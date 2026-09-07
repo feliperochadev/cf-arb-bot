@@ -1,0 +1,161 @@
+package io.cfarb.risk;
+
+import io.cfarb.config.BotConfig;
+import io.cfarb.util.FixedPoint;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLongArray;
+
+/**
+ * Every trading gate, all fail CLOSED (security rule S5), all hard-clamped in code as well as
+ * config (rule S6) — cf-arb-bot-plan.md §5.5. Four of these (the startup notional clamp, the
+ * per-triangle cooldown CAS, the sliding-window cycles/minute cap, the open-cycle cap) are ported
+ * patterns from {@code cf-trader.trader.Strategist}/{@code Orderer}; the equity floor and
+ * consecutive-failure trip live in {@link KillSwitch} instead, since those need to latch
+ * permanently rather than gate a single decision.
+ *
+ * <p><b>Threading:</b> {@link #canFire} and {@link #claim} are called ONLY from the single Netty
+ * event-loop thread that owns the MEXC depth WebSocket connection (9 configured symbols is well
+ * under MEXC's 30-streams-per-connection cap, so this bot uses exactly one connection — see
+ * {@code cf-bot.symbols}) — the per-triangle cooldown array and the cycles/minute ring buffer are
+ * therefore single-writer and need no synchronization, mirroring
+ * {@code cf-trader.trader.Orderer}'s single-consumer {@code ArrayDeque} rate limiter. Only
+ * {@link #openCycles} and {@code KillSwitch}'s fields cross threads (detector thread claims, the
+ * dedicated executor thread — see {@code exec.CycleExecutor} — releases), so those alone are
+ * atomic.
+ */
+public final class RiskGates {
+
+    /** Absolute ceiling regardless of what cf-bot.risk.max-notional-usd says — S6's "a
+     * misconfiguration (e.g. notional=10^9) must be clamped and flagged at startup validation,"
+     * sized generously above this PoC's $100 seed so it never binds in normal operation but still
+     * catches a fat-fingered config value. */
+    private static final double ABSOLUTE_MAX_NOTIONAL_USD = 1_000.0;
+
+    private final KillSwitch killSwitch;
+    private final long maxNotionalFixed;
+    public final boolean notionalWasClamped;
+    public final double effectiveMaxNotionalUsd;
+
+    private final int maxOpenCycles;
+    private final long cooldownNanos;
+    private final long maxBookAgeNanos;
+    private final long clockSkewToleranceNanos;
+
+    private final AtomicLongArray lastFireNanosByTriangle;
+    private final AtomicInteger openCycles = new AtomicInteger(0);
+
+    // Sliding cycles-per-minute window -- single-writer (detector thread) ring buffer, see class doc.
+    private final long[] ringTimestampsNanos;
+    private final int maxCyclesPerMinute;
+    private int ringHead;
+    private int ringCount;
+
+    public RiskGates(BotConfig.RiskConfig riskConfig, BotConfig.StrategyConfig strategyConfig,
+                      BotConfig.ExecConfig execConfig, int triangleCount, KillSwitch killSwitch) {
+        this.killSwitch = killSwitch;
+
+        // cf-arb-bot-review-plan.md Tier 2 step 2.5: a non-positive limit here previously widened
+        // silently to 1 via Math.max(1, ...) instead of being rejected -- fail closed (S5) on a
+        // misconfiguration instead of quietly substituting a default the operator never chose.
+        double configuredMaxNotional = riskConfig.maxNotionalUsd();
+        if (configuredMaxNotional <= 0) {
+            throw new IllegalStateException(
+                    "cf-bot.risk.max-notional-usd must be > 0, got " + configuredMaxNotional);
+        }
+        double clamped = Math.min(configuredMaxNotional, ABSOLUTE_MAX_NOTIONAL_USD);
+        this.notionalWasClamped = clamped != configuredMaxNotional;
+        this.effectiveMaxNotionalUsd = clamped;
+        this.maxNotionalFixed = FixedPoint.fromDouble(clamped);
+
+        if (riskConfig.maxOpenCycles() <= 0) {
+            throw new IllegalStateException(
+                    "cf-bot.risk.max-open-cycles must be > 0, got " + riskConfig.maxOpenCycles());
+        }
+        this.maxOpenCycles = riskConfig.maxOpenCycles();
+        this.cooldownNanos = riskConfig.cycleCooldownMs() * 1_000_000L;
+        this.maxBookAgeNanos = strategyConfig.maxBookAgeMs() * 1_000_000L;
+        this.clockSkewToleranceNanos = execConfig.recvWindowMs() * 1_000_000L;
+
+        if (riskConfig.maxCyclesPerMinute() <= 0) {
+            throw new IllegalStateException(
+                    "cf-bot.risk.max-cycles-per-minute must be > 0, got " + riskConfig.maxCyclesPerMinute());
+        }
+        this.maxCyclesPerMinute = riskConfig.maxCyclesPerMinute();
+        this.ringTimestampsNanos = new long[maxCyclesPerMinute];
+        this.lastFireNanosByTriangle = new AtomicLongArray(Math.max(1, triangleCount));
+        // AtomicLongArray defaults every slot to 0, which is indistinguishable from "fired at
+        // System.nanoTime()==0" -- nanoTime's origin is arbitrary per JVM and unit tests commonly
+        // use small nanoTime values for readability, so 0 is not a safe "never fired" sentinel.
+        // Seed every slot far enough in the past that (now - sentinel) always clears any
+        // realistic cooldown, while staying well clear of Long.MIN_VALUE to avoid subtraction
+        // overflow.
+        long neverFiredSentinel = Long.MIN_VALUE / 2;
+        for (int i = 0; i < lastFireNanosByTriangle.length(); i++) {
+            lastFireNanosByTriangle.set(i, neverFiredSentinel);
+        }
+    }
+
+    /**
+     * Hot-path pre-fire check on the detector thread. Does NOT claim the fire slot (a candidate
+     * can fail a downstream check after this returns true — e.g. {@link io.cfarb.strategy.EdgeCalculator}
+     * finding the ladder can't actually fill the size) — call {@link #claim} only immediately
+     * before dispatching to the executor, so a doomed candidate never burns real cooldown/rate-limit
+     * budget.
+     */
+    public boolean canFire(int triangleIndex, long candidateNotionalFixed, long nowNanos) {
+        if (killSwitch.tripped()) {
+            return false;
+        }
+        if (openCycles.get() >= maxOpenCycles) {
+            return false;
+        }
+        if (candidateNotionalFixed <= 0 || candidateNotionalFixed > maxNotionalFixed) {
+            return false;
+        }
+        if (nowNanos - lastFireNanosByTriangle.get(triangleIndex) < cooldownNanos) {
+            return false;
+        }
+        if (ringCount >= maxCyclesPerMinute) {
+            long oldest = ringTimestampsNanos[ringHead];
+            if (nowNanos - oldest < 60_000_000_000L) {
+                return false; // at the cycles-per-minute cap
+            }
+        }
+        return true;
+    }
+
+    /** Claim the fire slot and mark a cycle as open. Executor must call {@link #onCycleFinished()}
+     * exactly once when the cycle completes or is unwound, or the open-cycle slot leaks forever. */
+    public void claim(int triangleIndex, long nowNanos) {
+        lastFireNanosByTriangle.set(triangleIndex, nowNanos);
+        int idx = (ringHead + ringCount) % maxCyclesPerMinute;
+        ringTimestampsNanos[idx] = nowNanos;
+        if (ringCount < maxCyclesPerMinute) {
+            ringCount++;
+        } else {
+            ringHead = (ringHead + 1) % maxCyclesPerMinute;
+        }
+        openCycles.incrementAndGet();
+    }
+
+    /** Called by the executor thread when a cycle finishes, successfully or not. Clamped at zero
+     * (cf-arb-bot-review-plan.md Tier 1 step 1.6) as defense in depth: {@code exec.CycleExecutor}
+     * now has exactly one release owner per cycle, but a future double-release must still fail
+     * closed (block firing) rather than driving the count negative and permanently defeating
+     * {@code max-open-cycles}. */
+    public void onCycleFinished() {
+        openCycles.updateAndGet(n -> Math.max(0, n - 1));
+    }
+
+    public int openCycleCount() {
+        return openCycles.get();
+    }
+
+    public boolean isBookFresh(long bookAgeNanos) {
+        return bookAgeNanos <= maxBookAgeNanos;
+    }
+
+    public long clockSkewToleranceNanos() {
+        return clockSkewToleranceNanos;
+    }
+}

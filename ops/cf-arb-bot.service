@@ -1,0 +1,32 @@
+# Mirror of the unit installed by terraform/user_data.sh, kept here for review without having to
+# read through the templated shell script. Keep both in sync if either changes.
+[Unit]
+Description=cf-arb-bot -- MEXC triangular arbitrage PoC
+After=network-online.target chronyd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cfarbbot
+Group=cfarbbot
+WorkingDirectory=/opt/cf-arb-bot
+# cf-arb-bot-review-plan.md Tier 2 step 2.3: fetch secrets fresh on EVERY start, not only once at
+# cloud-init time -- the "+" prefix runs this one line as root, unsandboxed, before the sandboxed
+# main process (below) drops to the unprivileged cfarbbot user.
+ExecStartPre=+/usr/local/sbin/cf-arb-bot-fetch-secrets.sh
+EnvironmentFile=/etc/cf-arb-bot/secrets.env
+Environment=CF_BOT_JOURNAL_DIR=/var/lib/cf-arb-bot/journal
+ExecStart=/usr/bin/java -Xms512m -Xmx512m -XX:+AlwaysPreTouch -XX:MaxDirectMemorySize=256m \
+  -jar /opt/cf-arb-bot/quarkus-run.jar
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/cf-arb-bot
+ProtectHome=true
+# cf-arb-bot-review-plan.md Tier 2 step 2.3 / Grok Medium 10: ProtectSystem=strict makes /tmp
+# read-only from this unit's view; the JVM (hsperfdata) and Quarkus both want a writable temp dir.
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

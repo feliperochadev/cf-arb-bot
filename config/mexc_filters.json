@@ -1,0 +1,199 @@
+{
+  "as_of": "2026-09-07",
+  "source_url": "https://api.mexc.com/api/v3/exchangeInfo",
+  "notes": "quote_asset_precision added 2026-09-07 (cf-arb-bot-review-plan.md Tier 1 step 1.3) -- re-verified live against exchangeInfo. All other fields already matched the live venue; only the price-side precision was previously missing. order_types is unchanged and confirmed live: NONE of these 9 symbols advertise IMMEDIATE_OR_CANCEL or FILL_OR_KILL support -- only LIMIT/MARKET/LIMIT_MAKER. MEXC's order-type ENUM (see spot_v3 docs, 'Order type') does include IMMEDIATE_OR_CANCEL and FILL_OR_KILL as values, and there is no separate timeInForce parameter on POST /api/v3/order -- the type value itself carries that semantic. But exchangeInfo's per-symbol order_types is what the venue actually accepts for a given symbol, and it excludes both here. This is the wire-format problem the independent review flagged: an executor that submits type=IOC (not even a real value) or type=IMMEDIATE_OR_CANCEL against these symbols is submitting a request the venue's own published capability data says it will reject. Fixed by making order-type configurable and startup-validating it against this file per symbol (fail closed in live mode) rather than resolving the underlying strategy question here -- that requires either a live authenticated probe (blocked: no MEXC_API_KEY/MEXC_API_SECRET in this environment, and CLAUDE.md #9/#8 forbid trusting an unverified channel or hitting a live exchange from an automated path) or a redesign around a resting LIMIT/LIMIT_MAKER order, which is out of this plan's scope.",
+  "symbols": {
+    "BTCUSDT": {
+      "base_asset": "BTC",
+      "quote_asset": "USDT",
+      "base_asset_precision": 8,
+      "quote_asset_precision": 2,
+      "min_qty": 1e-06,
+      "min_notional": 1.0,
+      "taker_bps": 5.0,
+      "maker_bps": 0.0,
+      "order_types": [
+        "LIMIT",
+        "MARKET",
+        "LIMIT_MAKER"
+      ]
+    },
+    "ETHUSDT": {
+      "base_asset": "ETH",
+      "quote_asset": "USDT",
+      "base_asset_precision": 5,
+      "quote_asset_precision": 2,
+      "min_qty": 0.0001,
+      "min_notional": 1.0,
+      "taker_bps": 5.0,
+      "maker_bps": 0.0,
+      "order_types": [
+        "LIMIT",
+        "MARKET",
+        "LIMIT_MAKER"
+      ]
+    },
+    "SOLUSDT": {
+      "base_asset": "SOL",
+      "quote_asset": "USDT",
+      "base_asset_precision": 3,
+      "quote_asset_precision": 2,
+      "min_qty": 0.01,
+      "min_notional": 1.0,
+      "taker_bps": 5.0,
+      "maker_bps": 0.0,
+      "order_types": [
+        "LIMIT",
+        "MARKET",
+        "LIMIT_MAKER"
+      ]
+    },
+    "XRPUSDT": {
+      "base_asset": "XRP",
+      "quote_asset": "USDT",
+      "base_asset_precision": 2,
+      "quote_asset_precision": 4,
+      "min_qty": 0.1,
+      "min_notional": 1.0,
+      "taker_bps": 0.0,
+      "maker_bps": 0.0,
+      "order_types": [
+        "LIMIT",
+        "MARKET",
+        "LIMIT_MAKER"
+      ]
+    },
+    "ETHBTC": {
+      "base_asset": "ETH",
+      "quote_asset": "BTC",
+      "base_asset_precision": 3,
+      "quote_asset_precision": 6,
+      "min_qty": 0.001,
+      "min_notional": 5e-06,
+      "taker_bps": 5.0,
+      "maker_bps": 0.0,
+      "order_types": [
+        "LIMIT",
+        "MARKET",
+        "LIMIT_MAKER"
+      ]
+    },
+    "SOLBTC": {
+      "base_asset": "SOL",
+      "quote_asset": "BTC",
+      "base_asset_precision": 2,
+      "quote_asset_precision": 8,
+      "min_qty": 1.0,
+      "min_notional": 5e-06,
+      "taker_bps": 5.0,
+      "maker_bps": 0.0,
+      "order_types": [
+        "LIMIT",
+        "MARKET",
+        "LIMIT_MAKER"
+      ]
+    },
+    "XRPBTC": {
+      "base_asset": "XRP",
+      "quote_asset": "BTC",
+      "base_asset_precision": 2,
+      "quote_asset_precision": 9,
+      "min_qty": 10.0,
+      "min_notional": 5e-06,
+      "taker_bps": 5.0,
+      "maker_bps": 0.0,
+      "order_types": [
+        "LIMIT",
+        "MARKET",
+        "LIMIT_MAKER"
+      ]
+    },
+    "XRPETH": {
+      "base_asset": "XRP",
+      "quote_asset": "ETH",
+      "base_asset_precision": 2,
+      "quote_asset_precision": 7,
+      "min_qty": 0.0001,
+      "min_notional": 0.0001,
+      "taker_bps": 5.0,
+      "maker_bps": 0.0,
+      "order_types": [
+        "LIMIT",
+        "MARKET",
+        "LIMIT_MAKER"
+      ]
+    },
+    "BTCUSDC": {
+      "base_asset": "BTC",
+      "quote_asset": "USDC",
+      "base_asset_precision": 6,
+      "quote_asset_precision": 2,
+      "min_qty": 1e-06,
+      "min_notional": 1.0,
+      "taker_bps": 0.0,
+      "maker_bps": 0.0,
+      "order_types": [
+        "LIMIT",
+        "MARKET",
+        "LIMIT_MAKER"
+      ]
+    },
+    "ETHUSDC": {
+      "base_asset": "ETH",
+      "quote_asset": "USDC",
+      "base_asset_precision": 5,
+      "quote_asset_precision": 2,
+      "min_qty": 1e-06,
+      "min_notional": 1.0,
+      "taker_bps": 0.0,
+      "maker_bps": 0.0,
+      "order_types": [
+        "LIMIT",
+        "LIMIT_MAKER"
+      ]
+    },
+    "SOLUSDC": {
+      "base_asset": "SOL",
+      "quote_asset": "USDC",
+      "base_asset_precision": 2,
+      "quote_asset_precision": 2,
+      "min_qty": 1e-06,
+      "min_notional": 1.0,
+      "taker_bps": 0.0,
+      "maker_bps": 0.0,
+      "order_types": [
+        "LIMIT",
+        "LIMIT_MAKER"
+      ]
+    },
+    "XRPUSDC": {
+      "base_asset": "XRP",
+      "quote_asset": "USDC",
+      "base_asset_precision": 2,
+      "quote_asset_precision": 4,
+      "min_qty": 0.0001,
+      "min_notional": 1.0,
+      "taker_bps": 0.0,
+      "maker_bps": 0.0,
+      "order_types": [
+        "LIMIT",
+        "LIMIT_MAKER"
+      ]
+    },
+    "USDCUSDT": {
+      "base_asset": "USDC",
+      "quote_asset": "USDT",
+      "base_asset_precision": 2,
+      "quote_asset_precision": 5,
+      "min_qty": 1.0,
+      "min_notional": 1.0,
+      "taker_bps": 0.0,
+      "maker_bps": 0.0,
+      "order_types": [
+        "LIMIT",
+        "MARKET",
+        "LIMIT_MAKER"
+      ]
+    }
+  }
+}

@@ -1,0 +1,146 @@
+[
+  {
+    "file": "mexc_depth_00.pb.bin",
+    "symbol": "BTCUSDT",
+    "send_time_us": 1787961599952000,
+    "from_version": 80111665779,
+    "to_version": 80111665794,
+    "best_bid": [
+      77825.41,
+      0.0
+    ],
+    "best_ask": [
+      77855.52,
+      0.0
+    ],
+    "num_bids": 6,
+    "num_asks": 8,
+    "payload_len": 418
+  },
+  {
+    "file": "mexc_depth_01.pb.bin",
+    "symbol": "ETHUSDT",
+    "send_time_us": 1787961599953000,
+    "from_version": 61568244211,
+    "to_version": 61568244231,
+    "best_bid": [
+      2442.27,
+      0.0
+    ],
+    "best_ask": [
+      2443.22,
+      2.37006
+    ],
+    "num_bids": 9,
+    "num_asks": 9,
+    "payload_len": 469
+  },
+  {
+    "file": "mexc_depth_02.pb.bin",
+    "symbol": "XRPUSDC",
+    "send_time_us": 1787961599969000,
+    "from_version": 4925475318,
+    "to_version": 4925475319,
+    "best_bid": [
+      1.383,
+      0.0
+    ],
+    "best_ask": [
+      1.3842,
+      0.0
+    ],
+    "num_bids": 1,
+    "num_asks": 1,
+    "payload_len": 165
+  },
+  {
+    "file": "mexc_depth_03.pb.bin",
+    "symbol": "BTCUSDC",
+    "send_time_us": 1787961600017000,
+    "from_version": 23803432505,
+    "to_version": 23803432537,
+    "best_bid": [
+      77347.3,
+      0.0
+    ],
+    "best_ask": [
+      77904.09,
+      0.00021
+    ],
+    "num_bids": 1,
+    "num_asks": 31,
+    "payload_len": 728
+  },
+  {
+    "file": "mexc_depth_04.pb.bin",
+    "symbol": "BTCUSDT",
+    "send_time_us": 1787961600052000,
+    "from_version": 80111665795,
+    "to_version": 80111665862,
+    "best_bid": [
+      77833.25,
+      9.00689501
+    ],
+    "best_ask": [
+      77834.26,
+      0.0
+    ],
+    "num_bids": 18,
+    "num_asks": 21,
+    "payload_len": 810
+  },
+  {
+    "file": "mexc_depth_05.pb.bin",
+    "symbol": "ETHUSDT",
+    "send_time_us": 1787961600053000,
+    "from_version": 61568244232,
+    "to_version": 61568244269,
+    "best_bid": [
+      2442.22,
+      0.0
+    ],
+    "best_ask": [
+      2443.25,
+      0.0
+    ],
+    "num_bids": 12,
+    "num_asks": 11,
+    "payload_len": 495
+  },
+  {
+    "file": "mexc_depth_06.pb.bin",
+    "symbol": "XRPUSDT",
+    "send_time_us": 1787961600062000,
+    "from_version": 11245246685,
+    "to_version": 11245246698,
+    "best_bid": [
+      1.3837,
+      565.1
+    ],
+    "best_ask": [
+      1.3839,
+      0.0
+    ],
+    "num_bids": 6,
+    "num_asks": 5,
+    "payload_len": 344
+  },
+  {
+    "file": "mexc_depth_07.pb.bin",
+    "symbol": "XRPUSDC",
+    "send_time_us": 1787961600068000,
+    "from_version": 4925475320,
+    "to_version": 4925475330,
+    "best_bid": [
+      1.383,
+      350.94
+    ],
+    "best_ask": [
+      1.3842,
+      282.11
+    ],
+    "num_bids": 2,
+    "num_asks": 7,
+    "payload_len": 303
+  }
+]
