@@ -1,7 +1,6 @@
 package io.cfarb.exec;
 
 import io.vertx.core.Vertx;
-import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.WebSocketClient;
 import io.vertx.core.http.WebSocketClientOptions;
 import io.vertx.core.http.WebSocketConnectOptions;
@@ -37,6 +36,11 @@ public final class UserDataStream {
 
     private volatile String listenKey;
     private volatile boolean running;
+    // REVIEW.md MED-04: created once in start() and reused across every reconnect -- the previous
+    // version allocated a fresh WebSocketClient (and its underlying Netty channel pool) on every
+    // single reconnect attempt without ever closing the old one, leaking a client (and file
+    // descriptors) per attempt over an extended run with unstable connectivity.
+    private volatile WebSocketClient wsClient;
 
     public UserDataStream(Vertx vertx, WebClient restClient, String apiKey, String wsBaseUrl) {
         this.vertx = vertx;
@@ -47,6 +51,8 @@ public final class UserDataStream {
 
     public void start() {
         running = true;
+        WebSocketClientOptions opts = new WebSocketClientOptions().setSsl(true).setTcpKeepAlive(true);
+        this.wsClient = vertx.createWebSocketClient(opts);
         obtainListenKeyAndConnect();
         vertx.setPeriodic(LISTEN_KEY_REFRESH_MS, id -> {
             if (running) {
@@ -57,6 +63,10 @@ public final class UserDataStream {
 
     public void stop() {
         running = false;
+        WebSocketClient c = wsClient;
+        if (c != null) {
+            c.close();
+        }
     }
 
     private void obtainListenKeyAndConnect() {
@@ -84,9 +94,13 @@ public final class UserDataStream {
             obtainListenKeyAndConnect();
             return;
         }
-        restClient.put("/api/v3/userDataStream")
+        // REVIEW.md MED-05: the previous version sent listenKey as an unlabeled form body with no
+        // Content-Type header, which MEXC's PUT /api/v3/userDataStream does not document accepting
+        // -- send it as a query parameter instead, matching every other signed/keyed request this
+        // codebase makes to this venue (MexcRestClient's endpoints all pass their params in the URL).
+        restClient.put("/api/v3/userDataStream?listenKey=" + listenKey)
                 .putHeader("X-MEXC-APIKEY", apiKey)
-                .sendBuffer(Buffer.buffer("listenKey=" + listenKey), ar -> {
+                .send(ar -> {
                     if (ar.failed()) {
                         LOG.warnf("[user-data] listenKey refresh failed: %s", ar.cause().toString());
                     }
@@ -94,12 +108,10 @@ public final class UserDataStream {
     }
 
     private void connectWs() {
-        WebSocketClientOptions opts = new WebSocketClientOptions().setSsl(true).setTcpKeepAlive(true);
-        WebSocketClient client = vertx.createWebSocketClient(opts);
         java.net.URI uri = java.net.URI.create(wsBaseUrl + "?listenKey=" + listenKey);
         WebSocketConnectOptions connect = new WebSocketConnectOptions()
                 .setHost(uri.getHost()).setPort(443).setURI(uri.getRawPath() + "?" + uri.getRawQuery()).setSsl(true);
-        client.connect(connect).onSuccess(ws -> {
+        wsClient.connect(connect).onSuccess(ws -> {
             LOG.infof("[user-data] connected");
             ws.frameHandler(frame -> {
                 // Best-effort: log only. Wiring this into CycleExecutor's fill-confirmation path

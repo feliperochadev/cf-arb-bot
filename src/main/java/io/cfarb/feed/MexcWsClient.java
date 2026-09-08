@@ -92,6 +92,23 @@ public final class MexcWsClient {
         return connected;
     }
 
+    /** REVIEW.md MAJ-06: close the current socket to run through the EXISTING recovery path
+     * ({@code closeHandler} -> {@code books.resetAll()} -> {@code scheduleReconnect()}) rather than
+     * the feed watchdog's previous behavior of latching the kill switch permanently on a connection
+     * that {@code isConnected()} still reports as alive (a half-open socket, a silently stalled
+     * proxy). A no-op if a reconnect is already in flight -- {@code closeHandler} already flips
+     * {@link #connected} false, so a second watchdog tick before the new connection lands does not
+     * double-fire this. */
+    public void forceReconnect() {
+        if (!connected) {
+            return; // already disconnected/reconnecting -- closeHandler's path is already running
+        }
+        WebSocket s = socket;
+        if (s != null) {
+            s.close();
+        }
+    }
+
     /** cf-arb-bot-review-plan.md Tier 1 step 1.7: prune on READ, not only on connect -- the
      * previous version only pruned {@link #recentConnectMillis} inside {@link #recordConnectForChurn},
      * so a churn flag set by a burst of reconnects could stay latched {@code true} indefinitely once

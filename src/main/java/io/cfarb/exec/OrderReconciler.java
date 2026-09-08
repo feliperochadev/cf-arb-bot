@@ -29,6 +29,27 @@ import org.jboss.logging.Logger;
  * find out. If reconciliation itself cannot establish a terminal state, the leg is marked
  * {@link CycleState.LegStatus#UNKNOWN} and the caller must never guess past that (Terra Major 4 /
  * Grok Major 6: an ambiguous order must never be silently treated as either filled or unfilled).
+ *
+ * <p><b>Rewritten again by REVIEW.md's second independent pass:</b>
+ * <ul>
+ *   <li><b>MAJ-04:</b> a placement failure is no longer funneled unconditionally into a query that
+ *       then classifies any query exception as {@code UNKNOWN}. A definitive 4xx placement rejection
+ *       (the venue refusing the order outright — bad filter, insufficient balance, etc.) means the
+ *       order was never created; that is classified {@code REJECTED_PRESUBMIT} without a doomed
+ *       query, and routes through the ordinary broken-cycle/unwind path rather than tripping the
+ *       kill switch as an operator emergency. Only a genuinely ambiguous placement outcome (timeout,
+ *       I/O failure, 5xx) still falls through to reconciliation, where a further failure remains
+ *       {@code UNKNOWN} exactly as before.</li>
+ *   <li><b>MAJ-03:</b> after a successful query, a non-terminal venue {@code status} (
+ *       {@code NEW}/{@code PARTIALLY_FILLED}) is explicitly canceled and re-queried once for the
+ *       final executed amounts, closing the race where a resting remainder fills while a broken
+ *       cycle is already being unwound on the assumption the order was done.</li>
+ *   <li><b>MED-07/MIN-01:</b> {@code executedQty}/{@code cummulativeQuoteQty}/{@code commission} are
+ *       parsed via {@link FixedPoint#parse(CharSequence)} directly from MEXC's exact decimal
+ *       strings, never through {@code double} (which can drift a satoshi and flip a leg from
+ *       {@code FILLED} to {@code PARTIAL}); trade rows are filtered to the leg's own {@code orderId}
+ *       before summing commission.</li>
+ * </ul>
  */
 final class OrderReconciler {
 
@@ -51,38 +72,58 @@ final class OrderReconciler {
     void submitAndReconcile(String symbol, Side side, SymbolFilter filter, CycleState.Leg leg) {
         String params = CycleExecutor.buildOrderParams(symbol, side, leg.requestedBaseQtyFixed,
                 leg.requestedPriceFixed, filter, leg.clientOrderId, orderType);
+        submitPrebuiltAndReconcile(symbol, params, leg);
+    }
 
+    /** Same place-then-reconcile flow as {@link #submitAndReconcile}, for a caller that has already
+     * built its own (non-standard) request params -- used by {@link Unwinder}'s MARKET fallback
+     * (REVIEW.md MAJ-02), which needs {@code type=MARKET} with no price parameter, unlike every
+     * other order this bot places. */
+    void submitPrebuiltAndReconcile(String symbol, String params, CycleState.Leg leg) {
         String placedOrderId = null;
         try {
             String resp = rest.placeOrder(params, legTimeoutMs).get(legTimeoutMs, TimeUnit.MILLISECONDS);
             placedOrderId = readTextField(resp, "orderId");
         } catch (Exception e) {
-            logAttemptFailure("place", symbol, leg.clientOrderId, e);
-            // Fall through to reconciliation regardless -- see class javadoc.
-        }
-
-        String orderId = placedOrderId;
-        try {
-            String resp = rest.queryOrder(symbol, leg.clientOrderId, legTimeoutMs).get(legTimeoutMs, TimeUnit.MILLISECONDS);
-            JsonNode node = MAPPER.readTree(resp);
-            leg.executedBaseQtyFixed = FixedPoint.fromDouble(doubleField(node, "executedQty"));
-            leg.executedQuoteFixed = FixedPoint.fromDouble(doubleField(node, "cummulativeQuoteQty"));
-            if (orderId == null && node.hasNonNull("orderId")) {
-                orderId = node.get("orderId").asText();
+            Throwable cause = unwrap(e);
+            logAttemptFailure("place", symbol, leg.clientOrderId, cause);
+            if (cause instanceof MexcRestClient.OrderRejectedException rejected && rejected.statusCode / 100 == 4) {
+                // REVIEW.md MAJ-04: a 4xx placement rejection is the venue definitively refusing the
+                // order -- it was never created, so querying for it would only ever find "does not
+                // exist" and previously got misclassified as UNKNOWN. Nothing to reconcile.
+                leg.status = CycleState.LegStatus.REJECTED_PRESUBMIT;
+                return;
             }
-        } catch (Exception e) {
-            logAttemptFailure("reconcile", symbol, leg.clientOrderId, e);
-            leg.status = CycleState.LegStatus.UNKNOWN;
-            return; // venue truth is unknown -- never infer a fill/no-fill outcome from here
+            // Timeout / I/O failure / 5xx: genuinely ambiguous -- the order may have reached the
+            // venue despite this client-side failure. Fall through to reconciliation.
         }
 
-        if (leg.executedBaseQtyFixed <= 0) {
-            leg.status = CycleState.LegStatus.ZERO_FILL;
-        } else if (leg.executedBaseQtyFixed < leg.requestedBaseQtyFixed) {
-            leg.status = CycleState.LegStatus.PARTIAL;
-        } else {
-            leg.status = CycleState.LegStatus.FILLED;
+        if (!reconcileOnce(symbol, leg, placedOrderId)) {
+            return; // leg.status already set to UNKNOWN
         }
+
+        String orderId = leg.venueOrderId != null ? leg.venueOrderId : placedOrderId;
+
+        // REVIEW.md MAJ-03: a non-terminal order left resting on the matching engine can fill (or
+        // partially fill further) while the rest of this cycle -- and possibly Unwinder -- runs
+        // against the amount already observed. Cancel it and re-query once before classifying.
+        if (isNonTerminal(leg.venueStatus) && orderId != null) {
+            try {
+                rest.cancelOrder(symbol, leg.clientOrderId, legTimeoutMs).get(legTimeoutMs, TimeUnit.MILLISECONDS);
+            } catch (Exception e) {
+                // Best-effort: the order may have reached a terminal state (fully filled, or
+                // already canceled) between the query above and this call, which MEXC surfaces as
+                // an error here -- that is not a failure to act on, it just means there is nothing
+                // left to cancel. Either way, the following re-query is authoritative.
+                logAttemptFailure("cancel", symbol, leg.clientOrderId, unwrap(e));
+            }
+            if (!reconcileOnce(symbol, leg, orderId)) {
+                return;
+            }
+            orderId = leg.venueOrderId != null ? leg.venueOrderId : orderId;
+        }
+
+        classifyFill(leg);
 
         if (leg.executedBaseQtyFixed > 0 && orderId != null) {
             fetchCommission(symbol, orderId, leg);
@@ -90,25 +131,74 @@ final class OrderReconciler {
         leg.commissionEstimated = leg.commissionAsset == null;
     }
 
+    /** Query the venue once and populate {@code leg}'s executed amounts / venue status / venue
+     * order id from the response. Returns false (leg.status left as {@code UNKNOWN}) if the query
+     * itself could not establish a terminal-or-current state -- the caller must return immediately
+     * in that case, never guessing past it. */
+    private boolean reconcileOnce(String symbol, CycleState.Leg leg, String knownOrderId) {
+        try {
+            String resp = rest.queryOrder(symbol, leg.clientOrderId, legTimeoutMs).get(legTimeoutMs, TimeUnit.MILLISECONDS);
+            JsonNode node = MAPPER.readTree(resp);
+            long executedQty = parseFixedField(node, "executedQty");
+            long executedQuote = parseFixedField(node, "cummulativeQuoteQty");
+            if (executedQty == Long.MIN_VALUE || executedQuote == Long.MIN_VALUE) {
+                throw new IllegalStateException("malformed executedQty/cummulativeQuoteQty in response: " + resp);
+            }
+            leg.executedBaseQtyFixed = executedQty;
+            leg.executedQuoteFixed = executedQuote;
+            leg.venueStatus = node.hasNonNull("status") ? node.get("status").asText() : null;
+            leg.venueOrderId = node.hasNonNull("orderId") ? node.get("orderId").asText() : knownOrderId;
+            return true;
+        } catch (Exception e) {
+            logAttemptFailure("reconcile", symbol, leg.clientOrderId, unwrap(e));
+            leg.status = CycleState.LegStatus.UNKNOWN;
+            return false; // venue truth is unknown -- never infer a fill/no-fill outcome from here
+        }
+    }
+
+    private static boolean isNonTerminal(String venueStatus) {
+        return "NEW".equals(venueStatus) || "PARTIALLY_FILLED".equals(venueStatus);
+    }
+
+    private static void classifyFill(CycleState.Leg leg) {
+        if (leg.executedBaseQtyFixed <= 0) {
+            leg.status = CycleState.LegStatus.ZERO_FILL;
+        } else if (leg.executedBaseQtyFixed < leg.requestedBaseQtyFixed) {
+            leg.status = CycleState.LegStatus.PARTIAL;
+        } else {
+            leg.status = CycleState.LegStatus.FILLED;
+        }
+    }
+
     private void fetchCommission(String symbol, String orderId, CycleState.Leg leg) {
         try {
             String resp = rest.listTrades(symbol, orderId, legTimeoutMs).get(legTimeoutMs, TimeUnit.MILLISECONDS);
             JsonNode arr = MAPPER.readTree(resp);
-            double sum = 0;
+            long sum = 0;
             String asset = null;
             for (JsonNode t : arr) {
-                sum += doubleField(t, "commission");
+                // MIN-01: filter to this leg's own order -- if the venue's orderId query parameter
+                // is ever ignored (or returns a superset), unrelated trades must never be summed
+                // into this leg's commission.
+                if (t.hasNonNull("orderId") && !orderId.equals(t.get("orderId").asText())) {
+                    continue;
+                }
+                long commission = parseFixedField(t, "commission");
+                if (commission == Long.MIN_VALUE) {
+                    continue; // malformed row -- skip rather than corrupt the sum
+                }
+                sum += commission;
                 if (asset == null && t.hasNonNull("commissionAsset")) {
                     asset = t.get("commissionAsset").asText();
                 }
             }
             if (asset != null) {
                 leg.commissionAsset = asset;
-                leg.commissionFixed = FixedPoint.fromDouble(sum);
+                leg.commissionFixed = sum;
             }
         } catch (Exception e) {
             LOG.warnf("[exec] commission lookup failed for %s orderId=%s: %s -- falling back to the "
-                    + "published taker rate for this leg's PnL", symbol, orderId, e.toString());
+                    + "published taker rate for this leg's PnL", symbol, orderId, unwrap(e));
         }
     }
 
@@ -128,9 +218,23 @@ final class OrderReconciler {
         return FixedPoint.mulDiv(raw, filter.takerFeeMultiplierFixed(), FixedPoint.SCALE);
     }
 
-    private static double doubleField(JsonNode node, String field) {
+    /** {@code node.get(field)}, parsed as an exact-decimal 1e8-fixed value via
+     * {@link FixedPoint#parse(CharSequence)} -- never {@code double}, which can drift a satoshi on
+     * high-precision assets and misclassify a full fill as partial (REVIEW.md MED-07). An absent or
+     * blank field is treated as {@code 0} (MEXC omits some numeric fields on certain statuses);
+     * a present-but-malformed field returns {@code Long.MIN_VALUE}, the same fail-closed sentinel
+     * {@code FixedPoint.parse} itself uses, so the caller can distinguish "not reported" from
+     * "reported garbage" and never guess past the latter. */
+    private static long parseFixedField(JsonNode node, String field) {
         JsonNode v = node.get(field);
-        return v == null ? 0.0 : v.asDouble(0.0);
+        if (v == null || v.isNull()) {
+            return 0L;
+        }
+        String text = v.isTextual() ? v.asText() : v.asText(); // numeric nodes also render via asText()
+        if (text == null || text.isBlank()) {
+            return 0L;
+        }
+        return FixedPoint.parse(text);
     }
 
     private static String readTextField(String json, String field) {
@@ -142,8 +246,11 @@ final class OrderReconciler {
         }
     }
 
-    private void logAttemptFailure(String stage, String symbol, String clientOrderId, Throwable t) {
-        Throwable cause = (t instanceof ExecutionException && t.getCause() != null) ? t.getCause() : t;
+    private static Throwable unwrap(Throwable t) {
+        return (t instanceof ExecutionException && t.getCause() != null) ? t.getCause() : t;
+    }
+
+    private void logAttemptFailure(String stage, String symbol, String clientOrderId, Throwable cause) {
         LOG.warnf("[exec] %s failed for %s clientOrderId=%s: %s", stage, symbol, clientOrderId, cause.toString());
     }
 }

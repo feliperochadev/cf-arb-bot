@@ -23,7 +23,14 @@ import io.cfarb.feed.MexcDepthDecoder;
  * ({@code api.BotApiResource}, {@code api.ReadinessCheck}, {@code BotService}'s feed watchdog) read
  * simple boolean/long fields from other threads for advisory reporting only — a stale or torn read
  * there means a monitoring endpoint is briefly out of date, never a bad trade, and is the same
- * trade-off most systems make for health/metrics endpoints against hot-path state.
+ * trade-off most systems make for health/metrics endpoints against hot-path state. A second,
+ * declared exception (cf-arb-bot-review-plan.md second pass, Tier A4 / CLAUDE.md non-negotiable
+ * #5): {@link #topBidFixed()}/{@link #topAskFixed()} are read by the {@code cf-arb-executor}
+ * thread to price an emergency unwind reversal ({@code exec.Unwinder}) when the executor thread's
+ * own pricing (the failed cycle's stale entry-boundary price) has already been shown not to work.
+ * This is still never a trading DECISION on that thread -- it is pricing a recovery action for a
+ * cycle that has already failed, using the most recent price this book has published, the same
+ * trade-off class as the diagnostic reads above.
  */
 public final class L2Book {
 
@@ -50,6 +57,17 @@ public final class L2Book {
     private long lastUpdateNanos = -1;
     private long lastSendTimeMs = -1;
 
+    // cf-arb-bot-review-plan.md (second pass) Tier A4: published top-of-book, read by the executor
+    // thread ONLY for pricing an emergency unwind reversal (exec.Unwinder) -- never for a trading
+    // DECISION, which stays exclusively on this book-owning Netty event-loop thread via the normal
+    // askPxAt(0)/bidPxAt(0) accessors. Two independent volatiles rather than one allocated pair: a
+    // torn read (bid from one update, ask from the very next) yields two individually-valid RECENT
+    // prices milliseconds apart on a book that ticks every 10-40ms -- the unwind cross buffer and
+    // the venue's own PERCENT_PRICE_BY_SIDE clamp both have far more slack than that, so a torn
+    // read is harmless here in a way it would not be for a hot-path fire decision.
+    private volatile long topBidFixed = Long.MIN_VALUE;
+    private volatile long topAskFixed = Long.MIN_VALUE;
+
     public L2Book(long warmupUpdates, long warmupSeconds) {
         this.warmupUpdates = warmupUpdates;
         this.warmupNanos = warmupSeconds * 1_000_000_000L;
@@ -62,6 +80,8 @@ public final class L2Book {
         warmStartNanos = -1;
         trusted = false;
         lastToVersion = -1;
+        topBidFixed = Long.MIN_VALUE;
+        topAskFixed = Long.MIN_VALUE;
     }
 
     /**
@@ -92,6 +112,10 @@ public final class L2Book {
         if (f.sendTimeMs >= 0) {
             lastSendTimeMs = f.sendTimeMs;
         }
+        // Tier A4: publish AFTER the level arrays are updated above, so a reader never observes a
+        // top-of-book price that is stale relative to what apply() just wrote.
+        topBidFixed = bidCount > 0 ? bidPx[0] : Long.MIN_VALUE;
+        topAskFixed = askCount > 0 ? askPx[0] : Long.MIN_VALUE;
         maybePromote(nowNanos);
         return !gap;
     }
@@ -229,5 +253,16 @@ public final class L2Book {
 
     public long updateCount() {
         return updateCount;
+    }
+
+    /** Published top-of-book, for {@code exec.Unwinder}'s emergency reversal pricing ONLY (Tier
+     * A4) -- {@code Long.MIN_VALUE} if no side has ever had a level. See the field javadoc above for
+     * why a torn read across the two is an accepted trade-off here specifically. */
+    public long topBidFixed() {
+        return topBidFixed;
+    }
+
+    public long topAskFixed() {
+        return topAskFixed;
     }
 }

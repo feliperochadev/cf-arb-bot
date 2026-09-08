@@ -1,5 +1,12 @@
 # Mirror of the unit installed by terraform/user_data.sh, kept here for review without having to
 # read through the templated shell script. Keep both in sync if either changes.
+#
+# REVIEW.md MAJ-07: ExecStart below points at /opt/cf-arb-bot/quarkus-run.jar, which is a THIN
+# bootstrap runner that requires its sibling lib/, app/, and quarkus/ directories (Quarkus 3.x's
+# fast-jar layout) to be present alongside it. The deploy step MUST sync the entire
+# `target/quarkus-app/` tree into /opt/cf-arb-bot/ -- e.g. `rsync -a target/quarkus-app/ host:/opt/cf-arb-bot/`
+# -- copying quarkus-run.jar alone crashes with
+# ClassNotFoundException: io.quarkus.bootstrap.runner.QuarkusEntryPoint.
 [Unit]
 Description=cf-arb-bot -- MEXC triangular arbitrage PoC
 After=network-online.target chronyd.service

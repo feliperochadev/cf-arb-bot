@@ -53,6 +53,7 @@ public final class CycleExecutor {
     private final Unwinder unwinder;        // null when dryRun (only live mode can hold inventory)
     private final OrderReconciler reconciler; // null when dryRun
     private final long legTimeoutMs;
+    private final long maxIntentAgeNanos;    // REVIEW.md MED-10
 
     private volatile boolean running;
     private Thread thread;
@@ -60,7 +61,8 @@ public final class CycleExecutor {
     public CycleExecutor(SpscArrayQueue<OrderIntent> queue, TriangleRegistry triangles,
                           RiskGates riskGates, KillSwitch killSwitch, Portfolio portfolio,
                           BotMetrics metrics, EventJournal journal, boolean dryRun,
-                          MexcOrderApi rest, Unwinder unwinder, String orderType, long legTimeoutMs) {
+                          MexcOrderApi rest, Unwinder unwinder, String orderType, long legTimeoutMs,
+                          long maxIntentAgeMs) {
         this.queue = queue;
         this.triangles = triangles;
         this.riskGates = riskGates;
@@ -72,6 +74,7 @@ public final class CycleExecutor {
         this.rest = rest;
         this.unwinder = unwinder;
         this.legTimeoutMs = legTimeoutMs;
+        this.maxIntentAgeNanos = maxIntentAgeMs * 1_000_000L;
         if (!dryRun && (rest == null || unwinder == null)) {
             throw new IllegalStateException("live execution requires a MexcRestClient and Unwinder");
         }
@@ -128,6 +131,18 @@ public final class CycleExecutor {
         Triangle triangle = triangles.triangle(intent.triangleIndex());
         long fullCycleStart = System.nanoTime();
         try {
+            // REVIEW.md MED-10: a delay between detection and this thread actually dequeuing the
+            // intent (a slow prior cycle, a REST timeout, a JVM pause) can leave an intent stale
+            // enough that acting on it is close to guaranteed to fail -- triangular arbitrage
+            // opportunities live roughly 50-150ms. Drop it rather than execute a near-certain
+            // leg failure; the open-cycle slot this cycle claimed is still released below exactly
+            // once, same as every other outcome.
+            long ageNanos = fullCycleStart - intent.detectedAtNanos();
+            if (ageNanos > maxIntentAgeNanos) {
+                metrics.recordIntentExpired();
+                journal.write(JournalEvents.brokenCycle(triangle.name(), -1, "stale-intent", 0, portfolio.equity()));
+                return;
+            }
             if (dryRun) {
                 executePaper(triangle, intent);
             } else {
@@ -224,6 +239,15 @@ public final class CycleExecutor {
                             "reconciliation-unknown-operator-review-required", 0, portfolio.equity()));
                     return;
                 }
+                case REJECTED_PRESUBMIT -> {
+                    // REVIEW.md MAJ-04: a definitive 4xx placement rejection is an ORDINARY broken
+                    // cycle (bad filter, insufficient balance, etc.), not the ambiguous-outcome
+                    // emergency UNKNOWN represents -- the venue told us outright the order was never
+                    // created, so there is a clean earlier-legs-only unwind to run, and this counts
+                    // toward the ordinary consecutive-failure trip rather than an immediate one.
+                    handleBrokenCycle(triangle, state, leg, "rejected-presubmit");
+                    return;
+                }
                 case ZERO_FILL -> {
                     handleBrokenCycle(triangle, state, leg, "zero-fill");
                     return;
@@ -260,7 +284,16 @@ public final class CycleExecutor {
         // held-asset amount from an anchor amount, comparing mismatched currencies (Kimi Minor 3).
         long loss = r.recoveredAnchorFixed() - spent;
         long equityAfter = loss != 0 ? portfolio.applyBrokenCyclePnl(loss) : portfolio.equity();
-        killSwitch.recordFailure(reason + " (leg " + failedLeg + ", " + triangle.name() + ")");
+        // cf-arb-bot-review-plan.md (second pass) Tier A4: Unwinder.Result#unrecoverable means real
+        // inventory is verifiably stranded with no automated recovery path (no pricing source AND
+        // no MARKET fallback) -- that is an immediate operator-review emergency, not an ordinary
+        // failure that should merely count toward the consecutive-failure trip.
+        if (r.unrecoverable()) {
+            killSwitch.recordUnrecoverableInventory(reason + " (leg " + failedLeg + ", " + triangle.name() + "): "
+                    + r.detail());
+        } else {
+            killSwitch.recordFailure(reason + " (leg " + failedLeg + ", " + triangle.name() + ")");
+        }
         killSwitch.checkEquityFloor();
         journal.write(JournalEvents.brokenCycle(triangle.name(), failedLeg, reason, loss, equityAfter));
     }

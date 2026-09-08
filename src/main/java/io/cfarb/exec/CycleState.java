@@ -54,6 +54,16 @@ public final class CycleState {
          * succeeded; null/0 otherwise (see {@link #commissionEstimated}). */
         public String commissionAsset;
         public long commissionFixed;
+        /** The venue's own {@code status} field from the last successful {@code GET /api/v3/order}
+         * reconciliation (e.g. {@code NEW}, {@code PARTIALLY_FILLED}, {@code FILLED},
+         * {@code CANCELED}) -- REVIEW.md MAJ-03: {@link OrderReconciler} cancels a non-terminal
+         * order (NEW/PARTIALLY_FILLED) before treating the leg as done, rather than inferring
+         * "done" purely from comparing quantities. Null until the first successful reconciliation. */
+        public String venueStatus;
+        /** The venue-assigned {@code orderId} from the last successful reconciliation -- used for
+         * the cancel/re-query round trip and the commission lookup; may already be known from the
+         * placement response even before the first query succeeds. */
+        public String venueOrderId;
         /** True when {@link #commissionFixed} was estimated via {@code SymbolFilter#takerBps()}
          * rather than read from an actual fill -- honest bookkeeping per cf-arb-bot-review-plan.md
          * Tier 1 step 1.5: never silently pretend an estimate is a confirmed commission. */

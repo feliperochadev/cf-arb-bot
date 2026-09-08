@@ -60,21 +60,37 @@ ever enters `recorder-service`.
 
 ## Known, documented gaps (not oversights — see the referenced code for why)
 
-- **`cf-bot.exec.order-type` (`IMMEDIATE_OR_CANCEL`) is not currently supported by MEXC for ANY of
-  the 9 configured symbols** — confirmed live against `GET /api/v3/exchangeInfo` 2026-09-07; every
-  symbol advertises only `LIMIT`/`MARKET`/`LIMIT_MAKER`. `BotService` validates this at startup and
-  fails closed in live mode (S5) until either MEXC enables it here or the execution design changes
-  around a resting `LIMIT`/`LIMIT_MAKER` order. This is the actual remaining blocker on live mode,
-  not a code defect — see `cf-arb-bot-review-plan.md` Tier 1 step 1.3.
+- **CORRECTED 2026-09-07 (REVIEW.md's second independent review):** the entry above previously read
+  "`IMMEDIATE_OR_CANCEL` is not currently supported by MEXC... this is the actual remaining blocker
+  on live mode." That was WRONG on two counts, confirmed by fetching MEXC's own published spot v3
+  API reference directly (twice): (1) `IMMEDIATE_OR_CANCEL`/`FILL_OR_KILL` are not even the venue's
+  real short-form values — the documented `type` ENUM is `LIMIT`/`MARKET`/`LIMIT_MAKER`/`IOC`/`FOK`,
+  and there is NO separate `timeInForce` request parameter on `POST /api/v3/order` at all (it does
+  not appear in the request parameter table); (2) confirmed live across ALL 2074 MEXC spot symbols,
+  not just this bot's 9-13: `exchangeInfo`'s per-symbol `order_types` is always exactly one of
+  `[LIMIT,MARKET,LIMIT_MAKER]` or `[LIMIT,LIMIT_MAKER]` — `IOC`/`FOK` never appear there for ANY
+  symbol on this venue. `cf-bot.exec.order-type` is restored to `IOC`. Because `exchangeInfo` can
+  never confirm it by membership, `BotService.validateOrderType` treats this specific combination
+  as **unverified-but-permitted** (a loud startup WARN in live mode), not a boot failure — the
+  credentialed 1-USDT live probe (cf-arb-bot-plan.md's own release gate) is what actually settles
+  this, not a doc reading. `ETHUSDC`/`SOLUSDC`/`XRPUSDC` additionally advertise no `MARKET` at all —
+  relevant to `exec.Unwinder`'s MARKET fallback, which checks per-symbol support rather than
+  assuming universal availability.
 - `exec.UserDataStream` is unverified against the live listenKey endpoint (Phase 1 TODO).
 - **No real balance reconciliation on boot** — `state.Portfolio` is a single in-memory number seeded
   from `cf-bot.capital.seed-usd`; a restart does not fetch or reconcile the live account, and
   non-anchor inventory left over from an interrupted cycle is invisible to it. Required before any
   unattended live run (`cf-arb-bot-review-plan.md` Tier 3).
-- **Unwind reversal pricing uses each leg's own stale detection-time price**, not a current book —
-  `exec.Unwinder`'s javadoc documents this explicitly. Pricing from a live book needs either a
-  published top-of-book snapshot from the feed thread or a REST book fetch, neither of which exists
-  yet on the executor thread (Tier 3).
+- **RESOLVED 2026-09-07 (REVIEW.md MAJ-02, second pass):** this entry previously said unwind
+  reversal pricing used each leg's own stale detection-time price, deferred to Tier 3. Fixed:
+  `exec.Unwinder` now prices reversals off `book.L2Book`'s published top-of-book (a declared
+  cross-thread read, not a new hand-off — see `L2Book`'s javadoc and the threading table below),
+  crossing it by `cf-bot.exec.unwind-cross-bps` and clamping inside the symbol's own
+  `PERCENT_PRICE_BY_SIDE` band. A symbol with no usable top (untrusted/empty, e.g. mid-reconnect)
+  falls back to `MARKET` where the venue advertises it; where it does not
+  (`ETHUSDC`/`SOLUSDC`/`XRPUSDC`), the position is left stranded and the kill switch trips
+  immediately (`KillSwitch.recordUnrecoverableInventory`) rather than submitting a knowingly-doomed
+  limit order.
 - **Per-stage latency histograms are still blended**: `decisionToLeg1AckNanos` records the FULL
   place→reconcile→(commission-lookup) round trip for every leg into one histogram, not separate
   receipt→decode / decode→decision / queue-wait / leg-ack stages (Tier 3).
@@ -96,7 +112,7 @@ ever enters `recorder-service`.
 | Thread | Owns | Never |
 |---|---|---|
 | Netty event loop (`feed.MexcWsClient`) | decode → book update → `strategy.OpportunityDetector` | allocate on the steady path, log per-tick, block |
-| `cf-arb-executor` (`exec.CycleExecutor`) | 3 sequential legs, each place→query→(trades-reconcile), `exec.Unwinder` | touch a book directly |
+| `cf-arb-executor` (`exec.CycleExecutor`) | 3 sequential legs, each place→query→cancel-if-non-terminal→(trades-reconcile), `exec.Unwinder` (reads `book.L2Book`'s published top-of-book to price an emergency reversal — declared exception, see `L2Book`'s javadoc) | touch a book for anything but reading published top-of-book; make a trading DECISION from it |
 | `cf-arb-journal-writer` (`journal.EventJournal`) | NDJSON append | backpressure the hot path — drop and count instead |
 | Quarkus HTTP worker (`api.BotApiResource`, `api.ReadinessCheck`) | read-only JSON | any write to trading state (S12) |
 | Vert.x periodic timers (`BotService`: warm-up/clock-skew, feed watchdog, latency snapshots) | read-only diagnostic reads, `killSwitch.recordFeedUnhealthy` | gate or influence a trading decision directly — these feed the kill switch and journal only |

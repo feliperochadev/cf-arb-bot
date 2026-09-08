@@ -41,7 +41,7 @@ class EdgeCalculatorTest {
                                         long minQty, long minNotional, int priceDecimals, double takerBps) {
         long feeMultiplierFixed = FixedPoint.fromDouble(1.0 - takerBps / 10_000.0);
         return new SymbolFilter(symbol, base, quote, qtyStep, qtyDecimals, minQty, minNotional, priceDecimals,
-                takerBps, feeMultiplierFixed, Set.of("LIMIT", "MARKET", "LIMIT_MAKER"));
+                takerBps, feeMultiplierFixed, Set.of("LIMIT", "MARKET", "LIMIT_MAKER"), 0.05, 0.05);
     }
 
     private static Triangle triangle(String name, int[] symbolIndex, Side[] sides, SymbolFilter[] filters) {

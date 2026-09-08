@@ -54,25 +54,49 @@ MEXC_API_KEY=$(aws ssm get-parameter --name "${mexc_api_key_param_name}" --with-
   --region "${aws_region}" --query 'Parameter.Value' --output text)
 MEXC_API_SECRET=$(aws ssm get-parameter --name "${mexc_api_secret_param_name}" --with-decryption \
   --region "${aws_region}" --query 'Parameter.Value' --output text)
-cat > "$OUT" <<ENVFILE
-MEXC_API_KEY=$MEXC_API_KEY
-MEXC_API_SECRET=$MEXC_API_SECRET
-ENVFILE
+# REVIEW.md MED-08: the previous unquoted <<ENVFILE heredoc let bash parameter-expand the secret
+# values themselves -- a MEXC secret containing "$" or "\" would be silently corrupted or truncated
+# before it ever reached the file. printf with %s performs no expansion on its arguments.
+printf 'MEXC_API_KEY=%s\nMEXC_API_SECRET=%s\n' "$MEXC_API_KEY" "$MEXC_API_SECRET" > "$OUT"
 chmod 0400 "$OUT"
 chown cfarbbot:cfarbbot "$OUT"
 FETCHSCRIPT
 chmod 0500 /usr/local/sbin/cf-arb-bot-fetch-secrets.sh
 chown root:root /usr/local/sbin/cf-arb-bot-fetch-secrets.sh
-/usr/local/sbin/cf-arb-bot-fetch-secrets.sh # populate once now, before the unit is ever started
 
-# --- Application deploy: the built quarkus-app is expected to be placed at /opt/cf-arb-bot by the
-# deploy pipeline (out of scope for this Terraform -- CI/CD is not part of this plan's Phase 1-4).
+# --- Application deploy: out of scope for this Terraform (CI/CD is not part of this plan's
+# Phase 1-4), but the CONTRACT this unit assumes is explicit -- REVIEW.md MAJ-07: the deploy
+# pipeline must sync the ENTIRE `target/quarkus-app/` directory tree into /opt/cf-arb-bot/, not only
+# quarkus-run.jar. Quarkus 3.x's fast-jar layout is quarkus-run.jar (a thin bootstrap runner) PLUS
+# sibling lib/, app/, and quarkus/ directories it loads at startup; copying the jar alone crashes
+# with ClassNotFoundException: io.quarkus.bootstrap.runner.QuarkusEntryPoint. Concretely:
+#   rsync -a target/quarkus-app/ ec2-host:/opt/cf-arb-bot/
+# (or an equivalent that preserves quarkus-run.jar, lib/, app/, and quarkus/ as SIBLINGS under
+# /opt/cf-arb-bot/ -- ExecStart below expects exactly that layout). See ops/cf-arb-bot.service and
+# README.md for the same note.
+#
 # cf-arb-bot-review-plan.md Tier 2 step 2.2: mexc_filters.json is bundled inside the jar's classpath
-# now (src/main/resources/config/), so no separate filter-file deploy step is required; /opt/cf-arb-bot/config
+# (src/main/resources/config/), so no separate filter-file deploy step is required; /opt/cf-arb-bot/config
 # remains available as the expected location for cf-bot.filters-path if an operator ever needs to
 # override the bundled snapshot without rebuilding. ---
 mkdir -p /opt/cf-arb-bot /opt/cf-arb-bot/config /var/lib/cf-arb-bot/journal
 chown -R cfarbbot:cfarbbot /opt/cf-arb-bot /var/lib/cf-arb-bot
+
+# --- Journal logrotate: REVIEW.md MED-09. EventJournal rotates NDJSON hourly under
+# /var/lib/cf-arb-bot/journal/ with no S3 sync yet (needs the AWS SDK + a real bucket to test
+# against -- CLAUDE.md's documented gap); on a 20GB root volume, unbounded local retention alone
+# will eventually exhaust disk and crash the service. This is a stopgap, not a substitute for the
+# real S3 sync. ---
+cat > /etc/logrotate.d/cf-arb-bot <<'LOGROTATE'
+/var/lib/cf-arb-bot/journal/*.ndjson {
+  daily
+  rotate 7
+  compress
+  missingok
+  notifempty
+  su cfarbbot cfarbbot
+}
+LOGROTATE
 
 # --- systemd unit (installed here; content mirrored at ops/cf-arb-bot.service for review outside
 # the templated user_data.sh) ---
@@ -111,5 +135,21 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable cf-arb-bot.service
-# NOT started here -- the jar isn't deployed yet at first boot (see note above). Start manually
-# once /opt/cf-arb-bot/quarkus-run.jar exists: `systemctl start cf-arb-bot`.
+
+# --- First-boot secret population: REVIEW.md MAJ-05. Moved to the END of this script (after the
+# unit is installed and enabled) and made NON-FATAL. Previously this ran early, under `set -euo
+# pipefail`, BEFORE /opt/cf-arb-bot or the systemd unit existed -- if an operator ran `terraform
+# apply` before the SSM parameters were populated (the documented, expected out-of-band order in
+# main.tf's own comment), aws ssm get-parameter's failure aborted the ENTIRE script right there:
+# no /opt/cf-arb-bot directory, no systemd unit, cloud-init marked failed. Fail-closed behavior is
+# fully preserved by ExecStartPre in the unit above -- a non-zero exit THERE still fails the unit
+# and blocks the service from starting with no credentials, which is the correct place for that
+# gate. This first-boot call is just a convenience so the very first `systemctl start` (once the
+# jar is deployed) already has secrets in place if they happen to exist yet.
+/usr/local/sbin/cf-arb-bot-fetch-secrets.sh \
+  || echo "WARNING: SSM secrets not yet populated (see main.tf's 'populated out of band' note) -- \
+cloud-init will still finish successfully; ExecStartPre will fetch them on the first 'systemctl \
+start cf-arb-bot' once they exist" >&2
+
+# NOT started here -- the jar isn't deployed yet at first boot (see the deploy-contract note above).
+# Start manually once the full quarkus-app tree exists at /opt/cf-arb-bot: `systemctl start cf-arb-bot`.

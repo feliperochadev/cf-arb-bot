@@ -32,6 +32,7 @@ public final class RiskGates {
     private static final double ABSOLUTE_MAX_NOTIONAL_USD = 1_000.0;
 
     private final KillSwitch killSwitch;
+    private final boolean dryRun;
     private final long maxNotionalFixed;
     public final boolean notionalWasClamped;
     public final double effectiveMaxNotionalUsd;
@@ -40,6 +41,12 @@ public final class RiskGates {
     private final long cooldownNanos;
     private final long maxBookAgeNanos;
     private final long clockSkewToleranceNanos;
+    // REVIEW.md MED-01: sampled by BotService's periodic RTT-corrected clock-skew timer and gated
+    // here -- previously sampled and surfaced in readiness/API only, never actually consulted before
+    // firing. volatile: written from the Vert.x event-loop thread's periodic timer callback, read
+    // from the detector thread's canFire() hot path.
+    private volatile boolean clockSkewKnown;
+    private volatile long clockSkewNanos;
 
     private final AtomicLongArray lastFireNanosByTriangle;
     private final AtomicInteger openCycles = new AtomicInteger(0);
@@ -51,8 +58,10 @@ public final class RiskGates {
     private int ringCount;
 
     public RiskGates(BotConfig.RiskConfig riskConfig, BotConfig.StrategyConfig strategyConfig,
-                      BotConfig.ExecConfig execConfig, int triangleCount, KillSwitch killSwitch) {
+                      BotConfig.ExecConfig execConfig, int triangleCount, KillSwitch killSwitch,
+                      boolean dryRun) {
         this.killSwitch = killSwitch;
+        this.dryRun = dryRun;
 
         // cf-arb-bot-review-plan.md Tier 2 step 2.5: a non-positive limit here previously widened
         // silently to 1 via Math.max(1, ...) instead of being rejected -- fail closed (S5) on a
@@ -106,6 +115,19 @@ public final class RiskGates {
         if (killSwitch.tripped()) {
             return false;
         }
+        // REVIEW.md MED-01/MED-02: an unknown skew (no successful sample yet) fails closed ONLY in
+        // live mode -- this gate exists to protect real signed requests against MEXC's -1021
+        // ("timestamp outside recvWindow"), which dry-run never sends. Blocking paper trading
+        // because this host happens to have no route to MEXC's time endpoint would be a false
+        // safety, not a real one. A CONFIRMED skew beyond tolerance blocks in both modes -- it is
+        // useful, actionable information about this host's clock regardless of trading mode.
+        if (clockSkewKnown) {
+            if (Math.abs(clockSkewNanos) > clockSkewToleranceNanos) {
+                return false;
+            }
+        } else if (!dryRun) {
+            return false;
+        }
         if (openCycles.get() >= maxOpenCycles) {
             return false;
         }
@@ -157,5 +179,13 @@ public final class RiskGates {
 
     public long clockSkewToleranceNanos() {
         return clockSkewToleranceNanos;
+    }
+
+    /** Called from {@code BotService}'s periodic clock-skew timer (RTT-corrected -- see
+     * {@code BotService#scheduleWarmUpAndClockSkew}'s javadoc for the midpoint-estimate fix,
+     * REVIEW.md MED-02) whenever a sample is successfully taken. */
+    public void updateClockSkew(long skewNanos) {
+        this.clockSkewNanos = skewNanos;
+        this.clockSkewKnown = true;
     }
 }

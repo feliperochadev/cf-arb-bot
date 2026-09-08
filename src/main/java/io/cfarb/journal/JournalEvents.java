@@ -60,6 +60,16 @@ public final class JournalEvents {
                 + "}";
     }
 
+    /** REVIEW.md MAJ-06: the feed watchdog forcing a reconnect (recoverable) rather than tripping
+     * the kill switch outright -- {@code attempt} is the consecutive-detection count so a reader can
+     * tell "reconnected on the first try" from "still stuck after several attempts, about to trip". */
+    public static String feedReconnect(String reason, int attempt) {
+        return "{\"type\":\"feed_reconnect\",\"ts_us\":" + EpochMicros.now()
+                + ",\"reason\":\"" + esc(reason) + "\""
+                + ",\"attempt\":" + attempt
+                + "}";
+    }
+
     public static String latencySnapshot(long p50Nanos, long p99Nanos, long maxNanos, String stage) {
         return "{\"type\":\"latency_snapshot\",\"ts_us\":" + EpochMicros.now()
                 + ",\"stage\":\"" + esc(stage) + "\""

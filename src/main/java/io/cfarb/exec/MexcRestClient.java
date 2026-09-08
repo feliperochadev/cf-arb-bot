@@ -186,6 +186,44 @@ public final class MexcRestClient implements MexcOrderApi {
         return f;
     }
 
+    /**
+     * {@code DELETE /api/v3/order} by {@code origClientOrderId} -- REVIEW.md MAJ-03: cancels a
+     * resting order before {@link OrderReconciler} treats it as terminal, closing the race where a
+     * timed-out or partially-filled order fills the rest of its way while {@link Unwinder} is
+     * already acting on the assumption it was done. Best-effort by design: MEXC returns an error if
+     * the order already reached a terminal state (fully filled, already canceled, or never existed)
+     * -- that is not a failure of this call, it just means there was nothing left to cancel, so the
+     * caller treats any response (success or failure) the same way: re-query for the final state.
+     */
+    public CompletableFuture<String> cancelOrder(String symbol, String clientOrderId, long timeoutMs) {
+        return signedDelete("/api/v3/order", "symbol=" + symbol + "&origClientOrderId=" + clientOrderId, timeoutMs);
+    }
+
+    private CompletableFuture<String> signedDelete(String path, String queryString, long timeoutMs) {
+        long timestamp = System.currentTimeMillis();
+        String totalParams = queryString + "&recvWindow=" + recvWindowMs + "&timestamp=" + timestamp;
+        String signature = signer.sign(totalParams);
+        String fullQuery = totalParams + "&signature=" + signature;
+
+        CompletableFuture<String> f = new CompletableFuture<>();
+        client.delete(path + "?" + fullQuery)
+                .putHeader("X-MEXC-APIKEY", apiKey)
+                .timeout(timeoutMs)
+                .send(ar -> {
+                    if (ar.failed()) {
+                        f.completeExceptionally(ar.cause());
+                        return;
+                    }
+                    HttpResponse<Buffer> resp = ar.result();
+                    if (resp.statusCode() / 100 != 2) {
+                        f.completeExceptionally(new OrderRejectedException(resp.statusCode(), resp.bodyAsString()));
+                        return;
+                    }
+                    f.complete(resp.bodyAsString());
+                });
+        return f;
+    }
+
     /** Thrown when MEXC responds with a non-2xx to a signed request. Never includes the request
      * body/signature in its message (S3). */
     public static final class OrderRejectedException extends RuntimeException {

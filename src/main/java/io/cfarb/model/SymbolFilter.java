@@ -50,5 +50,14 @@ public record SymbolFilter(
          * order {@code type} parameter — e.g. {@code {"LIMIT","MARKET","LIMIT_MAKER"}}. Startup
          * validation in live mode requires {@code cf-bot.exec.order-type} to be a member of this
          * set for every triangle's every leg. */
-        Set<String> orderTypes) {
+        Set<String> orderTypes,
+        /** MEXC's {@code PERCENT_PRICE_BY_SIDE} filter band for this symbol -- how far a BID may
+         * sit above, or an ASK below, a reference price before the venue rejects it. Populated from
+         * {@code exchangeInfo}'s {@code filters[].bidMultiplierUp}/{@code askMultiplierDown}.
+         * {@code exec.Unwinder} (Tier A4) clamps its cross-the-book reversal price inside this band
+         * -- these vary a lot across the configured universe (0.005 on BTCUSDT/ETHUSDT, 0.02 on
+         * most majors-vs-stablecoin pairs, 0.1 on the thin XRP/SOL cross pairs), so a single global
+         * buffer cannot be safe for all of them. */
+        double bidMultiplierUp,
+        double askMultiplierDown) {
 }

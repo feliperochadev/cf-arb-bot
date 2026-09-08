@@ -53,11 +53,15 @@ java -jar target/quarkus-app/quarkus-run.jar   # dry-run by default -- connects 
 rebuilding. Re-fetch periodically — MEXC's fee promotions have an expiry (see
 `../cf-arb-bot-plan.md` §2.2).
 
-**Open wire-format question (blocks live mode):** none of the 9 configured symbols currently
-advertise support for `cf-bot.exec.order-type`'s `IMMEDIATE_OR_CANCEL` value in
-`GET /api/v3/exchangeInfo` (only `LIMIT`/`MARKET`/`LIMIT_MAKER`) — startup validation fails closed
-on this in live mode. Resolving it needs either a credentialed live probe (see CLAUDE.md #9's
-verify-before-trust discipline) or a redesign around a resting `LIMIT`/`LIMIT_MAKER` order.
+**Open wire-format question (does NOT block live-mode startup, just verification):** MEXC's
+documented `type` ENUM for `POST /api/v3/order` is `LIMIT`/`MARKET`/`LIMIT_MAKER`/`IOC`/`FOK` —
+confirmed directly against MEXC's own published spot v3 API reference — and there is no separate
+`timeInForce` parameter at all. `cf-bot.exec.order-type` defaults to `IOC`. Confirmed live across
+ALL 2074 MEXC spot symbols: `exchangeInfo`'s per-symbol `order_types` never lists `IOC`/`FOK` for
+ANY symbol, so startup validation cannot confirm this by membership and instead logs a loud WARN
+("unverified until the 1-USDT probe runs") rather than refusing to start. The credentialed 1-USDT
+live probe (see CLAUDE.md #9's verify-before-trust discipline) is what actually settles whether
+`IOC` is accepted for these symbols — this callout exists so nobody mistakes the WARN for silence.
 
 ## API (read-only — security rule S12)
 
@@ -95,6 +99,13 @@ The read-only API has no security-group ingress at all — it stays loopback-onl
 --document-name AWS-StartPortForwardingSession \
 --parameters '{"portNumber":["8080"],"localPortNumber":["8080"]}'`, then browse
 `http://localhost:8080/api/v1/state` locally.
+
+**Deploy layout (REVIEW.md MAJ-07):** the systemd unit's `ExecStart` runs
+`/opt/cf-arb-bot/quarkus-run.jar`, which is a thin bootstrap runner requiring its sibling `lib/`,
+`app/`, and `quarkus/` directories (Quarkus 3.x's fast-jar layout) alongside it. The deploy step
+must sync the ENTIRE `target/quarkus-app/` tree into `/opt/cf-arb-bot/` — e.g.
+`rsync -a target/quarkus-app/ host:/opt/cf-arb-bot/` — copying `quarkus-run.jar` alone crashes with
+`ClassNotFoundException: io.quarkus.bootstrap.runner.QuarkusEntryPoint`.
 
 ## Honest limits
 

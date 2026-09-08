@@ -84,6 +84,11 @@ public final class SymbolFilterLoader {
                     orderTypes.add(t.asText());
                 }
             }
+            // cf-arb-bot-review-plan.md (second pass) Tier A4: PERCENT_PRICE_BY_SIDE band, used to
+            // clamp exec.Unwinder's cross-the-book reversal price. Absent (null in the snapshot) is
+            // treated as "no band published" -- callers must not assume 0 means "no room to cross".
+            double bidMultiplierUp = optionalDouble(n, "bid_multiplier_up", Double.NaN);
+            double askMultiplierDown = optionalDouble(n, "ask_multiplier_down", Double.NaN);
             out.put(symbol, new SymbolFilter(
                     symbol,
                     n.get("base_asset").asText(),
@@ -95,7 +100,9 @@ public final class SymbolFilterLoader {
                     pricePrecision,
                     takerBps,
                     feeMultiplierFixed,
-                    orderTypes));
+                    orderTypes,
+                    bidMultiplierUp,
+                    askMultiplierDown));
         }
         return out;
     }
@@ -116,5 +123,13 @@ public final class SymbolFilterLoader {
                     + field + "': " + source);
         }
         return v.asDouble();
+    }
+
+    /** Unlike {@link #requireDouble}, absence (or an explicit JSON {@code null}, which the loader's
+     * own writer emits for a symbol with no published PERCENT_PRICE_BY_SIDE band) is not an error --
+     * it returns {@code fallback} so callers can distinguish "no band published" from "band is 0". */
+    private static double optionalDouble(JsonNode n, String field, double fallback) {
+        JsonNode v = n.get(field);
+        return (v == null || v.isNull()) ? fallback : v.asDouble();
     }
 }

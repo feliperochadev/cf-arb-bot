@@ -53,6 +53,16 @@ public final class BookRegistry {
         return books[symbolIndex];
     }
 
+    /** Published top-of-book for {@code symbolIndex}, for {@code exec.Unwinder}'s emergency
+     * reversal pricing ONLY (Tier A4) -- see {@link L2Book#topBidFixed()}'s javadoc. */
+    public long topBidFixed(int symbolIndex) {
+        return books[symbolIndex].topBidFixed();
+    }
+
+    public long topAskFixed(int symbolIndex) {
+        return books[symbolIndex].topAskFixed();
+    }
+
     /** Reset every book (cf-arb-bot-review-plan.md Tier 1 step 1.7) -- call on WebSocket disconnect
      * and again immediately before re-subscribing on reconnect. Without this, a stale ladder and
      * version-chain survive a reconnect; if the venue's push channel ever omits version fields, the

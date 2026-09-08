@@ -23,7 +23,7 @@ class TriangleRegistryTest {
     private static SymbolFilter filter(String symbol, String base, String quote) {
         return new SymbolFilter(symbol, base, quote, FixedPoint.fromDouble(0.01), 2,
                 FixedPoint.fromDouble(0.01), FixedPoint.fromDouble(1.0), 2, 5.0,
-                FixedPoint.fromDouble(0.9995), Set.of("LIMIT", "MARKET", "LIMIT_MAKER"));
+                FixedPoint.fromDouble(0.9995), Set.of("LIMIT", "MARKET", "LIMIT_MAKER"), 0.05, 0.05);
     }
 
     private static BotConfig.TriangleConfig triangleConfig(String... legs) {

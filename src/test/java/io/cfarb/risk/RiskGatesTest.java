@@ -34,13 +34,15 @@ class RiskGatesTest {
             public String orderType() { return "IOC"; }
             public long recvWindowMs() { return 5000; }
             public long legTimeoutMs() { return 1500; }
+            public long unwindCrossBps() { return 40; }
+            public long maxIntentAgeMs() { return 150; }
         };
     }
 
     @Test
     void notionalAboveConfiguredCapIsRejected() {
         KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(100.0)), FixedPoint.fromDouble(50.0), 3);
-        RiskGates gates = new RiskGates(risk(200.0, 1, 30, 250), strategy(), exec(), 1, ks);
+        RiskGates gates = new RiskGates(risk(200.0, 1, 30, 250), strategy(), exec(), 1, ks, true);
         long ok = FixedPoint.fromDouble(150.0);
         long tooMuch = FixedPoint.fromDouble(250.0);
         assertTrue(gates.canFire(0, ok, 1_000_000L));
@@ -51,7 +53,7 @@ class RiskGatesTest {
     void absoluteHardCapClampsEvenAMisconfiguredValue() {
         // S6: "a misconfiguration (e.g. notional=10^9) must be clamped and flagged at startup."
         KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(100.0)), FixedPoint.fromDouble(50.0), 3);
-        RiskGates gates = new RiskGates(risk(1_000_000_000.0, 1, 30, 250), strategy(), exec(), 1, ks);
+        RiskGates gates = new RiskGates(risk(1_000_000_000.0, 1, 30, 250), strategy(), exec(), 1, ks, true);
         assertTrue(gates.notionalWasClamped);
         assertTrue(gates.effectiveMaxNotionalUsd < 1_000_000_000.0);
         long huge = FixedPoint.fromDouble(1500.0); // exceeds the ABSOLUTE_MAX_NOTIONAL_USD ceiling of 1000
@@ -61,7 +63,7 @@ class RiskGatesTest {
     @Test
     void perTriangleCooldownBlocksRapidRefire() {
         KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(100.0)), FixedPoint.fromDouble(50.0), 3);
-        RiskGates gates = new RiskGates(risk(200.0, 5, 30, 250), strategy(), exec(), 2, ks);
+        RiskGates gates = new RiskGates(risk(200.0, 5, 30, 250), strategy(), exec(), 2, ks, true);
         long amt = FixedPoint.fromDouble(50.0);
         long t0 = 10_000_000_000L;
         assertTrue(gates.canFire(0, amt, t0));
@@ -75,7 +77,7 @@ class RiskGatesTest {
     @Test
     void openCycleCapBlocksASecondConcurrentCycle() {
         KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(100.0)), FixedPoint.fromDouble(50.0), 3);
-        RiskGates gates = new RiskGates(risk(200.0, 1, 30, 0), strategy(), exec(), 1, ks);
+        RiskGates gates = new RiskGates(risk(200.0, 1, 30, 0), strategy(), exec(), 1, ks, true);
         long amt = FixedPoint.fromDouble(50.0);
         assertTrue(gates.canFire(0, amt, 1L));
         gates.claim(0, 1L);
@@ -87,7 +89,7 @@ class RiskGatesTest {
     @Test
     void cyclesPerMinuteCapBlocksAfterTheLimit() {
         KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(100.0)), FixedPoint.fromDouble(50.0), 3);
-        RiskGates gates = new RiskGates(risk(200.0, 100, 2, 0), strategy(), exec(), 1, ks);
+        RiskGates gates = new RiskGates(risk(200.0, 100, 2, 0), strategy(), exec(), 1, ks, true);
         long amt = FixedPoint.fromDouble(10.0);
         assertTrue(gates.canFire(0, amt, 0L));
         gates.claim(0, 0L);
@@ -105,7 +107,7 @@ class RiskGatesTest {
     void killSwitchTripBlocksEverything() {
         Portfolio p = new Portfolio(FixedPoint.fromDouble(100.0));
         KillSwitch ks = new KillSwitch(p, FixedPoint.fromDouble(50.0), 3);
-        RiskGates gates = new RiskGates(risk(200.0, 5, 30, 0), strategy(), exec(), 1, ks);
+        RiskGates gates = new RiskGates(risk(200.0, 5, 30, 0), strategy(), exec(), 1, ks, true);
         assertTrue(gates.canFire(0, FixedPoint.fromDouble(10.0), 1L));
         p.applyRealizedPnl(FixedPoint.fromDouble(-60.0)); // equity 100 -> 40, below the $50 floor
         ks.checkEquityFloor();

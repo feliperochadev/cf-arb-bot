@@ -19,6 +19,11 @@ public interface MexcOrderApi {
     /** See {@link MexcRestClient#listTrades}. */
     CompletableFuture<String> listTrades(String symbol, String orderId, long timeoutMs);
 
+    /** See {@link MexcRestClient#cancelOrder} -- REVIEW.md MAJ-03: without this, a timed-out or
+     * partially-filled order stays live on the matching engine while {@link Unwinder} runs against
+     * inventory that can still change underneath it. */
+    CompletableFuture<String> cancelOrder(String symbol, String clientOrderId, long timeoutMs);
+
     /** See {@link MexcRestClient#sign} -- dry-run's "sign and discard" path (Tier 1 step 1.9). */
     String sign(String queryString);
 }
