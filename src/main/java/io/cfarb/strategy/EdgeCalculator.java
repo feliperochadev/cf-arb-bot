@@ -24,6 +24,15 @@ import io.cfarb.util.FixedPoint;
  * <p>Zero allocation on the hot path: {@link Result} and the internal {@link Sizer.Result} are
  * reusable output parameters, allocated once per {@code OpportunityDetector} instance and passed by
  * reference (rule R1).
+ *
+ * <p><b>REVIEW.md MED-03</b> ("Sizer.fillAsk overstates quote notional on multi-level walks"):
+ * verified NOT a defect. {@code Sizer.Result#quoteFixed} is {@code baseFilled x worstPrice}, which
+ * is exactly the notional MEXC's own min-notional filter evaluates for a limit order priced at that
+ * boundary -- it is the correct value for its one real use (Sizer's own {@code minNotional} check).
+ * The finding also claimed downstream modules "misstate the expected spend" from this value; in
+ * fact nothing downstream ever read it -- {@link Result} previously carried a {@code legQuoteFixed[]}
+ * array populated from this same field and never consumed anywhere. Removed as dead code rather
+ * than "fixing" an already-correct number.
  */
 public final class EdgeCalculator {
 
@@ -46,8 +55,6 @@ public final class EdgeCalculator {
          * cf-arb-bot-review-plan.md Tier 1 step 1.1: exec.CycleExecutor must submit exactly this,
          * not re-derive a (smaller) quantity from budget/worstPrice. */
         public final long[] legBaseQtyFixed = new long[3];
-        /** Per-leg quote-asset amount Sizer actually computed for that leg (1e8-fixed). */
-        public final long[] legQuoteFixed = new long[3];
     }
 
     /**
@@ -76,7 +83,6 @@ public final class EdgeCalculator {
             }
             out.legWorstPriceFixed[leg] = legResult.worstPriceFixed;
             out.legBaseQtyFixed[leg] = legResult.baseQtyFixed;
-            out.legQuoteFixed[leg] = legResult.quoteFixed;
             amount = legResult.outputAmount;
         }
 

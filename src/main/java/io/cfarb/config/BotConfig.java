@@ -114,16 +114,28 @@ public interface BotConfig {
     }
 
     interface ExecConfig {
-        /** cf-arb-bot-review-plan.md Tier 1 step 1.3: {@code IOC} is not a real MEXC order-type
-         * value (confirmed against the spot v3 API's published ENUM definitions 2026-09-07) --
-         * there is no separate {@code timeInForce} parameter on {@code POST /api/v3/order}; the
-         * {@code type} value itself carries that semantic, and the real value is
-         * {@code IMMEDIATE_OR_CANCEL}. NOTE: none of this bot's 9 currently configured symbols
-         * advertise support for it in {@code GET /api/v3/exchangeInfo} (only LIMIT/MARKET/
-         * LIMIT_MAKER) -- startup validation in live mode (see BotService) fails closed on this
-         * until either MEXC enables it for these symbols or the execution design changes. This is a
-         * genuine open product question, not resolved by this config change alone. */
-        @WithDefault("IMMEDIATE_OR_CANCEL")
+        /** cf-arb-bot-review-plan.md's SECOND independent review (REVIEW.md) caught an error the
+         * FIRST remediation pass introduced: that pass changed this default to
+         * {@code IMMEDIATE_OR_CANCEL} on the theory that {@code IOC} "is not a real MEXC order-type
+         * value." That theory was wrong. Confirmed twice against MEXC's own published spot v3 API
+         * reference (section "New Order"): the documented {@code type} ENUM is
+         * {@code LIMIT}/{@code MARKET}/{@code LIMIT_MAKER}/{@code IOC}/{@code FOK}, and
+         * {@code POST /api/v3/order}'s request parameter table has NO {@code timeInForce} field at
+         * all (it appears only in responses/other endpoints) -- so neither the original code's
+         * {@code IOC} nor the first pass's {@code IMMEDIATE_OR_CANCEL} was resolved by adding a
+         * {@code timeInForce} parameter; {@code IOC} was the correct short-form value the whole
+         * time. Restored here.
+         *
+         * <p>Separately confirmed live across ALL 2074 MEXC spot symbols (not just this bot's 9-13):
+         * {@code exchangeInfo}'s per-symbol {@code order_types} is always exactly one of
+         * {@code [LIMIT,MARKET,LIMIT_MAKER]} or {@code [LIMIT,LIMIT_MAKER]} -- {@code IOC}/
+         * {@code FOK} never appear there for any symbol on this venue, for any order type this bot
+         * could configure. A strict membership check is therefore structurally unsatisfiable
+         * whenever this is IOC/FOK; {@code BotService.validateOrderType} treats that specific
+         * combination as unverified-but-permitted (a loud startup WARN), not a boot failure --
+         * settling it for real needs the credentialed 1-USDT live probe this project's release gate
+         * already requires before {@code dry-run=false}. */
+        @WithDefault("IOC")
         String orderType();
 
         @WithDefault("5000")
@@ -131,6 +143,24 @@ public interface BotConfig {
 
         @WithDefault("1500")
         long legTimeoutMs();
+
+        /** cf-arb-bot-review-plan.md (second pass) Tier A4: basis-point buffer {@code exec.Unwinder}
+         * crosses the CURRENT top of book by when reversing a held asset back toward the anchor --
+         * pricing a reversal at the original leg's entry-boundary price (the previous design) fails
+         * deterministically in both directions, since it requires the market to move favorably
+         * rather than crossing it. Clamped per-symbol inside {@code SymbolFilter}'s
+         * {@code PERCENT_PRICE_BY_SIDE} band before submission; 40 bps sits comfortably inside even
+         * the tightest configured band (BTCUSDT/ETHUSDT at 0.5%) and well outside any observed
+         * spread on these symbols. */
+        @WithDefault("40")
+        long unwindCrossBps();
+
+        /** cf-arb-bot-review-plan.md (second pass) Tier A7 / REVIEW.md MED-10: an {@link
+         * io.cfarb.model.OrderIntent} older than this when the executor thread finally dequeues it
+         * is dropped rather than executed -- triangular arbitrage opportunities live 50-150ms;
+         * acting on one that is already older than that all but guarantees leg failures. */
+        @WithDefault("150")
+        long maxIntentAgeMs();
     }
 
     interface JournalConfig {
@@ -139,5 +169,15 @@ public interface BotConfig {
 
         /** Absent = local only. Never a secret — bucket name, not credentials. */
         java.util.Optional<String> s3Bucket();
+
+        /** Third-pass review finding: minimum interval between two journaled REJECT events for the
+         * SAME triangle. Every candidate clearing the cheap risk gates hits a reject path, and the
+         * per-triangle cooldown only advances on an actual fire, so the previous unsampled form
+         * wrote ~900 NDJSON lines/second (~10 GB/day) at the measured feed rate — enough to fill the
+         * deployed 20 GB root volume in about two days of DRY-RUN. Fires and order-queue-full events
+         * are never sampled; suppressed rejects are counted as {@code cfarb.journal.suppressed}.
+         * Set to 0 to journal every reject (the old behavior — only sane for short local captures). */
+        @WithDefault("1000")
+        long rejectSampleMs();
     }
 }

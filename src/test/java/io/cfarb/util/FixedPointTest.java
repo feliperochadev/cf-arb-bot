@@ -67,6 +67,51 @@ class FixedPointTest {
     }
 
     @Test
+    void mulDivOverflowBranchIsAllocationFreeAndMatchesRealBtcusdtLevelNotional() {
+        // Third-pass review finding (NEW-6): a single BTCUSDT-sized top-of-book level already
+        // overflows a plain a*b -- price=77855.52 (real fixture value, mexc_depth_00.pb.bin) and
+        // qty=6.77949504 (same fixture), both 1e8-fixed, is exactly Sizer.fillAsk's
+        // mulDiv(price, qty, SCALE) call on the Netty event-loop thread. Cross-checked against
+        // BigInteger (the previous implementation) to confirm the allocation-free 128-bit division
+        // is bit-for-bit identical, not merely "close enough".
+        long price = FixedPoint.fromDouble(77855.52);
+        long qty = FixedPoint.fromDouble(6.77949504);
+        long expected = java.math.BigInteger.valueOf(price).multiply(java.math.BigInteger.valueOf(qty))
+                .divide(java.math.BigInteger.valueOf(FixedPoint.SCALE)).longValueExact();
+        assertEquals(expected, FixedPoint.mulDiv(price, qty, FixedPoint.SCALE));
+        // Sanity: ~527,821.11 USDT notional for that one level (77855.52 * 6.77949504).
+        assertEquals(527821.11, FixedPoint.toDouble(expected), 0.01);
+    }
+
+    @Test
+    void mulDivOverflowBranchMatchesBigIntegerAcrossARandomSweep() {
+        // Deterministic seed -- a property-style cross-check against the previous BigInteger
+        // implementation over many overflow-triggering (a, b, c) triples, not just the two hand
+        // -picked cases above. Every triple is non-negative, matching the only domain mulDiv is
+        // ever actually called with in this codebase.
+        java.util.SplittableRandom rnd = new java.util.SplittableRandom(20260909L);
+        for (int i = 0; i < 100_000; i++) {
+            long a = rnd.nextLong(1L, Long.MAX_VALUE);
+            long b = rnd.nextLong(1L, Long.MAX_VALUE);
+            long c = rnd.nextLong(1L, Long.MAX_VALUE);
+            long high = Math.multiplyHigh(a, b);
+            long low = a * b;
+            boolean overflow = high != (low >> 63);
+            if (!overflow) {
+                continue; // only the overflow branch is under test here
+            }
+            java.math.BigInteger expected = java.math.BigInteger.valueOf(a).multiply(java.math.BigInteger.valueOf(b))
+                    .divide(java.math.BigInteger.valueOf(c));
+            if (expected.bitLength() >= 63) {
+                continue; // result itself wouldn't fit a long -- not a shape mulDiv's callers produce
+            }
+            long actual = FixedPoint.mulDiv(a, b, c);
+            assertEquals(expected.longValueExact(), actual,
+                    () -> "mismatch for a=" + a + " b=" + b + " c=" + c);
+        }
+    }
+
+    @Test
     void mulDivDoesNotSilentlyOverflowInTheSignedRangeBetweenLongMaxAndTwoToTheSixtyFour() {
         // Regression for a real bug found while porting cf-trader's mulDiv: Math.multiplyHigh(a,b)
         // == 0 only proves the product fits UNSIGNED in 64 bits (~1.8447e19), not that it fits the

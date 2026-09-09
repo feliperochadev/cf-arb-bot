@@ -43,7 +43,7 @@ class CycleExecutorTest {
         long feeMultiplierFixed = FixedPoint.fromDouble(1.0 - takerBps / 10_000.0);
         return new SymbolFilter(symbol, base, quote, FixedPoint.fromDouble(qtyStep), qtyDecimals,
                 FixedPoint.fromDouble(minQty), FixedPoint.fromDouble(minNotional), priceDecimals, takerBps,
-                feeMultiplierFixed, Set.of("LIMIT", "MARKET", "LIMIT_MAKER"));
+                feeMultiplierFixed, Set.of("LIMIT", "MARKET", "LIMIT_MAKER"), 0.05, 0.05);
     }
 
     private static final SymbolFilter BTCUSDT = filter("BTCUSDT", "BTC", "USDT", 1e-6, 6, 1e-6, 1.0, 2, 5.0);
@@ -84,9 +84,11 @@ class CycleExecutorTest {
 
     private static BotConfig.ExecConfig execConfig() {
         return new BotConfig.ExecConfig() {
-            public String orderType() { return "IMMEDIATE_OR_CANCEL"; }
+            public String orderType() { return "IOC"; }
             public long recvWindowMs() { return 5000; }
             public long legTimeoutMs() { return 1500; }
+            public long unwindCrossBps() { return 40; }
+            public long maxIntentAgeMs() { return 150; }
         };
     }
 
@@ -107,7 +109,7 @@ class CycleExecutorTest {
         api = new FakeMexcOrderApi();
         portfolio = new Portfolio(FixedPoint.fromDouble(100.0));
         killSwitch = new KillSwitch(portfolio, FixedPoint.fromDouble(10.0), 3);
-        riskGates = new RiskGates(riskConfig(), strategyConfig(), execConfig(), 1, killSwitch);
+        riskGates = new RiskGates(riskConfig(), strategyConfig(), execConfig(), 1, killSwitch, true);
         metrics = new BotMetrics(new SimpleMeterRegistry());
         journal = new EventJournal(tempDir.resolve("journal"), metrics);
         journal.start();
@@ -124,9 +126,9 @@ class CycleExecutorTest {
         Map<String, SymbolFilter> filters = Map.of("BTCUSDT", BTCUSDT, "XRPBTC", XRPBTC, "XRPUSDT", XRPUSDT);
         triangles = new TriangleRegistry(triangleConfigs, "USDT", books, filters);
 
-        Unwinder unwinder = new Unwinder(api, "IMMEDIATE_OR_CANCEL", 1500);
+        Unwinder unwinder = new Unwinder(api, "IOC", 1500, books, 40);
         executor = new CycleExecutor(queue, triangles, riskGates, killSwitch, portfolio, metrics, journal,
-                false, api, unwinder, "IMMEDIATE_OR_CANCEL", 1500);
+                false, api, unwinder, "IOC", 1500, 150);
         executor.start();
     }
 
@@ -182,9 +184,19 @@ class CycleExecutorTest {
     void partialFillOnLeg0AbortsAndUnwindsRatherThanContinuing() throws InterruptedException {
         // leg 0 only 60% filled -- must abort (no leg 1/2 submission) and unwind leg 0 back to the
         // anchor, never continue forward at the reduced size.
+        //
+        // Two-entry sequence for leg 0's own order (third-pass review, M5): the first query reports
+        // PARTIALLY_FILLED (still resting) -- OrderReconciler cancels it and re-queries; the SECOND
+        // entry is what that re-query sees, here a terminal CANCELED with the fill amount unchanged
+        // (the cancel took effect cleanly, nothing further filled -- the ordinary case). A single
+        // scriptQuery() here would leave leg 0 stuck reporting PARTIALLY_FILLED even after the
+        // cancel, which OrderReconciler now correctly classifies UNKNOWN rather than PARTIAL.
         long requested = FixedPoint.fromDouble(0.001285);
         long partial = FixedPoint.fromDouble(0.0007);
-        api.scriptQuery("BTCUSDT", partial, FixedPoint.fromDouble(0.0007 * 77850.0), "PARTIALLY_FILLED", "o0");
+        long partialQuote = FixedPoint.fromDouble(0.0007 * 77850.0);
+        api.scriptQuerySequence("BTCUSDT",
+                FakeMexcOrderApi.response(partial, partialQuote, "PARTIALLY_FILLED", "o0"),
+                FakeMexcOrderApi.response(partial, partialQuote, "CANCELED", "o0"));
         // the unwind reversal (SELL back on BTCUSDT) fills fully
         api.scriptQuery("BTCUSDT", partial, FixedPoint.fromDouble(0.0007 * 77850.0 * 0.999), "FILLED", "rev0");
 

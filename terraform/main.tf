@@ -232,6 +232,14 @@ resource "aws_iam_instance_profile" "bot" {
 # `aws ssm put-parameter --name /cf-arb-bot/mexc-api-key --type SecureString --value '<key>'`
 # Terraform manages the parameter's existence/type for review purposes but the actual secret value
 # must never pass through `terraform plan`/state -- see cf-arb-bot-plan.md §6.2.
+#
+# REVIEW.md MAJ-05: `terraform apply` no longer depends on these parameters existing first --
+# user_data.sh's first-boot secret fetch is at the END of the script and non-fatal, so an `apply`
+# run before these `put-parameter` commands still finishes cloud-init successfully (with a WARNING
+# in its log). The unit's `ExecStartPre` is the real, fail-closed gate: the service will not START
+# without valid secrets, but the INSTANCE will boot regardless of ordering. Populating these before
+# `terraform apply` remains the recommended order (no WARNING, no extra boot-then-retry step), just
+# no longer a hard prerequisite for the instance to come up at all.
 
 # --- Journal bucket ---
 

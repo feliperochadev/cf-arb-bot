@@ -43,10 +43,17 @@ public final class OpportunityDetector {
     private final EdgeCalculator edgeCalculator = new EdgeCalculator();
     private final EdgeCalculator.Result edgeResult = new EdgeCalculator.Result();
 
+    /** Third-pass review finding: per-triangle timestamp of the last REJECT journaled, so the
+     * reject stream is sampled rather than emitted at full feed rate. See {@link #journalReject}.
+     * Detector-thread-only, like every other counter here -- no synchronization. */
+    private final long[] lastRejectJournalNanos;
+    private final long rejectJournalIntervalNanos;
+
     public OpportunityDetector(BookRegistry books, TriangleRegistry triangles, RiskGates riskGates,
                                 Portfolio portfolio, BotMetrics metrics, EventJournal journal,
                                 SpscArrayQueue<OrderIntent> orderQueue,
-                                double minNetBps, double slippageBufferBps, boolean compound) {
+                                double minNetBps, double slippageBufferBps, boolean compound,
+                                long rejectJournalIntervalMs) {
         this.books = books;
         this.triangles = triangles;
         this.riskGates = riskGates;
@@ -59,6 +66,12 @@ public final class OpportunityDetector {
         this.compound = compound;
         this.seedFixed = portfolio.seed();
         this.maxNotionalFixed = io.cfarb.util.FixedPoint.fromDouble(riskGates.effectiveMaxNotionalUsd);
+        this.rejectJournalIntervalNanos = rejectJournalIntervalMs * 1_000_000L;
+        this.lastRejectJournalNanos = new long[Math.max(1, triangles.triangleCount())];
+        // Same "0 is not a safe never-happened sentinel" reasoning as RiskGates' cooldown array:
+        // nanoTime's origin is arbitrary per JVM. Seed far enough in the past that the FIRST reject
+        // for every triangle is always journaled, while staying clear of subtraction overflow.
+        java.util.Arrays.fill(lastRejectJournalNanos, Long.MIN_VALUE / 2);
     }
 
     /** Called after {@code symbolIndex}'s book has just been updated. {@code nowNanos} must be
@@ -91,15 +104,14 @@ public final class OpportunityDetector {
         if (!edgeResult.fillable) {
             metrics.recordOpportunityRejectedUnfillable();
             // cf-arb-bot-review-plan.md Tier 2 step 2.6 / plan §8: "the rejects are the interesting
-            // half" -- journal every candidate that reaches this point (past the cheap risk gates),
-            // not only the ones that fire.
-            journal.write(JournalEvents.opportunity(tri.name(), Double.NaN, candidateNotional, false, "unfillable"));
+            // half" -- but SAMPLED, not one line per candidate per frame (see journalReject).
+            journalReject(triangleIndex, tri.name(), Double.NaN, candidateNotional, "unfillable", nowNanos);
             return; // top-of-book may have looked good, but the real ladder/lot-size can't fill it
         }
         metrics.recordOpportunityDetected();
         if (edgeResult.netBps <= minNetBps + slippageBufferBps) {
-            journal.write(JournalEvents.opportunity(tri.name(), edgeResult.netBps, candidateNotional, false,
-                    "below-threshold"));
+            journalReject(triangleIndex, tri.name(), edgeResult.netBps, candidateNotional,
+                    "below-threshold", nowNanos);
             return; // real edge doesn't clear threshold + slippage buffer
         }
 
@@ -120,6 +132,32 @@ public final class OpportunityDetector {
         }
         metrics.recordOpportunityFired();
         journal.write(JournalEvents.opportunity(tri.name(), edgeResult.netBps, candidateNotional, true, null));
+    }
+
+    /**
+     * Journal a REJECTED candidate, at most once per triangle per {@code cf-bot.journal.reject-sample-ms}.
+     *
+     * <p><b>Third-pass review finding.</b> Every candidate that clears the cheap risk gates reaches
+     * one of the two reject paths, and {@code canFire}'s per-triangle cooldown only advances on
+     * {@link RiskGates#claim} — so a triangle that never fires was writing a journal line on EVERY
+     * book update it touched. At the measured feed rate (aggre.depth@10ms, 14-41ms per symbol) over
+     * 9 symbols and 10 triangles that is roughly 900 lines/second, ~10 GB/day against a 20 GB root
+     * volume — in dry-run, the default mode. It also put ~900 {@code String} allocations/second
+     * (JournalEvents' formatting) on the Netty event-loop thread, which rule R1 forbids outright.
+     *
+     * <p>Fires and genuine anomalies (order-queue-full) stay UNSAMPLED — they are rare by
+     * construction and are the events an operator actually reconstructs a session from. Suppressed
+     * rejects are counted ({@code cfarb.journal.suppressed}), never silently dropped:
+     * recorder-service non-negotiable #2, "a dropped frame that isn't counted is a lie."
+     */
+    private void journalReject(int triangleIndex, String name, double netBps, long candidateNotional,
+                                String reason, long nowNanos) {
+        if (nowNanos - lastRejectJournalNanos[triangleIndex] < rejectJournalIntervalNanos) {
+            metrics.recordJournalSuppressed();
+            return;
+        }
+        lastRejectJournalNanos[triangleIndex] = nowNanos;
+        journal.write(JournalEvents.opportunity(name, netBps, candidateNotional, false, reason));
     }
 
     private boolean allLegsFresh(Triangle tri, long nowNanos) {

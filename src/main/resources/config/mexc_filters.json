@@ -1,7 +1,7 @@
 {
   "as_of": "2026-09-07",
   "source_url": "https://api.mexc.com/api/v3/exchangeInfo",
-  "notes": "quote_asset_precision added 2026-09-07 (cf-arb-bot-review-plan.md Tier 1 step 1.3) -- re-verified live against exchangeInfo. All other fields already matched the live venue; only the price-side precision was previously missing. order_types is unchanged and confirmed live: NONE of these 9 symbols advertise IMMEDIATE_OR_CANCEL or FILL_OR_KILL support -- only LIMIT/MARKET/LIMIT_MAKER. MEXC's order-type ENUM (see spot_v3 docs, 'Order type') does include IMMEDIATE_OR_CANCEL and FILL_OR_KILL as values, and there is no separate timeInForce parameter on POST /api/v3/order -- the type value itself carries that semantic. But exchangeInfo's per-symbol order_types is what the venue actually accepts for a given symbol, and it excludes both here. This is the wire-format problem the independent review flagged: an executor that submits type=IOC (not even a real value) or type=IMMEDIATE_OR_CANCEL against these symbols is submitting a request the venue's own published capability data says it will reject. Fixed by making order-type configurable and startup-validating it against this file per symbol (fail closed in live mode) rather than resolving the underlying strategy question here -- that requires either a live authenticated probe (blocked: no MEXC_API_KEY/MEXC_API_SECRET in this environment, and CLAUDE.md #9/#8 forbid trusting an unverified channel or hitting a live exchange from an automated path) or a redesign around a resting LIMIT/LIMIT_MAKER order, which is out of this plan's scope.",
+  "notes": "Re-fetched 2026-09-07 (cf-arb-bot-review-plan.md second pass / REVIEW.md verification) to add bid_multiplier_up/ask_multiplier_down (PERCENT_PRICE_BY_SIDE) for unwind-price band clamping (Tier A4) and to re-confirm order_types. CORRECTION to this file's previous notes: the prior pass concluded 'IMMEDIATE_OR_CANCEL is the real MEXC order-type value and no symbol supports it' -- that conclusion was WRONG. MEXC's actual documented type ENUM for POST /api/v3/order is LIMIT / MARKET / LIMIT_MAKER / IOC / FOK (confirmed against MEXC's own published spot v3 API reference, section 'New Order', twice), and there is NO separate timeInForce request parameter -- it does not appear in the request parameter table at all (only in responses). IMMEDIATE_OR_CANCEL/FILL_OR_KILL are not values this endpoint accepts; IOC/FOK are the real short forms. Separately confirmed live across ALL 2074 MEXC spot symbols (not just these 9-13): order_types is always exactly one of two arrays, [LIMIT,MARKET,LIMIT_MAKER] or [LIMIT,LIMIT_MAKER] -- IOC/FOK never appears in exchangeInfo's per-symbol order_types for ANY symbol on this venue. A strict membership check against order_types can therefore never pass for type=IOC; BotService.validateOrderType treats that combination as unverified-but-permitted (loud startup WARN), not fail-closed, and the credentialed 1-USDT probe remains the real gate before dry-run=false. ETHUSDC/SOLUSDC/XRPUSDC additionally advertise no MARKET at all -- any unwind fallback path that assumes MARKET is universally available is wrong for those three.",
   "symbols": {
     "BTCUSDT": {
       "base_asset": "BTC",
@@ -16,7 +16,9 @@
         "LIMIT",
         "MARKET",
         "LIMIT_MAKER"
-      ]
+      ],
+      "bid_multiplier_up": 0.005,
+      "ask_multiplier_down": 0.005
     },
     "ETHUSDT": {
       "base_asset": "ETH",
@@ -31,7 +33,9 @@
         "LIMIT",
         "MARKET",
         "LIMIT_MAKER"
-      ]
+      ],
+      "bid_multiplier_up": 0.005,
+      "ask_multiplier_down": 0.005
     },
     "SOLUSDT": {
       "base_asset": "SOL",
@@ -46,7 +50,9 @@
         "LIMIT",
         "MARKET",
         "LIMIT_MAKER"
-      ]
+      ],
+      "bid_multiplier_up": 0.02,
+      "ask_multiplier_down": 0.02
     },
     "XRPUSDT": {
       "base_asset": "XRP",
@@ -61,7 +67,9 @@
         "LIMIT",
         "MARKET",
         "LIMIT_MAKER"
-      ]
+      ],
+      "bid_multiplier_up": 0.02,
+      "ask_multiplier_down": 0.02
     },
     "ETHBTC": {
       "base_asset": "ETH",
@@ -76,7 +84,9 @@
         "LIMIT",
         "MARKET",
         "LIMIT_MAKER"
-      ]
+      ],
+      "bid_multiplier_up": 0.02,
+      "ask_multiplier_down": 0.02
     },
     "SOLBTC": {
       "base_asset": "SOL",
@@ -91,7 +101,9 @@
         "LIMIT",
         "MARKET",
         "LIMIT_MAKER"
-      ]
+      ],
+      "bid_multiplier_up": 0.1,
+      "ask_multiplier_down": 0.1
     },
     "XRPBTC": {
       "base_asset": "XRP",
@@ -106,7 +118,9 @@
         "LIMIT",
         "MARKET",
         "LIMIT_MAKER"
-      ]
+      ],
+      "bid_multiplier_up": 0.1,
+      "ask_multiplier_down": 0.1
     },
     "XRPETH": {
       "base_asset": "XRP",
@@ -121,7 +135,9 @@
         "LIMIT",
         "MARKET",
         "LIMIT_MAKER"
-      ]
+      ],
+      "bid_multiplier_up": 0.1,
+      "ask_multiplier_down": 0.1
     },
     "BTCUSDC": {
       "base_asset": "BTC",
@@ -136,7 +152,9 @@
         "LIMIT",
         "MARKET",
         "LIMIT_MAKER"
-      ]
+      ],
+      "bid_multiplier_up": 0.02,
+      "ask_multiplier_down": 0.02
     },
     "ETHUSDC": {
       "base_asset": "ETH",
@@ -150,7 +168,9 @@
       "order_types": [
         "LIMIT",
         "LIMIT_MAKER"
-      ]
+      ],
+      "bid_multiplier_up": 0.02,
+      "ask_multiplier_down": 0.02
     },
     "SOLUSDC": {
       "base_asset": "SOL",
@@ -164,7 +184,9 @@
       "order_types": [
         "LIMIT",
         "LIMIT_MAKER"
-      ]
+      ],
+      "bid_multiplier_up": 0.1,
+      "ask_multiplier_down": 0.1
     },
     "XRPUSDC": {
       "base_asset": "XRP",
@@ -178,7 +200,9 @@
       "order_types": [
         "LIMIT",
         "LIMIT_MAKER"
-      ]
+      ],
+      "bid_multiplier_up": 0.1,
+      "ask_multiplier_down": 0.1
     },
     "USDCUSDT": {
       "base_asset": "USDC",
@@ -193,7 +217,9 @@
         "LIMIT",
         "MARKET",
         "LIMIT_MAKER"
-      ]
+      ],
+      "bid_multiplier_up": 0.02,
+      "ask_multiplier_down": 0.02
     }
   }
 }

@@ -1,5 +1,6 @@
 package io.cfarb.risk;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -34,13 +35,15 @@ class RiskGatesTest {
             public String orderType() { return "IOC"; }
             public long recvWindowMs() { return 5000; }
             public long legTimeoutMs() { return 1500; }
+            public long unwindCrossBps() { return 40; }
+            public long maxIntentAgeMs() { return 150; }
         };
     }
 
     @Test
     void notionalAboveConfiguredCapIsRejected() {
         KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(100.0)), FixedPoint.fromDouble(50.0), 3);
-        RiskGates gates = new RiskGates(risk(200.0, 1, 30, 250), strategy(), exec(), 1, ks);
+        RiskGates gates = new RiskGates(risk(200.0, 1, 30, 250), strategy(), exec(), 1, ks, true);
         long ok = FixedPoint.fromDouble(150.0);
         long tooMuch = FixedPoint.fromDouble(250.0);
         assertTrue(gates.canFire(0, ok, 1_000_000L));
@@ -51,7 +54,7 @@ class RiskGatesTest {
     void absoluteHardCapClampsEvenAMisconfiguredValue() {
         // S6: "a misconfiguration (e.g. notional=10^9) must be clamped and flagged at startup."
         KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(100.0)), FixedPoint.fromDouble(50.0), 3);
-        RiskGates gates = new RiskGates(risk(1_000_000_000.0, 1, 30, 250), strategy(), exec(), 1, ks);
+        RiskGates gates = new RiskGates(risk(1_000_000_000.0, 1, 30, 250), strategy(), exec(), 1, ks, true);
         assertTrue(gates.notionalWasClamped);
         assertTrue(gates.effectiveMaxNotionalUsd < 1_000_000_000.0);
         long huge = FixedPoint.fromDouble(1500.0); // exceeds the ABSOLUTE_MAX_NOTIONAL_USD ceiling of 1000
@@ -61,7 +64,7 @@ class RiskGatesTest {
     @Test
     void perTriangleCooldownBlocksRapidRefire() {
         KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(100.0)), FixedPoint.fromDouble(50.0), 3);
-        RiskGates gates = new RiskGates(risk(200.0, 5, 30, 250), strategy(), exec(), 2, ks);
+        RiskGates gates = new RiskGates(risk(200.0, 5, 30, 250), strategy(), exec(), 2, ks, true);
         long amt = FixedPoint.fromDouble(50.0);
         long t0 = 10_000_000_000L;
         assertTrue(gates.canFire(0, amt, t0));
@@ -75,7 +78,7 @@ class RiskGatesTest {
     @Test
     void openCycleCapBlocksASecondConcurrentCycle() {
         KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(100.0)), FixedPoint.fromDouble(50.0), 3);
-        RiskGates gates = new RiskGates(risk(200.0, 1, 30, 0), strategy(), exec(), 1, ks);
+        RiskGates gates = new RiskGates(risk(200.0, 1, 30, 0), strategy(), exec(), 1, ks, true);
         long amt = FixedPoint.fromDouble(50.0);
         assertTrue(gates.canFire(0, amt, 1L));
         gates.claim(0, 1L);
@@ -87,7 +90,7 @@ class RiskGatesTest {
     @Test
     void cyclesPerMinuteCapBlocksAfterTheLimit() {
         KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(100.0)), FixedPoint.fromDouble(50.0), 3);
-        RiskGates gates = new RiskGates(risk(200.0, 100, 2, 0), strategy(), exec(), 1, ks);
+        RiskGates gates = new RiskGates(risk(200.0, 100, 2, 0), strategy(), exec(), 1, ks, true);
         long amt = FixedPoint.fromDouble(10.0);
         assertTrue(gates.canFire(0, amt, 0L));
         gates.claim(0, 0L);
@@ -102,10 +105,56 @@ class RiskGatesTest {
     }
 
     @Test
+    void clockSkewToleranceIsHalfTheRecvWindowNotTheFullBoundary() {
+        // Third-pass review finding (M7): the previous tolerance was the FULL recvWindow -- exactly
+        // MEXC's own -1021 rejection boundary, leaving zero margin.
+        KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(100.0)), FixedPoint.fromDouble(50.0), 3);
+        RiskGates gates = new RiskGates(risk(200.0, 5, 30, 0), strategy(), exec(), 1, ks, false);
+        assertEquals(2_500_000_000L, gates.clockSkewToleranceNanos(), "recvWindowMs=5000 -> 2500ms tolerance");
+    }
+
+    @Test
+    void staleClockSkewSampleDegradesToUnknownAndFailsClosedInLiveMode() {
+        // Third-pass review finding (M7): clockSkewKnown used to latch true FOREVER on the first
+        // sample -- an hours-old sample kept passing canFire() indefinitely even if the host lost
+        // its route to MEXC's time endpoint. A sample older than the staleness threshold must be
+        // treated exactly like "never sampled": fail closed in LIVE mode (dryRun=false).
+        KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(100.0)), FixedPoint.fromDouble(50.0), 3);
+        RiskGates gates = new RiskGates(risk(200.0, 5, 30, 0), strategy(), exec(), 1, ks, false);
+        long amt = FixedPoint.fromDouble(10.0);
+        long t0 = 10_000_000_000L;
+
+        assertFalse(gates.canFire(0, amt, t0), "no sample yet -- live mode fails closed");
+        gates.updateClockSkew(0L); // a perfect (zero-skew) sample, taken "now" via System.nanoTime()
+
+        assertTrue(gates.canFire(0, amt, t0), "a fresh sample must unblock live-mode firing");
+        // Simulate the sample going stale: canFire's nowNanos is detector-thread System.nanoTime(),
+        // the same clock updateClockSkew just recorded against -- push it far enough into the
+        // future (well past CLOCK_SKEW_SAMPLE_MAX_AGE_NANOS) that the sample must be treated as
+        // expired regardless of exactly when this test itself ran.
+        long farFuture = System.nanoTime() + 300_000_000_000L; // +300s, past the 180s staleness window
+        assertFalse(gates.canFire(0, amt, farFuture),
+                "a stale clock-skew sample must degrade to 'unknown' and fail closed in live mode, "
+                        + "not keep trusting an arbitrarily old value forever");
+    }
+
+    @Test
+    void staleClockSkewSampleDoesNotBlockDryRun() {
+        // The dry-run/live asymmetry (RiskGates' own documented rationale) must hold for a STALE
+        // sample exactly as it does for a never-taken one.
+        KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(100.0)), FixedPoint.fromDouble(50.0), 3);
+        RiskGates gates = new RiskGates(risk(200.0, 5, 30, 0), strategy(), exec(), 1, ks, true);
+        gates.updateClockSkew(0L);
+        long farFuture = System.nanoTime() + 300_000_000_000L;
+        assertTrue(gates.canFire(0, FixedPoint.fromDouble(10.0), farFuture),
+                "dry-run never sends signed requests -- a stale/missing skew sample must not block it");
+    }
+
+    @Test
     void killSwitchTripBlocksEverything() {
         Portfolio p = new Portfolio(FixedPoint.fromDouble(100.0));
         KillSwitch ks = new KillSwitch(p, FixedPoint.fromDouble(50.0), 3);
-        RiskGates gates = new RiskGates(risk(200.0, 5, 30, 0), strategy(), exec(), 1, ks);
+        RiskGates gates = new RiskGates(risk(200.0, 5, 30, 0), strategy(), exec(), 1, ks, true);
         assertTrue(gates.canFire(0, FixedPoint.fromDouble(10.0), 1L));
         p.applyRealizedPnl(FixedPoint.fromDouble(-60.0)); // equity 100 -> 40, below the $50 floor
         ks.checkEquityFloor();

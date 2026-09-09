@@ -46,6 +46,17 @@ public final class CycleState {
 
     public static final class Leg {
         public final String clientOrderId;
+        /** How much of this leg's FROM-asset was handed to it -- the anchor budget for leg 0, the
+         * previous leg's actual net proceeds for legs 1-2 (1e8-fixed, in from-asset units).
+         *
+         * <p>Third-pass review finding: without this, {@link Unwinder} had no way to know how much
+         * of a leg's input the leg failed to consume. A PARTIAL fill spends only part of what it was
+         * handed, and the remainder — still sitting in the from-asset, still real — was neither
+         * reversed nor flagged, while {@code CycleExecutor#handleBrokenCycle} booked it as a 100%
+         * loss. {@code Unwinder} now carries {@code inputAmountFixed - executed} backwards through
+         * the reversal chain. Populated for every leg BEFORE submission, so it is meaningful even
+         * for a leg that never reached the venue. */
+        public long inputAmountFixed;
         public long requestedBaseQtyFixed;
         public long requestedPriceFixed;
         public long executedBaseQtyFixed;
@@ -54,6 +65,16 @@ public final class CycleState {
          * succeeded; null/0 otherwise (see {@link #commissionEstimated}). */
         public String commissionAsset;
         public long commissionFixed;
+        /** The venue's own {@code status} field from the last successful {@code GET /api/v3/order}
+         * reconciliation (e.g. {@code NEW}, {@code PARTIALLY_FILLED}, {@code FILLED},
+         * {@code CANCELED}) -- REVIEW.md MAJ-03: {@link OrderReconciler} cancels a non-terminal
+         * order (NEW/PARTIALLY_FILLED) before treating the leg as done, rather than inferring
+         * "done" purely from comparing quantities. Null until the first successful reconciliation. */
+        public String venueStatus;
+        /** The venue-assigned {@code orderId} from the last successful reconciliation -- used for
+         * the cancel/re-query round trip and the commission lookup; may already be known from the
+         * placement response even before the first query succeeds. */
+        public String venueOrderId;
         /** True when {@link #commissionFixed} was estimated via {@code SymbolFilter#takerBps()}
          * rather than read from an actual fill -- honest bookkeeping per cf-arb-bot-review-plan.md
          * Tier 1 step 1.5: never silently pretend an estimate is a confirmed commission. */

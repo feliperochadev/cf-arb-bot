@@ -53,10 +53,36 @@ public final class JournalEvents {
                 + "}";
     }
 
+    /** REVIEW.md MED-10, dedicated event added by the third-pass review: a stale {@code OrderIntent}
+     * dropped without ever being submitted. Previously reused {@code brokenCycle}'s shape with
+     * {@code failed_leg=-1} as a sentinel meaning "no leg was ever attempted" -- but nothing else
+     * that shape's consumers (dashboards, the {@code cfarb.cycles.broken} metric) treat -1 as
+     * special, so a stale-intent drop silently inflated the broken-cycle line count in the NDJSON
+     * while {@code metrics.recordCycleBroken()} was deliberately never called for it, leaving the
+     * journal and the Prometheus counter permanently disagreeing about how many cycles actually
+     * broke. */
+    public static String intentExpired(String triangleName, long ageNanos, long equityFixed) {
+        return "{\"type\":\"intent_expired\",\"ts_us\":" + EpochMicros.now()
+                + ",\"triangle\":\"" + esc(triangleName) + "\""
+                + ",\"age_ms\":" + (ageNanos / 1_000_000.0)
+                + ",\"equity_usd\":" + io.cfarb.util.FixedPoint.toDouble(equityFixed)
+                + "}";
+    }
+
     public static String riskTrip(String reason, long equityFixed) {
         return "{\"type\":\"risk_trip\",\"ts_us\":" + EpochMicros.now()
                 + ",\"reason\":\"" + esc(reason) + "\""
                 + ",\"equity_usd\":" + io.cfarb.util.FixedPoint.toDouble(equityFixed)
+                + "}";
+    }
+
+    /** REVIEW.md MAJ-06: the feed watchdog forcing a reconnect (recoverable) rather than tripping
+     * the kill switch outright -- {@code attempt} is the consecutive-detection count so a reader can
+     * tell "reconnected on the first try" from "still stuck after several attempts, about to trip". */
+    public static String feedReconnect(String reason, int attempt) {
+        return "{\"type\":\"feed_reconnect\",\"ts_us\":" + EpochMicros.now()
+                + ",\"reason\":\"" + esc(reason) + "\""
+                + ",\"attempt\":" + attempt
                 + "}";
     }
 

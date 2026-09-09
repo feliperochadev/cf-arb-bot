@@ -90,6 +90,16 @@ public final class KillSwitch {
         trip("feed-unhealthy: " + reason);
     }
 
+    /** cf-arb-bot-review-plan.md (second pass) Tier A4: {@code exec.Unwinder}'s documented fallback
+     * ladder can conclude a reversal has NO pricing source and NO {@code MARKET} fallback either --
+     * real inventory is verifiably left in an unconverted asset with no automated recovery path.
+     * Unlike {@link #recordFailure}, this trips IMMEDIATELY rather than after
+     * {@code maxConsecutiveFailures} -- there is no "try again" for this condition, only operator
+     * intervention. */
+    public void recordUnrecoverableInventory(String reason) {
+        trip("unrecoverable-inventory: " + reason);
+    }
+
     private void trip(String reason) {
         if (tripped.compareAndSet(false, true)) {
             tripReason.set(reason);

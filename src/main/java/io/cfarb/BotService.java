@@ -58,8 +58,14 @@ public class BotService {
      * (250ms default), which gates individual fire decisions and is expected to trip routinely for
      * a momentarily-quiet illiquid symbol. This watchdog exists for the case closeHandler never
      * fires at all (a half-open TCP connection, a silently stalled proxy) -- it should only fire
-     * when literally every configured symbol has gone quiet at once. */
-    private static final long CONNECTION_DEAD_THRESHOLD_NANOS = 5_000_000_000L;
+     * when literally every configured symbol has gone quiet at once. Raised from 5s to 15s by
+     * REVIEW.md's second pass -- 5s left very little margin above ordinary feed jitter before
+     * declaring the WHOLE connection dead. */
+    private static final long CONNECTION_DEAD_THRESHOLD_NANOS = 15_000_000_000L;
+    /** REVIEW.md MAJ-06: consecutive watchdog detections (each WATCHDOG_PERIOD_MS apart) that a
+     * forced reconnect failed to clear the staleness before the kill switch is finally tripped as a
+     * last resort -- "reconnection failing repeatedly," not "the connection was briefly quiet." */
+    private static final int FEED_DEAD_TRIP_THRESHOLD = 3;
     private static final long LATENCY_SNAPSHOT_PERIOD_MS = 60_000;
     /** Dry-run never opens a socket or sends a request, but MexcSigner requires a non-empty secret
      * to construct -- cf-arb-bot-review-plan.md Tier 1 step 1.9. This is not a real credential and
@@ -86,6 +92,7 @@ public class BotService {
 
     private volatile long clockSkewNanos;
     private long clockSkewToleranceNanos;
+    private int consecutiveFeedDeadDetections; // Vert.x event-loop thread only -- single timer callback
 
     void onStart(@Observes StartupEvent ev) {
         logStartupSafetyBanner();
@@ -97,7 +104,7 @@ public class BotService {
 
         boolean dryRun = config.dryRun();
         if (!dryRun) {
-            validateOrderTypeSupported(filters);
+            validateOrderType(filters);
         }
 
         // cf-arb-bot-review-plan.md Tier 2 step 2.5: fail closed on a non-positive capital
@@ -116,7 +123,7 @@ public class BotService {
         this.killSwitch = new KillSwitch(portfolio, FixedPoint.fromDouble(equityFloorUsd),
                 config.risk().maxConsecutiveFailures());
         this.riskGates = new RiskGates(config.risk(), config.strategy(), config.exec(),
-                triangles.triangleCount(), killSwitch);
+                triangles.triangleCount(), killSwitch, dryRun);
         this.clockSkewToleranceNanos = riskGates.clockSkewToleranceNanos();
         if (riskGates.notionalWasClamped) {
             LOG.warnf("cf-bot.risk.max-notional-usd=%.2f exceeds the absolute ceiling -- clamped to %.2f "
@@ -139,7 +146,7 @@ public class BotService {
         SpscArrayQueue<OrderIntent> orderQueue = new SpscArrayQueue<>(256);
         OpportunityDetector detector = new OpportunityDetector(books, triangles, riskGates, portfolio,
                 metrics, journal, orderQueue, config.strategy().minNetBps(), config.strategy().slippageBufferBps(),
-                config.capital().compound());
+                config.capital().compound(), config.journal().rejectSampleMs());
 
         // cf-arb-bot-review-plan.md Tier 1 step 1.9: MexcRestClient (and therefore the signer) is
         // now constructed in BOTH modes, so dry-run can build and sign every request through the
@@ -158,7 +165,8 @@ public class BotService {
 
         Unwinder unwinder = null;
         if (!dryRun) {
-            unwinder = new Unwinder(restClient, config.exec().orderType(), config.exec().legTimeoutMs());
+            unwinder = new Unwinder(restClient, config.exec().orderType(), config.exec().legTimeoutMs(),
+                    books, config.exec().unwindCrossBps());
 
             WebClientOptions userDataOpts = new WebClientOptions().setSsl(true).setDefaultHost(
                     URI.create(config.venue().restUrl()).getHost()).setDefaultPort(443);
@@ -168,7 +176,8 @@ public class BotService {
         }
 
         this.executor = new CycleExecutor(orderQueue, triangles, riskGates, killSwitch, portfolio,
-                metrics, journal, dryRun, restClient, unwinder, config.exec().orderType(), config.exec().legTimeoutMs());
+                metrics, journal, dryRun, restClient, unwinder, config.exec().orderType(),
+                config.exec().legTimeoutMs(), config.exec().maxIntentAgeMs());
         executor.start();
 
         List<String> subscribeMessages = MexcProtocol.subscribeMessages(config.venue().depthChannel(), config.symbols());
@@ -204,14 +213,35 @@ public class BotService {
         });
     }
 
-    /** cf-arb-bot-review-plan.md Tier 1 step 1.3 / new defect 3: fail closed in live mode if the
-     * configured order type is not one the venue actually advertises for every configured symbol.
-     * As of this writing NONE of the 9 configured symbols advertise IMMEDIATE_OR_CANCEL support --
-     * see BotConfig.ExecConfig#orderType's javadoc -- so this will refuse to start in live mode
-     * until that changes. That is the correct, safe outcome of an unresolved wire-format question,
-     * not a bug in this check. */
-    private void validateOrderTypeSupported(Map<String, SymbolFilter> filters) {
+    /** MEXC's documented {@code type} ENUM for {@code POST /api/v3/order} (LIMIT/MARKET/
+     * LIMIT_MAKER/IOC/FOK) -- see BotConfig.ExecConfig#orderType's javadoc for how this was
+     * confirmed and why the first remediation pass's IMMEDIATE_OR_CANCEL default was wrong. */
+    private static final java.util.Set<String> MEXC_DOCUMENTED_ORDER_TYPES =
+            java.util.Set.of("LIMIT", "MARKET", "LIMIT_MAKER", "IOC", "FOK");
+    /** {@code exchangeInfo}'s per-symbol {@code order_types} never lists these two for ANY MEXC
+     * symbol (confirmed live across all 2074 spot symbols) -- membership can never be satisfied, so
+     * this bot cannot use exchangeInfo to verify them and settles for a loud warning instead of a
+     * boot failure. See BotConfig.ExecConfig#orderType's javadoc. */
+    private static final java.util.Set<String> UNVERIFIABLE_VIA_EXCHANGE_INFO = java.util.Set.of("IOC", "FOK");
+
+    /** cf-arb-bot-review-plan.md's second independent review pass (REVIEW.md MAJ-01): fail closed
+     * in live mode on an order type MEXC's API does not even define, and require every configured
+     * symbol to support LIMIT (the priced-order capability every execution path here depends on,
+     * regardless of the exact {@code type} value used). If the configured type IS one
+     * {@code exchangeInfo} enumerates per-symbol (LIMIT/MARKET/LIMIT_MAKER), require membership as
+     * before. If it is IOC/FOK -- which exchangeInfo never enumerates for any MEXC symbol -- log a
+     * prominent warning that acceptance is unverified until the credentialed 1-USDT live probe runs,
+     * and continue rather than refusing to start (the previous pass's mistake here was papering over
+     * a genuinely unresolved wire-format question by "fixing" the default to an even-less-correct
+     * value; the honest state is "unverified", not "definitely rejected"). */
+    private void validateOrderType(Map<String, SymbolFilter> filters) {
         String orderType = config.exec().orderType();
+        if (!MEXC_DOCUMENTED_ORDER_TYPES.contains(orderType)) {
+            throw new IllegalStateException("cf-bot.exec.order-type=" + orderType + " is not one of "
+                    + "MEXC's documented order types " + MEXC_DOCUMENTED_ORDER_TYPES + " -- refusing to "
+                    + "start in live mode (security rule S5); see BotConfig.ExecConfig#orderType's javadoc");
+        }
+        boolean unverifiable = UNVERIFIABLE_VIA_EXCHANGE_INFO.contains(orderType);
         for (Map.Entry<String, BotConfig.TriangleConfig> e : config.triangles().entrySet()) {
             if (!e.getValue().enabled()) {
                 continue;
@@ -219,15 +249,40 @@ public class BotService {
             for (String leg : e.getValue().legs()) {
                 String symbol = leg.split(":")[0];
                 SymbolFilter filter = filters.get(symbol);
-                if (filter != null && !filter.orderTypes().contains(orderType)) {
+                if (filter == null) {
+                    continue;
+                }
+                if (!filter.orderTypes().contains("LIMIT")) {
+                    throw new IllegalStateException("MEXC symbol '" + symbol + "' does not advertise LIMIT "
+                            + "support (venue advertises " + filter.orderTypes() + ") -- refusing to start "
+                            + "in live mode (security rule S5)");
+                }
+                if (unverifiable) {
+                    LOG.warnf("*** cf-bot.exec.order-type=%s for symbol '%s' is NOT verifiable against "
+                                    + "GET /api/v3/exchangeInfo (venue never lists IOC/FOK in any symbol's "
+                                    + "order_types) -- acceptance is UNCONFIRMED until the credentialed "
+                                    + "1-USDT live probe runs; see BotConfig.ExecConfig#orderType's javadoc",
+                            orderType, symbol);
+                } else if (!filter.orderTypes().contains(orderType)) {
                     throw new IllegalStateException("cf-bot.exec.order-type=" + orderType + " is not supported "
                             + "by MEXC for symbol '" + symbol + "' (venue advertises " + filter.orderTypes()
-                            + ") -- refusing to start in live mode (security rule S5); see "
-                            + "BotConfig.ExecConfig#orderType's javadoc");
+                            + ") -- refusing to start in live mode (security rule S5)");
                 }
             }
         }
     }
+
+    /** cf-arb-bot-review-plan.md (second pass) REVIEW.md MED-02: the previous computation captured
+     * {@code localMs} only AFTER the async HTTP response arrived, so the "skew" it measured was
+     * really skew-plus-full-round-trip-latency -- a 120ms RTT would show up as 120ms of apparent
+     * clock drift, fluctuating with network jitter rather than tracking true NTP drift. Fixed by
+     * capturing {@code localStartMs} immediately before the call and estimating the true skew as
+     * the midpoint: {@code (localStartMs + rtt/2) - serverMs}, which assumes the request and
+     * response legs took roughly equal time -- a standard NTP-style approximation, good enough for
+     * this bot's purpose (comparing against a multi-second {@code recvWindow} tolerance, not
+     * disciplining a clock). A sample whose RTT is implausibly large is discarded outright rather
+     * than folded into the estimate, so one slow/jittery request cannot swing the gate. */
+    private static final long MAX_PLAUSIBLE_SKEW_SAMPLE_RTT_MS = 2_000L;
 
     private void scheduleWarmUpAndClockSkew() {
         Runnable warmUpAndSkew = () -> {
@@ -236,13 +291,21 @@ public class BotService {
                     LOG.debugf("warm-up ping failed: %s", err.toString());
                 }
             });
+            long localStartMs = System.currentTimeMillis();
             restClient.serverTime().whenComplete((serverMs, err) -> {
                 if (err != null) {
                     LOG.debugf("server-time sample failed: %s", err.toString());
                     return;
                 }
-                long localMs = System.currentTimeMillis();
-                clockSkewNanos = (localMs - serverMs) * 1_000_000L;
+                long localEndMs = System.currentTimeMillis();
+                long rtt = localEndMs - localStartMs;
+                if (rtt < 0 || rtt > MAX_PLAUSIBLE_SKEW_SAMPLE_RTT_MS) {
+                    LOG.debugf("discarding clock-skew sample: implausible RTT %dms", rtt);
+                    return;
+                }
+                long skewMs = (localStartMs + rtt / 2) - serverMs;
+                clockSkewNanos = skewMs * 1_000_000L;
+                riskGates.updateClockSkew(clockSkewNanos);
             });
         };
         warmUpAndSkew.run(); // sample once at startup, before the feed connects
@@ -274,10 +337,75 @@ public class BotService {
                 freshestWarmedBookAgeNanos = Math.min(freshestWarmedBookAgeNanos, book.ageNanos(nowNanos));
             }
             boolean feedDead = anyWarmed && freshestWarmedBookAgeNanos > CONNECTION_DEAD_THRESHOLD_NANOS;
-            if ((feedDead && wsClient.isConnected()) || wsClient.isChurning()) {
-                killSwitch.recordFeedUnhealthy(feedDead ? "sustained-stale-book" : "connection-churning");
+
+            WatchdogDecision decision = decideWatchdogAction(anyWarmed, feedDead,
+                    consecutiveFeedDeadDetections, FEED_DEAD_TRIP_THRESHOLD);
+            consecutiveFeedDeadDetections = decision.nextConsecutiveFeedDeadDetections;
+            if (decision.action != WatchdogAction.NONE) {
+                LOG.warnf("feed watchdog: %s (detection %d/%d) -- forcing a reconnect",
+                        feedDead ? "connection reports alive but no data across every warmed book for >"
+                                + (CONNECTION_DEAD_THRESHOLD_NANOS / 1_000_000) + "ms"
+                                : "still no data across any book after a forced reconnect",
+                        decision.nextConsecutiveFeedDeadDetections, FEED_DEAD_TRIP_THRESHOLD);
+                journal.write(JournalEvents.feedReconnect(decision.reason, decision.nextConsecutiveFeedDeadDetections));
+                wsClient.forceReconnect(); // no-op if a reconnect is already in flight -- see its own javadoc
+                if (decision.action == WatchdogAction.RECONNECT_AND_TRIP) {
+                    killSwitch.recordFeedUnhealthy("sustained-stale-book-after-"
+                            + decision.nextConsecutiveFeedDeadDetections + "-forced-reconnects");
+                }
+            }
+
+            // Churn (5 reconnects inside a 5-minute window -- MexcWsClient.CHURN_THRESHOLD/
+            // CHURN_WINDOW_MS) already IS "reconnection failing repeatedly": trip immediately, same
+            // as before.
+            if (wsClient.isChurning()) {
+                killSwitch.recordFeedUnhealthy("connection-churning");
             }
         });
+    }
+
+    enum WatchdogAction { NONE, RECONNECT, RECONNECT_AND_TRIP }
+
+    record WatchdogDecision(WatchdogAction action, int nextConsecutiveFeedDeadDetections, String reason) {
+    }
+
+    /**
+     * Third-pass review finding (M3): pure decision function for the feed watchdog's escalation
+     * counter, extracted out of the Vert.x timer callback so this state machine can be unit tested
+     * without a live Vert.x/WebSocket harness (package-visible for {@code BotServiceWatchdogTest}).
+     *
+     * <p>The previous inline form reset {@code consecutiveFeedDeadDetections} to 0 whenever
+     * {@code !feedDead} -- which is ALSO true immediately after {@code forceReconnect()} runs
+     * (its {@code closeHandler} calls {@code books.resetAll()}, zeroing every book's
+     * {@code updateCount}, which makes {@code anyWarmed} false on the very next tick regardless of
+     * whether the reconnect actually restored data). A feed that goes fully dark after a forced
+     * reconnect -- exactly the failure this escalation exists to catch -- would then see
+     * {@code anyWarmed} stay false forever, silently resetting the counter to 0 on every subsequent
+     * tick: the kill switch could never trip, and the bot would sit un-trading with no operator
+     * signal beyond a readiness-check flip (MIN-05: no alarm wired to that either).
+     *
+     * <p>Only CONFIRMED health (a book with fresh, non-stale data -- {@code anyWarmed && !feedDead})
+     * legitimately clears an escalation in progress. {@code !anyWarmed} while ALREADY mid-escalation
+     * ({@code consecutiveFeedDeadDetectionsBefore > 0}) keeps counting instead, on the working
+     * assumption that the last forced reconnect has not yet proven itself. A genuinely brand-new
+     * process (never warmed, never escalated) still does nothing, matching {@code L2Book}'s own "not
+     * yet warm, not stale" semantics.
+     */
+    static WatchdogDecision decideWatchdogAction(boolean anyWarmed, boolean feedDead,
+                                                  int consecutiveFeedDeadDetectionsBefore, int tripThreshold) {
+        boolean confirmedHealthy = anyWarmed && !feedDead;
+        if (confirmedHealthy) {
+            return new WatchdogDecision(WatchdogAction.NONE, 0, null);
+        }
+        boolean stillUnhealthy = feedDead || (consecutiveFeedDeadDetectionsBefore > 0 && !anyWarmed);
+        if (!stillUnhealthy) {
+            // Never warmed yet at all, and not already mid-escalation -- legitimately nothing to do.
+            return new WatchdogDecision(WatchdogAction.NONE, consecutiveFeedDeadDetectionsBefore, null);
+        }
+        int next = consecutiveFeedDeadDetectionsBefore + 1;
+        String reason = feedDead ? "sustained-stale-book" : "post-reconnect-still-dark";
+        WatchdogAction action = next >= tripThreshold ? WatchdogAction.RECONNECT_AND_TRIP : WatchdogAction.RECONNECT;
+        return new WatchdogDecision(action, next, reason);
     }
 
     private void scheduleLatencySnapshots() {
