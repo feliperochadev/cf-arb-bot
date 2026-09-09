@@ -206,6 +206,11 @@ public final class CycleExecutor {
             long priceFixed = intent.legWorstPriceFixed()[leg];
             CycleState.Leg legState = state.legs[leg];
 
+            // Third-pass review finding: record what this leg was HANDED, before it is submitted, so
+            // Unwinder can carry whatever the leg fails to consume (a PARTIAL fill's remainder)
+            // backwards through the reversal chain instead of abandoning it in a non-anchor asset.
+            legState.inputAmountFixed = leg == 0 ? intent.candidateNotionalFixed() : carryAmount;
+
             if (leg == 0) {
                 // Tier 1 step 1.1/1.2: submit exactly the Sizer-computed quantized base quantity,
                 // never a re-derived budget/price division that discards the ladder walk.

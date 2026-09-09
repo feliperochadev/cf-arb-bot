@@ -54,6 +54,28 @@ import org.jboss.logging.Logger;
  * {@code ETHUSDC}/{@code SOLUSDC}/{@code XRPUSDC} advertise only {@code LIMIT}/{@code LIMIT_MAKER}),
  * the position is left stranded, journaled, and flagged as needing IMMEDIATE operator review — never
  * submit a knowingly-doomed limit order, and never fabricate a recovery number.
+ *
+ * <p><b>A {@code MARKET} order is sized in the asset you are SPENDING, which is not the same
+ * parameter for both directions</b> (third-pass review finding). The first cut of the MARKET
+ * fallback above fed a placeholder reference price of {@code 1.0} into
+ * {@link CycleExecutor#quantizeLeg} so it could reuse the priced path's sizing. That is a no-op for
+ * a reversal that SELLs (the held amount is already base-denominated, and dividing by 1.0 leaves it
+ * alone) but a currency error for one that BUYs: the held amount is then in the QUOTE asset, and
+ * dividing it by a fabricated 1.0 submits a quote amount verbatim as a base {@code quantity}. On
+ * {@code usdt-btc-usdc-fwd} (leg 1 {@code BTCUSDC:BID}) that is ~100 USDC in hand becoming
+ * {@code MARKET BUY 100 BTC} — the exact class of order {@code UnwinderTest} was written to prevent,
+ * reachable whenever the books have been reset (which {@code MexcWsClient} does on EVERY disconnect,
+ * a plausible correlated cause of the leg failure that triggered the unwind in the first place).
+ * A reversal that BUYs is now sized with {@code quoteOrderQty} — the quote amount actually held —
+ * and never carries a {@code quantity} at all.
+ *
+ * <p><b>{@code quoteOrderQty} is UNVERIFIED against this venue</b>, in the same sense as
+ * {@code cf-bot.exec.order-type=IOC} (see {@code BotConfig.ExecConfig#orderType}): it is documented
+ * for {@code POST /api/v3/order} in the Binance-family spot v3 contract MEXC's API is modeled on,
+ * but this project has not put a credentialed request through it. It fails SAFE if unsupported — a
+ * 4xx rejection classifies as {@code REJECTED_PRESUBMIT}, which reports the position as stranded for
+ * operator review, rather than submitting a wrongly-sized order. The credentialed 1-USDT probe
+ * (cf-arb-bot-plan.md's own release gate) must exercise this path before {@code dry-run=false}.
  */
 public final class Unwinder {
 
@@ -94,90 +116,164 @@ public final class Unwinder {
 
         Side[] sides = triangle.side();
         SymbolFilter[] filters = triangle.filter();
-        long currentAmount = OrderReconciler.netProceeds(sides[heldLegIndex], filters[heldLegIndex],
+
+        // Anchor already in hand and needing no reversal (only leg 2 can produce this -- its output
+        // IS the anchor by the triangle-closure invariant), kept separate from `working`, which is
+        // whatever non-anchor asset the walk is currently carrying backwards.
+        long anchorRecovered = 0;
+        long working = OrderReconciler.netProceeds(sides[heldLegIndex], filters[heldLegIndex],
                 state.legs[heldLegIndex]);
-
-        if (heldLegIndex == 2) {
-            // Leg 2 always returns to the anchor by construction (triangle-closure validation in
-            // TriangleRegistry) -- its own proceeds ARE the recovered anchor amount; nothing to
-            // reverse.
-            LOG.warnf("[unwind] triangle=%s heldLeg=2 already anchor-denominated, recoveredAnchor=%.8f",
-                    triangle.name(), FixedPoint.toDouble(currentAmount));
-            return new Result(false, currentAmount, "leg 2 proceeds already anchor-denominated", false);
-        }
-
         boolean anyOrderPlaced = false;
+
         for (int i = heldLegIndex; i >= 0; i--) {
             Side reverseSide = sides[i] == Side.BID ? Side.ASK : Side.BID;
             SymbolFilter filter = filters[i];
-            int symbolIndex = triangle.symbolIndex()[i];
 
-            Long priceFixed = priceReversal(reverseSide, filter, symbolIndex);
-            boolean useMarket = priceFixed == null;
-            if (useMarket && !filter.orderTypes().contains("MARKET")) {
-                LOG.errorf("[unwind] triangle=%s leg=%d symbol=%s: no live book to price the reversal AND "
-                                + "the venue does not offer MARKET for this symbol -- %.8f of %s is STRANDED, "
-                                + "IMMEDIATE operator review required", triangle.name(), i, filter.symbol(),
-                        FixedPoint.toDouble(currentAmount), triangle.fromAsset()[i]);
-                return new Result(anyOrderPlaced, 0,
-                        "unrecoverable: no pricing source and no MARKET fallback reversing leg " + i
-                                + " on " + filter.symbol(), true);
+            if (i == 2) {
+                // Leg 2 always returns to the anchor by construction (triangle-closure validation in
+                // TriangleRegistry) -- its own proceeds ARE recovered anchor; nothing to reverse.
+                // The walk still continues down through legs 1 and 0, because a leg-2 PARTIAL leaves
+                // an UNSOLD remainder of leg 1's output behind (see residualHeldBy below), and that
+                // remainder is emphatically not anchor-denominated.
+                LOG.warnf("[unwind] triangle=%s heldLeg=2 proceeds already anchor-denominated, banked=%.8f",
+                        triangle.name(), FixedPoint.toDouble(working));
+                anchorRecovered += working;
+                working = 0;
+            } else if (working > 0) {
+                Result failure = reverseOneLeg(triangle, state, i, reverseSide, filter, working,
+                        anchorRecovered, anyOrderPlaced);
+                if (failure != null) {
+                    return failure;
+                }
+                anyOrderPlaced = true;
+                working = lastReversalProceeds;
+                LOG.warnf("[unwind] triangle=%s leg=%d symbol=%s reverseSide=%s recovered=%.8f %s",
+                        triangle.name(), i, filter.symbol(), reverseSide, FixedPoint.toDouble(working),
+                        triangle.fromAsset()[i]);
             }
 
-            // Reference price for quantization only when we have one; a MARKET order needs no price
-            // at all, so a missing top-of-book does not block sizing the reversal via MARKET.
-            long referencePriceFixed = priceFixed != null ? priceFixed : lastResortReferencePrice(filter);
-            long[] q = CycleExecutor.quantizeLeg(reverseSide, filter, currentAmount, referencePriceFixed);
-            long baseQty = q[0];
-            long quoteAmt = q[1];
-            // useMarket's quoteAmt was computed against lastResortReferencePrice's placeholder 1.0,
-            // not a real price -- it carries no information about the ACTUAL notional and must never
-            // be compared against filter.minNotional() (a real quote-currency threshold), or a
-            // recoverable position gets wrongly stranded on a units artifact. minQty is denominated
-            // in the base asset and unaffected by price, so it still applies; the real minNotional
-            // (if genuinely violated) surfaces as a venue rejection during reconciliation instead.
-            boolean belowMinimum = baseQty < filter.minQty() || (!useMarket && quoteAmt < filter.minNotional());
-            if (belowMinimum) {
-                LOG.errorf("[unwind] triangle=%s leg=%d symbol=%s: held amount %.8f is below the venue "
-                                + "minimum to reverse -- STRANDED, operator review required",
-                        triangle.name(), i, filter.symbol(), FixedPoint.toDouble(currentAmount));
-                return new Result(anyOrderPlaced, 0,
-                        "stranded below venue minimum reversing leg " + i + " on " + filter.symbol(), false);
+            // THIRD-PASS REVIEW FINDING: whatever leg i was handed but never actually consumed is
+            // still sitting in leg i's FROM-asset -- which is exactly the asset the reversal above
+            // just returned to, and exactly the asset leg i-1's reversal spends. Carry it along
+            // instead of abandoning it.
+            //
+            // Unwinder's original model ("at most ONE leg's output is ever in hand and not yet
+            // converted forward -- every earlier leg's output was already fully spent as the next
+            // leg's input") is false precisely in the PARTIAL case, which is the case
+            // exec.CycleExecutor deliberately routes here: a leg that filled 40% consumed only 40%
+            // of what it was handed, and the other 60% sat un-reversed, un-flagged, and booked by
+            // handleBrokenCycle as a 100% loss while the asset was still in the account.
+            //
+            // Leg 0 is excluded on purpose: its from-asset IS the anchor, so its unconsumed
+            // remainder was never spent, and CycleExecutor#anchorSpent already measures the spend
+            // from leg 0's ACTUAL executedQuote/executedBase. Adding it to the recovery side would
+            // double-count it as profit.
+            if (i >= 1) {
+                working += residualHeldBy(sides[i], state.legs[i]);
             }
-
-            String clientOrderId = state.legs[i].clientOrderId + "-unwind";
-            CycleState.Leg reverseLeg = new CycleState.Leg(clientOrderId);
-            reverseLeg.requestedBaseQtyFixed = baseQty;
-            reverseLeg.requestedPriceFixed = useMarket ? 0 : priceFixed;
-
-            if (useMarket) {
-                LOG.warnf("[unwind] triangle=%s leg=%d symbol=%s: no live book to price the reversal -- "
-                        + "falling back to MARKET", triangle.name(), i, filter.symbol());
-                submitMarketAndReconcile(filter, reverseSide, baseQty, reverseLeg);
-            } else {
-                reconciler.submitAndReconcile(filter.symbol(), reverseSide, filter, reverseLeg);
-            }
-            anyOrderPlaced = true;
-
-            if (reverseLeg.status != CycleState.LegStatus.FILLED
-                    && reverseLeg.status != CycleState.LegStatus.PARTIAL) {
-                LOG.errorf("[unwind] triangle=%s leg=%d symbol=%s reversal did not fill (status=%s) -- "
-                                + "%.8f of %s remains STRANDED, operator review required",
-                        triangle.name(), i, filter.symbol(), reverseLeg.status,
-                        FixedPoint.toDouble(currentAmount), triangle.toAsset()[i]);
-                return new Result(anyOrderPlaced, 0,
-                        "reversal did not fill on leg " + i + " (" + reverseLeg.status + ")", false);
-            }
-
-            currentAmount = OrderReconciler.netProceeds(reverseSide, filter, reverseLeg);
-            LOG.warnf("[unwind] triangle=%s leg=%d symbol=%s reverseSide=%s recovered=%.8f %s",
-                    triangle.name(), i, filter.symbol(), reverseSide, FixedPoint.toDouble(currentAmount),
-                    triangle.fromAsset()[i]);
         }
 
-        // After leg 0's reversal, currentAmount is anchor-denominated by the triangle-closure
-        // invariant (fromAsset[0] == anchor, validated at startup).
-        return new Result(anyOrderPlaced, currentAmount, "reversed legs " + heldLegIndex + "..0", false);
+        // After leg 0's reversal, `working` is anchor-denominated by the triangle-closure invariant
+        // (fromAsset[0] == anchor, validated at startup).
+        return new Result(anyOrderPlaced, anchorRecovered + working,
+                "reversed legs " + heldLegIndex + "..0", false);
+    }
+
+    /** Proceeds of the reversal {@link #reverseOneLeg} last placed, in that leg's FROM-asset units.
+     * An out-parameter rather than a return value so {@code reverseOneLeg} can return the
+     * early-exit {@link Result} (or {@code null} to continue) -- this class is single-threaded, one
+     * instance per executor thread, and an unwind runs to completion before the next one starts. */
+    private long lastReversalProceeds;
+
+    /** Size, submit and reconcile ONE reversal. Returns {@code null} on success (with the proceeds
+     * in {@link #lastReversalProceeds}), or the terminal {@link Result} the caller must return --
+     * which now carries {@code anchorRecovered}, the anchor this unwind has genuinely banked so far,
+     * rather than a flat 0 that would under-report a real recovery as a total loss. */
+    private Result reverseOneLeg(Triangle triangle, CycleState state, int i, Side reverseSide,
+                                  SymbolFilter filter, long currentAmount, long anchorRecovered,
+                                  boolean anyOrderPlacedSoFar) {
+        int symbolIndex = triangle.symbolIndex()[i];
+        Long priceFixed = priceReversal(reverseSide, filter, symbolIndex);
+        boolean useMarket = priceFixed == null;
+        if (useMarket && !filter.orderTypes().contains("MARKET")) {
+            LOG.errorf("[unwind] triangle=%s leg=%d symbol=%s: no live book to price the reversal AND "
+                            + "the venue does not offer MARKET for this symbol -- %.8f of %s is STRANDED, "
+                            + "IMMEDIATE operator review required", triangle.name(), i, filter.symbol(),
+                    FixedPoint.toDouble(currentAmount), triangle.fromAsset()[i]);
+            return new Result(anyOrderPlacedSoFar, anchorRecovered,
+                    "unrecoverable: no pricing source and no MARKET fallback reversing leg " + i
+                            + " on " + filter.symbol(), true);
+        }
+
+        // Sizing. A MARKET order carries no price, so it is sized purely in the asset being SPENT:
+        // base `quantity` when selling, quote `quoteOrderQty` when buying (see the class javadoc --
+        // conflating the two is what produced a 100-BTC market buy). A priced reversal goes through
+        // the same quantization the forward legs use.
+        long baseQty = 0;
+        long quoteQty = 0;
+        boolean belowMinimum;
+        if (useMarket && reverseSide == Side.ASK) {
+            quoteQty = truncateToDecimals(currentAmount, filter.priceDecimals());
+            belowMinimum = quoteQty < filter.minNotional();
+        } else if (useMarket) {
+            baseQty = FixedPoint.quantizeDown(currentAmount, filter.qtyStep());
+            belowMinimum = baseQty < filter.minQty();
+        } else {
+            long[] q = CycleExecutor.quantizeLeg(reverseSide, filter, currentAmount, priceFixed);
+            baseQty = q[0];
+            quoteQty = q[1];
+            belowMinimum = baseQty < filter.minQty() || quoteQty < filter.minNotional();
+        }
+        if (belowMinimum) {
+            LOG.errorf("[unwind] triangle=%s leg=%d symbol=%s: held amount %.8f of %s is below the venue "
+                            + "minimum to reverse -- STRANDED, operator review required",
+                    triangle.name(), i, filter.symbol(), FixedPoint.toDouble(currentAmount),
+                    triangle.toAsset()[i]);
+            return new Result(anyOrderPlacedSoFar, anchorRecovered,
+                    "stranded below venue minimum reversing leg " + i + " on " + filter.symbol(), false);
+        }
+
+        String clientOrderId = state.legs[i].clientOrderId + "-unwind";
+        CycleState.Leg reverseLeg = new CycleState.Leg(clientOrderId);
+        // A quote-sized MARKET BUY has no requested BASE quantity to compare a fill against, so 0 is
+        // the honest value here: OrderReconciler#classifyFill then reads any non-zero fill as FILLED
+        // (a MARKET order either sweeps or is rejected -- "partially filled relative to a requested
+        // base quantity" is not a state it can be in) and a zero fill as ZERO_FILL, unchanged.
+        reverseLeg.requestedBaseQtyFixed = baseQty;
+        reverseLeg.requestedPriceFixed = useMarket ? 0 : priceFixed;
+
+        if (useMarket) {
+            LOG.warnf("[unwind] triangle=%s leg=%d symbol=%s: no live book to price the reversal -- "
+                            + "falling back to MARKET (%s)", triangle.name(), i, filter.symbol(),
+                    reverseSide == Side.ASK ? "quoteOrderQty" : "quantity");
+            submitMarketAndReconcile(filter, reverseSide, baseQty, quoteQty, reverseLeg);
+        } else {
+            reconciler.submitAndReconcile(filter.symbol(), reverseSide, filter, reverseLeg);
+        }
+
+        if (reverseLeg.status != CycleState.LegStatus.FILLED
+                && reverseLeg.status != CycleState.LegStatus.PARTIAL) {
+            LOG.errorf("[unwind] triangle=%s leg=%d symbol=%s reversal did not fill (status=%s) -- "
+                            + "%.8f of %s remains STRANDED, operator review required",
+                    triangle.name(), i, filter.symbol(), reverseLeg.status,
+                    FixedPoint.toDouble(currentAmount), triangle.toAsset()[i]);
+            return new Result(true, anchorRecovered,
+                    "reversal did not fill on leg " + i + " (" + reverseLeg.status + ")", false);
+        }
+
+        lastReversalProceeds = OrderReconciler.netProceeds(reverseSide, filter, reverseLeg);
+        return null;
+    }
+
+    /** The part of {@code leg}'s INPUT that the leg never actually consumed, in that leg's
+     * from-asset units -- an ASK leg spends quote ({@code cummulativeQuoteQty}), a BID leg spends
+     * base ({@code executedQty}). Non-zero for any PARTIAL fill, and dust-sized for a FILLED one
+     * (the quantization slack {@code Sizer}/{@code quantizeLeg} rounds away). Clamped at 0 so a leg
+     * whose {@code inputAmountFixed} was never populated degrades to the old
+     * abandon-the-remainder behavior rather than fabricating a negative recovery. */
+    private static long residualHeldBy(Side side, CycleState.Leg leg) {
+        long consumed = side == Side.ASK ? leg.executedQuoteFixed : leg.executedBaseQtyFixed;
+        return Math.max(0, leg.inputAmountFixed - consumed);
     }
 
     /** Cross the CURRENT top of book by {@code unwindCrossBps}, clamped inside the symbol's
@@ -226,18 +322,30 @@ public final class Unwinder {
         return price;
     }
 
-    /** Only reached when a MARKET fallback is about to be used purely to QUANTIZE the base quantity
-     * (a MARKET order itself carries no price) -- any recent price is fine here since it never
-     * reaches the venue; falls back to 1.0 (a harmless quantization unit) if truly nothing is known. */
-    private static long lastResortReferencePrice(SymbolFilter filter) {
-        return FixedPoint.SCALE; // 1.0 in 1e8-fixed -- see method javadoc: not sent to the venue
+    /** Truncate a 1e8-fixed amount DOWN to {@code decimals} fractional digits, so the value compared
+     * against {@code minNotional} is the same one {@link FixedPoint#toPlainString} will render onto
+     * the wire. Truncating down is the safe direction for a {@code quoteOrderQty}: it can only
+     * spend less of the quote asset than is actually held, never more. */
+    static long truncateToDecimals(long fixed, int decimals) {
+        long step = 1L;
+        for (int i = decimals; i < 8; i++) {
+            step *= 10L;
+        }
+        return (fixed / step) * step;
     }
 
-    private void submitMarketAndReconcile(SymbolFilter filter, Side side, long baseQtyFixed, CycleState.Leg leg) {
+    /** A {@code MARKET} reversal, sized in the asset being SPENT: a SELL spends the base asset and
+     * carries {@code quantity}; a BUY spends the quote asset and carries {@code quoteOrderQty} (and
+     * must NOT carry a {@code quantity} -- see the class javadoc for the 100-BTC order that the
+     * previous shared-{@code quantity} form produced). Neither carries a price. */
+    private void submitMarketAndReconcile(SymbolFilter filter, Side side, long baseQtyFixed,
+                                           long quoteQtyFixed, CycleState.Leg leg) {
         String sideStr = side == Side.ASK ? "BUY" : "SELL";
-        String qtyStr = FixedPoint.toPlainString(baseQtyFixed, filter.qtyDecimals());
+        String sizeParam = side == Side.ASK
+                ? "&quoteOrderQty=" + FixedPoint.toPlainString(quoteQtyFixed, filter.priceDecimals())
+                : "&quantity=" + FixedPoint.toPlainString(baseQtyFixed, filter.qtyDecimals());
         String params = "symbol=" + filter.symbol() + "&side=" + sideStr + "&type=MARKET"
-                + "&quantity=" + qtyStr + "&newClientOrderId=" + leg.clientOrderId;
+                + sizeParam + "&newClientOrderId=" + leg.clientOrderId;
         reconciler.submitPrebuiltAndReconcile(filter.symbol(), params, leg);
     }
 }

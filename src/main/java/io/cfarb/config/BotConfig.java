@@ -169,5 +169,15 @@ public interface BotConfig {
 
         /** Absent = local only. Never a secret — bucket name, not credentials. */
         java.util.Optional<String> s3Bucket();
+
+        /** Third-pass review finding: minimum interval between two journaled REJECT events for the
+         * SAME triangle. Every candidate clearing the cheap risk gates hits a reject path, and the
+         * per-triangle cooldown only advances on an actual fire, so the previous unsampled form
+         * wrote ~900 NDJSON lines/second (~10 GB/day) at the measured feed rate — enough to fill the
+         * deployed 20 GB root volume in about two days of DRY-RUN. Fires and order-queue-full events
+         * are never sampled; suppressed rejects are counted as {@code cfarb.journal.suppressed}.
+         * Set to 0 to journal every reject (the old behavior — only sane for short local captures). */
+        @WithDefault("1000")
+        long rejectSampleMs();
     }
 }

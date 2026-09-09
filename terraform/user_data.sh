@@ -82,21 +82,58 @@ chown root:root /usr/local/sbin/cf-arb-bot-fetch-secrets.sh
 mkdir -p /opt/cf-arb-bot /opt/cf-arb-bot/config /var/lib/cf-arb-bot/journal
 chown -R cfarbbot:cfarbbot /opt/cf-arb-bot /var/lib/cf-arb-bot
 
-# --- Journal logrotate: REVIEW.md MED-09. EventJournal rotates NDJSON hourly under
-# /var/lib/cf-arb-bot/journal/ with no S3 sync yet (needs the AWS SDK + a real bucket to test
-# against -- CLAUDE.md's documented gap); on a 20GB root volume, unbounded local retention alone
-# will eventually exhaust disk and crash the service. This is a stopgap, not a substitute for the
-# real S3 sync. ---
-cat > /etc/logrotate.d/cf-arb-bot <<'LOGROTATE'
-/var/lib/cf-arb-bot/journal/*.ndjson {
-  daily
-  rotate 7
-  compress
-  missingok
-  notifempty
-  su cfarbbot cfarbbot
-}
-LOGROTATE
+# --- Journal retention: REVIEW.md MED-09, REDONE by the third-pass review. EventJournal writes NDJSON
+# under /var/lib/cf-arb-bot/journal/ with no S3 sync yet (needs the AWS SDK + a real bucket to test
+# against -- CLAUDE.md's documented gap); on a 20GB root volume, unbounded local retention will
+# exhaust disk and crash the service. This is a stopgap, not a substitute for the real S3 sync.
+#
+# The previous remediation used logrotate on `/var/lib/cf-arb-bot/journal/*.ndjson` with `rotate 7`,
+# which CANNOT bound growth here: EventJournal names each file for its hour
+# (cf-arb-bot-YYYYMMDD-HH.ndjson), so every file is a DISTINCT logrotate logfile with its own
+# rotation state. Each gets rotated to `.1.gz` exactly once and then falls out of the glob forever
+# (that hour never recurs, `missingok` skips it), so the rotation chain never advances and `rotate 7`
+# never deletes anything -- disk still grows without limit, just compressed. `maxage` does not help
+# either: it only prunes during a rotation of that same logfile, which never happens again.
+#
+# Age-based cleanup is the right tool for hour-named files. -mmin +90 on the gzip step guarantees the
+# hour currently being appended to is never touched: EventJournal holds an open FD to it, and gzip
+# replaces the file, which would send the writer's remaining output to an unlinked inode. ---
+cat > /usr/local/sbin/cf-arb-bot-journal-gc.sh <<'JOURNALGC'
+#!/usr/bin/env bash
+set -euo pipefail
+JOURNAL_DIR=/var/lib/cf-arb-bot/journal
+[ -d "$JOURNAL_DIR" ] || exit 0
+# Compress finished hours only -- never the file EventJournal still has open (see note above).
+find "$JOURNAL_DIR" -maxdepth 1 -type f -name '*.ndjson' -mmin +90 -exec gzip -9 {} +
+# Bound total retention, compressed or not.
+find "$JOURNAL_DIR" -maxdepth 1 -type f \( -name '*.ndjson' -o -name '*.ndjson.gz' \) \
+  -mtime +7 -delete
+JOURNALGC
+chmod 0755 /usr/local/sbin/cf-arb-bot-journal-gc.sh
+chown root:root /usr/local/sbin/cf-arb-bot-journal-gc.sh
+
+cat > /etc/systemd/system/cf-arb-bot-journal-gc.service <<'GCUNIT'
+[Unit]
+Description=cf-arb-bot -- compress and prune local NDJSON journal files
+
+[Service]
+Type=oneshot
+User=cfarbbot
+Group=cfarbbot
+ExecStart=/usr/local/sbin/cf-arb-bot-journal-gc.sh
+GCUNIT
+
+cat > /etc/systemd/system/cf-arb-bot-journal-gc.timer <<'GCTIMER'
+[Unit]
+Description=cf-arb-bot -- daily journal compression and retention sweep
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+GCTIMER
 
 # --- systemd unit (installed here; content mirrored at ops/cf-arb-bot.service for review outside
 # the templated user_data.sh) ---
@@ -135,6 +172,7 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable cf-arb-bot.service
+systemctl enable --now cf-arb-bot-journal-gc.timer
 
 # --- First-boot secret population: REVIEW.md MAJ-05. Moved to the END of this script (after the
 # unit is installed and enabled) and made NON-FATAL. Previously this ran early, under `set -euo

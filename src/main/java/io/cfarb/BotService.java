@@ -146,7 +146,7 @@ public class BotService {
         SpscArrayQueue<OrderIntent> orderQueue = new SpscArrayQueue<>(256);
         OpportunityDetector detector = new OpportunityDetector(books, triangles, riskGates, portfolio,
                 metrics, journal, orderQueue, config.strategy().minNetBps(), config.strategy().slippageBufferBps(),
-                config.capital().compound());
+                config.capital().compound(), config.journal().rejectSampleMs());
 
         // cf-arb-bot-review-plan.md Tier 1 step 1.9: MexcRestClient (and therefore the signer) is
         // now constructed in BOTH modes, so dry-run can build and sign every request through the

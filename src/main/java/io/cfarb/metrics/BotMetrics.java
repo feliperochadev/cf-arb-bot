@@ -28,6 +28,7 @@ public class BotMetrics {
     private io.micrometer.core.instrument.Counter cyclesBroken;
     private io.micrometer.core.instrument.Counter orderQueueDrops;
     private io.micrometer.core.instrument.Counter journalDrops;
+    private io.micrometer.core.instrument.Counter journalSuppressed;
     private io.micrometer.core.instrument.Counter riskTrips;
     private io.micrometer.core.instrument.Counter intentsExpired;
 
@@ -61,6 +62,12 @@ public class BotMetrics {
         cyclesBroken = registry.counter("cfarb.cycles.broken");
         orderQueueDrops = registry.counter("cfarb.order_queue.drops");
         journalDrops = registry.counter("cfarb.journal.drops");
+        // Third-pass review finding: a REJECT candidate the detector deliberately did not journal
+        // because that triangle already journaled one inside cf-bot.journal.reject-sample-ms. This
+        // is sampling, not loss -- but it is still counted, so "how many candidates did we actually
+        // see" never has to be inferred from the NDJSON line count. See
+        // strategy.OpportunityDetector#journalReject.
+        journalSuppressed = registry.counter("cfarb.journal.suppressed");
         riskTrips = registry.counter("cfarb.risk.trips");
         // REVIEW.md MED-10: an OrderIntent the executor thread dequeued too late to act on
         // (cf-bot.exec.max-intent-age-ms) -- see exec.CycleExecutor#execute.
@@ -76,6 +83,7 @@ public class BotMetrics {
     public void recordCycleBroken() { cyclesBroken.increment(); }
     public void recordOrderQueueDrop() { orderQueueDrops.increment(); }
     public void recordJournalDrop() { journalDrops.increment(); }
+    public void recordJournalSuppressed() { journalSuppressed.increment(); }
     public void recordRiskTrip() { riskTrips.increment(); }
     public void recordIntentExpired() { intentsExpired.increment(); }
 

@@ -91,6 +91,24 @@ ever enters `recorder-service`.
   (`ETHUSDC`/`SOLUSDC`/`XRPUSDC`), the position is left stranded and the kill switch trips
   immediately (`KillSwitch.recordUnrecoverableInventory`) rather than submitting a knowingly-doomed
   limit order.
+- **AMENDED 2026-09-09 (third-pass review):** that `MARKET` fallback sized BOTH directions with a
+  base `quantity`, derived by dividing the held amount by a placeholder reference price of `1.0`.
+  Harmless for a reversal that SELLs (the held amount is already base-denominated); a currency error
+  for one that BUYs, where the held amount is in the QUOTE asset — on `usdt-btc-usdc-fwd` that turned
+  ~100 USDC in hand into `MARKET BUY 100 BTC`. A `MARKET` BUY is now sized with `quoteOrderQty` and
+  carries no `quantity` at all. **`quoteOrderQty` is unverified against MEXC** in the same sense as
+  `order-type=IOC` (documented in the Binance-family spot v3 contract, never put through a
+  credentialed request here); it fails safe — an unsupported parameter 4xx-rejects into
+  `REJECTED_PRESUBMIT`, i.e. "stranded, operator review", never a wrongly-sized order — and the
+  1-USDT live probe must exercise it before `dry-run=false`.
+- **FIXED 2026-09-09 (third-pass review):** a PARTIAL fill used to strand the remainder of the
+  PREVIOUS leg's proceeds. `Unwinder`'s model ("at most ONE leg's output is ever in hand and not yet
+  converted forward") is false for exactly the PARTIAL case `CycleExecutor` routes into it: a leg
+  that filled 40% consumed only 40% of what it was handed, and the rest sat un-reversed, un-flagged,
+  and booked by `handleBrokenCycle` as a 100% loss while the asset was still in the account.
+  `CycleState.Leg.inputAmountFixed` now records what each leg was handed, and the unwind walk carries
+  `input - executed` backwards through the reversal chain (excluding leg 0, whose from-asset is the
+  anchor and whose actual spend `anchorSpent` already measures).
 - **Per-stage latency histograms are still blended**: `decisionToLeg1AckNanos` records the FULL
   place→reconcile→(commission-lookup) round trip for every leg into one histogram, not separate
   receipt→decode / decode→decision / queue-wait / leg-ack stages (Tier 3).
@@ -99,6 +117,13 @@ ever enters `recorder-service`.
   higher still: the real wire contract requires a place-then-query-then-trades round trip per leg,
   not the single call originally assumed). Deferred deliberately; recorded in `RUST-MIGRATION.md`.
 - `journal.EventJournal` does not sync to S3 yet (needs the AWS SDK + a real bucket to test against).
+  **Third-pass review:** the local reject stream is now SAMPLED — `cf-bot.journal.reject-sample-ms`
+  (default 1000) bounds journaled REJECT events to one per triangle per interval, with suppressed
+  ones counted as `cfarb.journal.suppressed`. Unsampled it ran at feed rate (~900 lines/s, ~10 GB/day,
+  filling the deployed 20 GB root volume in ~2 days of DRY-RUN) and put ~900 `String` allocations/s
+  on the Netty event-loop thread, which rule R1 forbids. Retention is a `find`-based systemd timer,
+  not logrotate: `EventJournal` names each file for its hour, so every file is a distinct logrotate
+  logfile whose chain never advances — `rotate 7` could not delete anything.
 - `terraform/` has never been `apply`'d — no AWS credentials existed in the environment that wrote
   it. Validated with `terraform validate` only (both `terraform/` and `terraform/modules/probe/`
   currently pass cleanly).

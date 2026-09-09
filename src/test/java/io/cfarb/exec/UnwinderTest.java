@@ -2,6 +2,7 @@ package io.cfarb.exec;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.cfarb.book.BookRegistry;
@@ -53,6 +54,30 @@ class UnwinderTest {
     // Real live orderTypes as of 2026-09-07: this symbol advertises NO MARKET at all.
     private static final SymbolFilter ETHUSDC_NO_MARKET = filter("ETHUSDC", "ETH", "USDC", 1e-6, 8, 1e-6, 1.0, 2, 0.0,
             Set.of("LIMIT", "LIMIT_MAKER"), 0.02, 0.02);
+    // usdt-btc-usdc-fwd's middle leg: a BID leg whose REVERSAL is therefore a BUY, and which does
+    // advertise MARKET -- the combination that produced the 100-BTC market order.
+    private static final SymbolFilter BTCUSDC = filter("BTCUSDC", "BTC", "USDC", 1e-6, 6, 1e-6, 1.0, 2, 5.0,
+            Set.of("LIMIT", "MARKET", "LIMIT_MAKER"), 0.02, 0.02);
+    private static final SymbolFilter USDCUSDT = filter("USDCUSDT", "USDC", "USDT", 0.01, 2, 1.0, 1.0, 5, 0.0,
+            Set.of("LIMIT", "MARKET", "LIMIT_MAKER"), 0.02, 0.02);
+
+    /** {@code usdt-btc-usdc-fwd} — {@code BTCUSDT:ASK, BTCUSDC:BID, USDCUSDT:BID} (anchor USDT).
+     * Leg 1 is a BID, so reversing it BUYS, spending the USDC in hand. */
+    private static Triangle btcUsdcTriangle() {
+        Side[] sides = {Side.ASK, Side.BID, Side.BID};
+        SymbolFilter[] filters = {BTCUSDT, BTCUSDC, USDCUSDT};
+        String[] fromAsset = new String[3];
+        String[] toAsset = new String[3];
+        for (int i = 0; i < 3; i++) {
+            fromAsset[i] = Triangle.legFromAsset(sides[i], filters[i]);
+            toAsset[i] = Triangle.legToAsset(sides[i], filters[i]);
+        }
+        return new Triangle("usdt-btc-usdc-fwd", new int[]{0, 1, 2}, sides, filters, fromAsset, toAsset);
+    }
+
+    private static BookRegistry btcUsdcBooks() {
+        return new BookRegistry(List.of("BTCUSDT", "BTCUSDC", "USDCUSDT"), 1, 3600);
+    }
 
     private static Triangle triangle() {
         Side[] sides = {Side.ASK, Side.ASK, Side.BID};
@@ -160,16 +185,18 @@ class UnwinderTest {
     }
 
     @Test
-    void leg2PartialFillIsAlreadyAnchorDenominatedNoOrderPlaced() {
-        // leg 2 (XRPUSDT BID) always returns to the anchor by construction -- if IT is the one that
-        // partially filled, its own proceeds ARE the recovered anchor amount; nothing to reverse.
+    void leg2FullFillIsAlreadyAnchorDenominatedNoOrderPlaced() {
+        // leg 2 (XRPUSDT BID) always returns to the anchor by construction -- when it consumed
+        // everything it was handed, its own proceeds ARE the recovered anchor amount and there is
+        // nothing left in any other asset to reverse.
         FakeMexcOrderApi api = new FakeMexcOrderApi();
         CycleState state = new CycleState("c");
         state.legs[0].status = CycleState.LegStatus.FILLED;
         state.legs[1].status = CycleState.LegStatus.FILLED;
         state.legs[2].status = CycleState.LegStatus.PARTIAL;
-        state.legs[2].requestedBaseQtyFixed = FixedPoint.fromDouble(100.0);
-        state.legs[2].executedBaseQtyFixed = FixedPoint.fromDouble(60.0);
+        state.legs[2].inputAmountFixed = FixedPoint.fromDouble(60.0); // handed 60 XRP...
+        state.legs[2].requestedBaseQtyFixed = FixedPoint.fromDouble(60.0);
+        state.legs[2].executedBaseQtyFixed = FixedPoint.fromDouble(60.0); // ...sold all 60
         state.legs[2].executedQuoteFixed = FixedPoint.fromDouble(50.0); // 0 bps taker on XRPUSDT
 
         Unwinder.Result r = unwinder(api, books()).unwind(triangle(), state, 2);
@@ -177,6 +204,84 @@ class UnwinderTest {
         assertFalse(r.anyOrderPlaced(), "leg 2's proceeds are already anchor-denominated -- no reversal needed");
         assertEquals(0, api.placeOrderCalls);
         assertEquals(FixedPoint.fromDouble(50.0), r.recoveredAnchorFixed());
+    }
+
+    @Test
+    void leg2PartialFillReversesTheUnsoldRemainderInsteadOfAbandoningIt() {
+        // THIRD-PASS REVIEW FINDING. This test previously asserted the DEFECT: leg 2 requested 100
+        // XRP, filled 60, and the unwinder returned "already anchor-denominated" with the 40 unsold
+        // XRP neither reversed, nor logged as stranded, nor flagged unrecoverable -- CycleExecutor
+        // then booked that XRP as a 100% loss while it sat in the account. Unwinder's stated model
+        // ("at most ONE leg's output is ever in hand and not yet converted forward") is false for
+        // exactly the PARTIAL case the executor routes into it.
+        FakeMexcOrderApi api = new FakeMexcOrderApi();
+        BookRegistry books = books();
+        seedTop(books, 1, 0.0000169, 0.0000171); // XRPBTC
+        seedTop(books, 0, 77840.0, 77850.0);     // BTCUSDT
+        CycleState state = new CycleState("c");
+        state.legs[0].status = CycleState.LegStatus.FILLED;
+        state.legs[1].status = CycleState.LegStatus.FILLED;
+        state.legs[2].status = CycleState.LegStatus.PARTIAL;
+        state.legs[2].inputAmountFixed = FixedPoint.fromDouble(220.0);      // handed 220 XRP
+        state.legs[2].requestedBaseQtyFixed = FixedPoint.fromDouble(220.0);
+        state.legs[2].executedBaseQtyFixed = FixedPoint.fromDouble(90.0);   // only 90 sold
+        state.legs[2].executedQuoteFixed = FixedPoint.fromDouble(124.0);    // 0 bps taker on XRPUSDT
+        // ...leaving 130 XRP that must be walked back XRPBTC -> BTCUSDT -> USDT.
+
+        api.scriptQuery("XRPBTC", FixedPoint.fromDouble(130.0), FixedPoint.fromDouble(0.002197),
+                "FILLED", "rev-1");
+        api.scriptQuery("BTCUSDT", FixedPoint.fromDouble(0.002195), FixedPoint.fromDouble(170.86),
+                "FILLED", "rev-0");
+
+        Unwinder.Result r = unwinder(api, books).unwind(triangle(), state, 2);
+
+        assertEquals(2, api.placeOrderCalls, "the 130 unsold XRP must be walked back through legs 1 and 0");
+        assertTrue(api.placedParams.get(0).contains("symbol=XRPBTC"));
+        assertTrue(api.placedParams.get(0).contains("side=SELL"));
+        assertEquals("130.00", param(api.placedParams.get(0), "quantity"),
+                "must reverse the UNSOLD remainder (220 handed - 90 sold), not leg 2's proceeds: "
+                        + api.placedParams.get(0));
+        assertTrue(api.placedParams.get(1).contains("symbol=BTCUSDT"));
+        assertTrue(r.recoveredAnchorFixed() > FixedPoint.fromDouble(280.0),
+                "recovered anchor must be leg 2's own 124 USDT PLUS the ~170 USDT the remainder walked "
+                        + "back to, not 124 alone -- got "
+                        + FixedPoint.toDouble(r.recoveredAnchorFixed()));
+    }
+
+    @Test
+    void partialLegRemainderIsCarriedIntoTheNextReversal() {
+        // Same defect one leg earlier: leg 1 (XRPBTC ASK) was handed 0.001284 BTC and spent only
+        // 0.00077 of it before being canceled. Reversing leg 1 returns ~0.00077 BTC -- the other
+        // ~0.000514 BTC is still sitting there and must be sold back through leg 0 too, not left
+        // behind and booked as a loss.
+        FakeMexcOrderApi api = new FakeMexcOrderApi();
+        BookRegistry books = books();
+        seedTop(books, 1, 0.0000169, 0.0000171);
+        seedTop(books, 0, 77840.0, 77850.0);
+        CycleState state = new CycleState("c");
+        state.legs[0].status = CycleState.LegStatus.FILLED;
+        state.legs[0].executedBaseQtyFixed = FixedPoint.fromDouble(0.001285);
+        state.legs[0].executedQuoteFixed = FixedPoint.fromDouble(100.0);
+        state.legs[1].status = CycleState.LegStatus.PARTIAL;
+        state.legs[1].inputAmountFixed = FixedPoint.fromDouble(0.001284); // BTC handed to leg 1
+        state.legs[1].requestedBaseQtyFixed = FixedPoint.fromDouble(75.0);
+        state.legs[1].executedBaseQtyFixed = FixedPoint.fromDouble(45.0);  // XRP acquired
+        state.legs[1].executedQuoteFixed = FixedPoint.fromDouble(0.00077); // BTC actually spent
+
+        // Reversing leg 1: sell the 45 XRP back for ~0.00076 BTC.
+        api.scriptQuery("XRPBTC", FixedPoint.fromDouble(45.0), FixedPoint.fromDouble(0.00076),
+                "FILLED", "rev-1");
+        api.scriptQuery("BTCUSDT", FixedPoint.fromDouble(0.001273), FixedPoint.fromDouble(99.0),
+                "FILLED", "rev-0");
+
+        unwinder(api, books).unwind(triangle(), state, 2);
+
+        assertEquals(2, api.placeOrderCalls);
+        // 0.00076 BTC recovered from the XRP reversal (minus 5bps) + 0.000514 BTC never spent.
+        double leg0SellQty = Double.parseDouble(param(api.placedParams.get(1), "quantity"));
+        assertTrue(leg0SellQty > 0.00125,
+                "leg 0's reversal must sell the reversal proceeds PLUS the ~0.000514 BTC leg 1 never "
+                        + "consumed (~0.001274 BTC total), not the ~0.00076 proceeds alone -- got " + leg0SellQty);
     }
 
     @Test
@@ -316,6 +421,48 @@ class UnwinderTest {
         assertFalse(api.placedParams.get(0).contains("price="), "a MARKET order must never carry a price parameter");
         assertFalse(r.unrecoverable());
         assertTrue(r.recoveredAnchorFixed() > 0);
+    }
+
+    @Test
+    void marketFallbackOnABuyReversalIsSizedInQuoteNotAsABaseQuantity() {
+        // THIRD-PASS REVIEW FINDING -- the regression the existing MARKET test could not catch,
+        // because it only exercised the SELL direction (where the held amount is already
+        // base-denominated and the placeholder 1.0 reference price was a harmless no-op).
+        //
+        // usdt-btc-usdc-fwd, leg 2 fails: ~100 USDC in hand, reversing leg 1 (BTCUSDC:BID) means
+        // BUYING BTC. Feeding a fabricated price of 1.0 into quantizeLeg turned "100 USDC" into
+        // "quantity=100" -- a 100 BTC (~$7.7M) market order. A MARKET BUY is sized by quoteOrderQty.
+        FakeMexcOrderApi api = new FakeMexcOrderApi();
+        BookRegistry books = btcUsdcBooks(); // no seedTop: books reset by a reconnect mid-unwind
+        CycleState state = new CycleState("c");
+        state.legs[0].status = CycleState.LegStatus.FILLED;
+        state.legs[0].executedBaseQtyFixed = FixedPoint.fromDouble(0.001285);
+        state.legs[0].executedQuoteFixed = FixedPoint.fromDouble(100.0);
+        state.legs[1].status = CycleState.LegStatus.FILLED;
+        state.legs[1].executedBaseQtyFixed = FixedPoint.fromDouble(0.001285); // BTC sold
+        state.legs[1].executedQuoteFixed = FixedPoint.fromDouble(100.0);      // USDC received
+        state.legs[2].status = CycleState.LegStatus.ZERO_FILL;
+
+        api.scriptQuery("BTCUSDC", FixedPoint.fromDouble(0.001283), FixedPoint.fromDouble(99.94),
+                "FILLED", "rev-1");
+        api.scriptQuery("BTCUSDT", FixedPoint.fromDouble(0.001282), FixedPoint.fromDouble(99.80),
+                "FILLED", "rev-0");
+
+        Unwinder.Result r = unwinder(api, books).unwind(btcUsdcTriangle(), state, 2);
+
+        String buy = api.placedParams.get(0);
+        assertTrue(buy.contains("symbol=BTCUSDC") && buy.contains("side=BUY") && buy.contains("type=MARKET"), buy);
+        assertNull(param(buy, "quantity"),
+                "a MARKET BUY must NOT carry a base quantity -- that is the 100-BTC bug: " + buy);
+        assertEquals("99.95", param(buy, "quoteOrderQty"),
+                "must spend the ~99.95 USDC actually held, sized in the QUOTE asset: " + buy);
+        // The SELL direction must be untouched: still a base quantity, still no quote sizing.
+        String sell = api.placedParams.get(1);
+        assertTrue(sell.contains("symbol=BTCUSDT") && sell.contains("side=SELL"), sell);
+        assertNull(param(sell, "quoteOrderQty"), "a MARKET SELL is sized by base quantity: " + sell);
+        assertEquals(0.001282, Double.parseDouble(param(sell, "quantity")), 1e-9, sell);
+        assertTrue(r.recoveredAnchorFixed() > FixedPoint.fromDouble(90.0),
+                "both hops filled -- the position is recovered, not stranded");
     }
 
     @Test

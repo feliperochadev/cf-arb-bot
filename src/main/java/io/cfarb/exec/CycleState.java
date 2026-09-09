@@ -46,6 +46,17 @@ public final class CycleState {
 
     public static final class Leg {
         public final String clientOrderId;
+        /** How much of this leg's FROM-asset was handed to it -- the anchor budget for leg 0, the
+         * previous leg's actual net proceeds for legs 1-2 (1e8-fixed, in from-asset units).
+         *
+         * <p>Third-pass review finding: without this, {@link Unwinder} had no way to know how much
+         * of a leg's input the leg failed to consume. A PARTIAL fill spends only part of what it was
+         * handed, and the remainder — still sitting in the from-asset, still real — was neither
+         * reversed nor flagged, while {@code CycleExecutor#handleBrokenCycle} booked it as a 100%
+         * loss. {@code Unwinder} now carries {@code inputAmountFixed - executed} backwards through
+         * the reversal chain. Populated for every leg BEFORE submission, so it is meaningful even
+         * for a leg that never reached the venue. */
+        public long inputAmountFixed;
         public long requestedBaseQtyFixed;
         public long requestedPriceFixed;
         public long executedBaseQtyFixed;
