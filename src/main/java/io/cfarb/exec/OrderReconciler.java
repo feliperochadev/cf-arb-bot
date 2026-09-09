@@ -50,6 +50,33 @@ import org.jboss.logging.Logger;
  *       {@code FILLED} to {@code PARTIAL}); trade rows are filtered to the leg's own {@code orderId}
  *       before summing commission.</li>
  * </ul>
+ *
+ * <p><b>Third-pass review, three further gaps in MAJ-03/MAJ-04's own fix:</b>
+ * <ul>
+ *   <li><b>M4 — not every HTTP 4xx is a definitive rejection.</b> The Binance-family error code
+ *       {@code -1007} ("Timeout waiting for response from backend server. Send status unknown;
+ *       execution status unknown.") is the venue's OWN way of saying the outcome is ambiguous, and
+ *       can arrive behind a 4xx from an edge proxy/WAF even though the order may have reached the
+ *       matching engine. Treating {@code statusCode/100==4} alone as "never created" (the previous
+ *       form) would skip reconciliation for exactly the case it exists to resolve. Only a response
+ *       whose venue {@code code} is OUTSIDE this small ambiguous set skips the query now; a body
+ *       that cannot even be parsed fails closed the same way (never infer "never created" from a
+ *       body that couldn't be read).</li>
+ *   <li><b>M5 — a cancel that didn't actually clear the order was trusted anyway.</b> The
+ *       cancel-then-re-query race MAJ-03 added assumed the re-query's status would always be
+ *       terminal once a cancel had been attempted. If the re-query STILL reports {@code NEW}/
+ *       {@code PARTIALLY_FILLED} (the cancel raced a fill, or genuinely never took effect), that is
+ *       exactly as ambiguous as an outright reconciliation failure and is now classified
+ *       {@code UNKNOWN} instead of being fed into {@code classifyFill} on the assumption nothing
+ *       will change further.</li>
+ *   <li><b>M6 — a missing/unrecognized {@code status} field used to skip the cancel entirely.</b>
+ *       {@code isNonTerminal} previously returned {@code false} (skip the cancel, trust the fill
+ *       numbers as final) for anything that WASN'T literally {@code "NEW"} or
+ *       {@code "PARTIALLY_FILLED"} -- a fail-OPEN default in a module whose whole contract is
+ *       fail-closed. A response omitting {@code status}, or reporting a value this codebase does not
+ *       recognize, now triggers the SAME cancel-and-verify path a known-resting order does, rather
+ *       than being trusted as already final.</li>
+ * </ul>
  */
 final class OrderReconciler {
 
@@ -87,15 +114,19 @@ final class OrderReconciler {
         } catch (Exception e) {
             Throwable cause = unwrap(e);
             logAttemptFailure("place", symbol, leg.clientOrderId, cause);
-            if (cause instanceof MexcRestClient.OrderRejectedException rejected && rejected.statusCode / 100 == 4) {
+            if (cause instanceof MexcRestClient.OrderRejectedException rejected && rejected.statusCode / 100 == 4
+                    && !isAmbiguousRejection(rejected.responseBody)) {
                 // REVIEW.md MAJ-04: a 4xx placement rejection is the venue definitively refusing the
                 // order -- it was never created, so querying for it would only ever find "does not
                 // exist" and previously got misclassified as UNKNOWN. Nothing to reconcile.
+                //
+                // Third-pass review finding (M4): "4xx" alone is not "definitive" -- see
+                // isAmbiguousRejection's javadoc for the -1007 case this now excludes.
                 leg.status = CycleState.LegStatus.REJECTED_PRESUBMIT;
                 return;
             }
-            // Timeout / I/O failure / 5xx: genuinely ambiguous -- the order may have reached the
-            // venue despite this client-side failure. Fall through to reconciliation.
+            // Timeout / I/O failure / 5xx / an ambiguous 4xx: genuinely ambiguous -- the order may
+            // have reached the venue despite this client-side failure. Fall through to reconciliation.
         }
 
         if (!reconcileOnce(symbol, leg, placedOrderId)) {
@@ -107,6 +138,10 @@ final class OrderReconciler {
         // REVIEW.md MAJ-03: a non-terminal order left resting on the matching engine can fill (or
         // partially fill further) while the rest of this cycle -- and possibly Unwinder -- runs
         // against the amount already observed. Cancel it and re-query once before classifying.
+        //
+        // Third-pass review finding (M6): isNonTerminal now fails CLOSED -- a missing/unrecognized
+        // status is treated the same as a known-resting one (attempt cancel, verify), not trusted as
+        // already final.
         if (isNonTerminal(leg.venueStatus) && orderId != null) {
             try {
                 rest.cancelOrder(symbol, leg.clientOrderId, legTimeoutMs).get(legTimeoutMs, TimeUnit.MILLISECONDS);
@@ -121,6 +156,17 @@ final class OrderReconciler {
                 return;
             }
             orderId = leg.venueOrderId != null ? leg.venueOrderId : orderId;
+            // Third-pass review finding (M5): the cancel-triggered re-query is meant to be
+            // AUTHORITATIVE (MAJ-03's own docs above), but nothing previously verified it actually
+            // WAS terminal -- a race (the cancel lost to a fill) or a cancel that genuinely never
+            // took effect could leave the order STILL resting, and the old code fed that straight
+            // into classifyFill as if it were final. Never guess past a still-ambiguous outcome.
+            if (isNonTerminal(leg.venueStatus)) {
+                logAttemptFailure("post-cancel-reconcile", symbol, leg.clientOrderId, new IllegalStateException(
+                        "order still reports status=" + leg.venueStatus + " after a cancel attempt"));
+                leg.status = CycleState.LegStatus.UNKNOWN;
+                return;
+            }
         }
 
         classifyFill(leg);
@@ -156,8 +202,44 @@ final class OrderReconciler {
         }
     }
 
+    /** Venue {@code status} values this codebase KNOWS are final -- an order in one of these states
+     * will never fill or partially-fill any further, so trusting the executed amounts as-is (no
+     * cancel needed) is safe. */
+    private static final java.util.Set<String> KNOWN_TERMINAL_STATUSES = java.util.Set.of(
+            "FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH", "PARTIALLY_CANCELED");
+
+    /** Third-pass review finding (M6): the previous form (`"NEW".equals(s) ||
+     * "PARTIALLY_FILLED".equals(s)`) returned {@code false} -- "safe to trust as final, skip the
+     * cancel" -- for EVERYTHING it didn't explicitly recognize, including a {@code null} status
+     * (the field genuinely absent from the response) or any status string this codebase has never
+     * seen. That is a fail-OPEN default in a module whose entire contract is fail-closed (an
+     * unrecognized state is exactly as uninformative as a resting one). Flipped to an explicit
+     * terminal allowlist: anything NOT in it -- known-resting, {@code null}, or unrecognized --
+     * triggers the same cancel-and-verify path. */
     private static boolean isNonTerminal(String venueStatus) {
-        return "NEW".equals(venueStatus) || "PARTIALLY_FILLED".equals(venueStatus);
+        return venueStatus == null || !KNOWN_TERMINAL_STATUSES.contains(venueStatus);
+    }
+
+    /** Third-pass review finding (M4): MEXC/Binance-family error code {@code -1007} ("Timeout
+     * waiting for response from backend server. Send status unknown; execution status unknown.") is
+     * the venue's own admission that a 4xx response does NOT mean the order was never created --
+     * skipping reconciliation for this code would be the exact ambiguous-outcome guess {@code
+     * OrderReconciler}'s whole design exists to avoid. A response this method cannot parse a venue
+     * {@code code} out of at all is treated the same way -- fail closed, never infer "definitely
+     * rejected" from a body that couldn't even be read (an edge proxy/WAF in front of the venue is a
+     * plausible source of a 4xx with a body MEXC itself never produced). */
+    private static final int AMBIGUOUS_PLACEMENT_VENUE_CODE = -1007;
+
+    private static boolean isAmbiguousRejection(String responseBody) {
+        try {
+            JsonNode node = MAPPER.readTree(responseBody);
+            if (!node.hasNonNull("code")) {
+                return true;
+            }
+            return node.get("code").asInt() == AMBIGUOUS_PLACEMENT_VENUE_CODE;
+        } catch (Exception e) {
+            return true;
+        }
     }
 
     private static void classifyFill(CycleState.Leg leg) {

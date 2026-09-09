@@ -276,11 +276,30 @@ public final class Unwinder {
         return Math.max(0, leg.inputAmountFixed - consumed);
     }
 
+    /** Third-pass review finding (L1): how old {@code books.topBidFixed}/{@code topAskFixed} may be
+     * before {@link #priceReversal} refuses to price against it and falls back to {@code MARKET}/
+     * stranded instead. {@code L2Book} only clears a published top on an explicit {@code reset()}
+     * (a disconnect, or a version-chain gap) -- a connection that goes quietly stale WITHOUT
+     * triggering either (a half-open socket the feed watchdog has not yet caught, or a genuinely
+     * thin symbol like {@code XRPETH} that simply hasn't ticked in a while) still reports a real,
+     * non-sentinel top, just an increasingly out-of-date one. Crossing a many-minutes-old top by a
+     * fixed {@code unwindCrossBps} buffer is exactly the MAJ-02 failure mode ("the market has to
+     * move favorably for this to fill") one level removed -- the buffer was sized for normal
+     * tick-to-tick drift (10-40ms cadence), not for however long the book has actually been silent.
+     * A few seconds is generous relative to that cadence while still meaningfully bounding how
+     * stale a price this method will ever act on. */
+    private static final long MAX_REVERSAL_PRICE_AGE_NANOS = 5_000_000_000L; // 5s
+
     /** Cross the CURRENT top of book by {@code unwindCrossBps}, clamped inside the symbol's
      * {@code PERCENT_PRICE_BY_SIDE} band -- REVIEW.md MAJ-02. Returns {@code null} if the book has
-     * no usable top on the required side (untrusted/empty, e.g. mid-reconnect), signaling the
-     * caller to fall back to {@code MARKET}. */
+     * no usable top on the required side (untrusted/empty, e.g. mid-reconnect), is still warming up,
+     * or has gone stale beyond {@link #MAX_REVERSAL_PRICE_AGE_NANOS} (third-pass review finding L1)
+     * -- signaling the caller to fall back to {@code MARKET}. */
     private Long priceReversal(Side reverseSide, SymbolFilter filter, int symbolIndex) {
+        if (!books.isTrusted(symbolIndex)
+                || books.ageNanos(symbolIndex, System.nanoTime()) > MAX_REVERSAL_PRICE_AGE_NANOS) {
+            return null;
+        }
         if (reverseSide == Side.ASK) {
             // BUY: cross ABOVE the current best ask.
             long topAsk = books.topAskFixed(symbolIndex);
@@ -304,7 +323,19 @@ public final class Unwinder {
      * ABOVE the reference than {@code bidMultiplierUp}; a SELL ("ask" side) order may not price
      * further BELOW it than {@code askMultiplierDown}. An absent band (not published for this
      * symbol) leaves the price unclamped -- the small, fixed cross buffer is the only guard in that
-     * case, which every configured symbol currently avoids by publishing a real band. */
+     * case, which every configured symbol currently avoids by publishing a real band.
+     *
+     * <p><b>Third-pass review finding (L2):</b> the clamped price is computed here at full 1e8
+     * precision, but {@link CycleExecutor#buildOrderParams} later renders it onto the wire via
+     * {@link FixedPoint#toPlainString}, which TRUNCATES DOWN to the symbol's real
+     * {@code priceDecimals} (never rounds -- see that method's own javadoc). For the CAP (a BUY may
+     * not price ABOVE it), truncating a price sitting exactly at the cap DOWN only makes the order
+     * less aggressive -- still safely inside the band. For the FLOOR (a SELL may not price BELOW
+     * it), the same truncation could push the price sitting exactly at the floor BELOW it once
+     * rendered -- exactly the venue rejection this clamp exists to prevent. The floor is therefore
+     * rounded UP to a representable tick at {@code priceDecimals} before use, so later truncation
+     * can only land ON it, never under it; the cap is left as-is, since truncating toward it is
+     * already the safe direction. */
     static long clampToPriceBand(long price, Side reverseSide, SymbolFilter filter, long referencePriceFixed) {
         if (reverseSide == Side.ASK) {
             if (!Double.isNaN(filter.bidMultiplierUp())) {
@@ -316,7 +347,7 @@ public final class Unwinder {
             if (!Double.isNaN(filter.askMultiplierDown())) {
                 long floor = FixedPoint.mulDiv(referencePriceFixed,
                         FixedPoint.fromDouble(1.0 - filter.askMultiplierDown()), FixedPoint.SCALE);
-                price = Math.max(price, floor);
+                price = Math.max(price, roundUpToDecimals(floor, filter.priceDecimals()));
             }
         }
         return price;
@@ -327,11 +358,26 @@ public final class Unwinder {
      * the wire. Truncating down is the safe direction for a {@code quoteOrderQty}: it can only
      * spend less of the quote asset than is actually held, never more. */
     static long truncateToDecimals(long fixed, int decimals) {
+        return (fixed / stepFor(decimals)) * stepFor(decimals);
+    }
+
+    /** Round a 1e8-fixed amount UP to {@code decimals} fractional digits -- the opposite direction
+     * from {@link #truncateToDecimals}/{@link FixedPoint#toPlainString}'s own truncation. Used ONLY
+     * for a price FLOOR (third-pass review finding L2, {@link #clampToPriceBand}'s javadoc): rounding
+     * the floor itself up to a representable tick FIRST means the later on-wire truncation can only
+     * land exactly on it, never below it. */
+    static long roundUpToDecimals(long fixed, int decimals) {
+        long step = stepFor(decimals);
+        long truncated = (fixed / step) * step;
+        return truncated == fixed ? fixed : truncated + step;
+    }
+
+    private static long stepFor(int decimals) {
         long step = 1L;
         for (int i = decimals; i < 8; i++) {
             step *= 10L;
         }
-        return (fixed / step) * step;
+        return step;
     }
 
     /** A {@code MARKET} reversal, sized in the asset being SPENT: a SELL spends the base asset and

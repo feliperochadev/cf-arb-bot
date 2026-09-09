@@ -139,8 +139,10 @@ public final class CycleExecutor {
             // once, same as every other outcome.
             long ageNanos = fullCycleStart - intent.detectedAtNanos();
             if (ageNanos > maxIntentAgeNanos) {
+                // Third-pass review finding: a dedicated event, not brokenCycle's shape with a
+                // failed_leg=-1 sentinel -- see JournalEvents#intentExpired's javadoc.
                 metrics.recordIntentExpired();
-                journal.write(JournalEvents.brokenCycle(triangle.name(), -1, "stale-intent", 0, portfolio.equity()));
+                journal.write(JournalEvents.intentExpired(triangle.name(), ageNanos, portfolio.equity()));
                 return;
             }
             if (dryRun) {
@@ -238,8 +240,21 @@ public final class CycleExecutor {
                     // Terra Major 4 / Grok Major 6: reconciliation could not establish a terminal
                     // state. Never guess -- no automated unwind, trip the kill switch for operator
                     // review, and leave whatever inventory may exist exactly as-is.
+                    //
+                    // Third-pass review finding (M1): this used to call killSwitch.recordFailure(),
+                    // which only trips after cf-bot.risk.max-consecutive-failures (default 3) in a
+                    // row -- contradicting CycleState.LegStatus#UNKNOWN's own javadoc ("it trips the
+                    // kill switch and waits for operator review"). Between the first and third
+                    // UNKNOWN, Portfolio is never debited (no unwind runs, so
+                    // handleBrokenCycle/applyBrokenCyclePnl is never reached), yet the executor keeps
+                    // accepting new cycles against equity that no longer reflects reality -- the
+                    // account may already be holding non-anchor inventory from the FIRST UNKNOWN leg.
+                    // recordUnrecoverableInventory trips on the first occurrence, exactly as the
+                    // status's own contract promises and as KillSwitch already does for the
+                    // structurally identical "no automated recovery path" case in Unwinder.
                     metrics.recordCycleBroken();
-                    killSwitch.recordFailure("leg-" + leg + "-reconciliation-unknown (" + triangle.name() + ")");
+                    killSwitch.recordUnrecoverableInventory(
+                            "leg-" + leg + "-reconciliation-unknown (" + triangle.name() + ")");
                     journal.write(JournalEvents.brokenCycle(triangle.name(), leg,
                             "reconciliation-unknown-operator-review-required", 0, portfolio.equity()));
                     return;

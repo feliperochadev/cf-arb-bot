@@ -47,6 +47,20 @@ public final class RiskGates {
     // from the detector thread's canFire() hot path.
     private volatile boolean clockSkewKnown;
     private volatile long clockSkewNanos;
+    // Third-pass review finding (M7): the nanoTime() a skew sample was taken at, so canFire() can
+    // tell a STALE sample from a fresh one -- see the class-level constant and canFire()'s usage.
+    private volatile long clockSkewSampleNanos = Long.MIN_VALUE / 2; // never-sampled sentinel
+
+    /** Third-pass review finding (M7): {@code clockSkewKnown} used to latch {@code true} permanently
+     * on the FIRST successful sample and never expire -- if {@code /api/v3/time} later became
+     * unreachable (an egress rule change, a sustained MEXC outage) or every subsequent sample kept
+     * getting discarded by {@code BotService}'s own implausible-RTT filter, {@code canFire} would
+     * keep trusting an hours-old skew value forever, and the live-mode fail-closed branch below
+     * ("no sample yet -> refuse to fire") would then be reachable only during the brief window
+     * before the very first sample ever landed. {@code BotService} samples every
+     * {@code WARMUP_PERIOD_MS} (60s); a sample older than 3x that cadence is treated exactly like
+     * "never sampled" -- fail closed in live mode, same as the true never-sampled case. */
+    private static final long CLOCK_SKEW_SAMPLE_MAX_AGE_NANOS = 180_000_000_000L; // 180s
 
     private final AtomicLongArray lastFireNanosByTriangle;
     private final AtomicInteger openCycles = new AtomicInteger(0);
@@ -83,7 +97,12 @@ public final class RiskGates {
         this.maxOpenCycles = riskConfig.maxOpenCycles();
         this.cooldownNanos = riskConfig.cycleCooldownMs() * 1_000_000L;
         this.maxBookAgeNanos = strategyConfig.maxBookAgeMs() * 1_000_000L;
-        this.clockSkewToleranceNanos = execConfig.recvWindowMs() * 1_000_000L;
+        // Third-pass review finding (M7): the previous tolerance was the FULL recvWindow -- exactly
+        // the boundary at which MEXC starts returning -1021 ("timestamp outside recvWindow"), so a
+        // skew that passed this gate could still be one jitter spike (or the time between this check
+        // and the request actually reaching MEXC) away from rejection. Halved for real margin before
+        // the venue's own hard boundary; recvWindow itself is unchanged (still sent as-is to MEXC).
+        this.clockSkewToleranceNanos = (execConfig.recvWindowMs() * 1_000_000L) / 2;
 
         if (riskConfig.maxCyclesPerMinute() <= 0) {
             throw new IllegalStateException(
@@ -121,7 +140,15 @@ public final class RiskGates {
         // because this host happens to have no route to MEXC's time endpoint would be a false
         // safety, not a real one. A CONFIRMED skew beyond tolerance blocks in both modes -- it is
         // useful, actionable information about this host's clock regardless of trading mode.
-        if (clockSkewKnown) {
+        //
+        // Third-pass review finding (M7): a sample older than CLOCK_SKEW_SAMPLE_MAX_AGE_NANOS is
+        // treated exactly like "never sampled" -- clockSkewKnown otherwise latches true forever on
+        // the FIRST successful sample, so a later loss of connectivity to MEXC's time endpoint would
+        // keep this gate trusting an arbitrarily stale value rather than degrading back to the same
+        // fail-closed-in-live-mode behavior a fresh JVM with no sample yet gets.
+        boolean skewSampleFresh = clockSkewKnown
+                && (nowNanos - clockSkewSampleNanos) <= CLOCK_SKEW_SAMPLE_MAX_AGE_NANOS;
+        if (skewSampleFresh) {
             if (Math.abs(clockSkewNanos) > clockSkewToleranceNanos) {
                 return false;
             }
@@ -183,9 +210,13 @@ public final class RiskGates {
 
     /** Called from {@code BotService}'s periodic clock-skew timer (RTT-corrected -- see
      * {@code BotService#scheduleWarmUpAndClockSkew}'s javadoc for the midpoint-estimate fix,
-     * REVIEW.md MED-02) whenever a sample is successfully taken. */
+     * REVIEW.md MED-02) whenever a sample is successfully taken. Records the sample TIME (this
+     * class's own {@code nanoTime()}, not the caller's) so {@link #canFire} can detect a sample
+     * that has since gone stale (third-pass review finding M7) -- see
+     * {@link #CLOCK_SKEW_SAMPLE_MAX_AGE_NANOS}'s javadoc. */
     public void updateClockSkew(long skewNanos) {
         this.clockSkewNanos = skewNanos;
+        this.clockSkewSampleNanos = System.nanoTime();
         this.clockSkewKnown = true;
     }
 }

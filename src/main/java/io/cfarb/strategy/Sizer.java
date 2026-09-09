@@ -96,6 +96,20 @@ public final class Sizer {
         if (quoteSpent < quoteBudget) {
             return; // the displayed ladder can't fully absorb the intended size — reject, don't partial-fill
         }
+        // Third-pass review finding: baseFilled was accumulated by walking each level at ITS OWN
+        // (better-or-equal) price, so baseFilled * worstPrice can exceed quoteBudget whenever more
+        // than one level was touched -- yet exec.CycleExecutor submits a SINGLE IOC limit order for
+        // the full baseFilled quantity AT worstPrice (Result#worstPriceFixed's own javadoc: "the
+        // marketable IOC limit price CycleExecutor must request"). MEXC's balance check evaluates the
+        // order at ITS OWN limit price, not this multi-level VWAP, so a candidate sized near the full
+        // available balance could be rejected for insufficient balance even though the true VWAP
+        // spend modeled above fits -- max-notional-usd is meant to be a hard cap on what gets
+        // reserved, not merely on what this walk projects would be spent. Cap the quantity so the
+        // WORST-PRICE notional also never exceeds the budget; conservative (never orders MORE than
+        // modeled) and a no-op whenever a single level satisfies the whole size (the common case,
+        // where worstPrice IS the only price touched).
+        long worstPriceCappedBase = FixedPoint.mulDiv(quoteBudget, FixedPoint.SCALE, worstPrice);
+        baseFilled = Math.min(baseFilled, worstPriceCappedBase);
         // Quantize FIRST, then validate both minimums against the FINAL quantized size (Terra
         // Minor 1: the review found minNotional was checked against pre-rounding quoteSpent, so a
         // quantity that rounds down below the venue's real minimum notional could still pass here

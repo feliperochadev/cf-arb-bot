@@ -338,25 +338,21 @@ public class BotService {
             }
             boolean feedDead = anyWarmed && freshestWarmedBookAgeNanos > CONNECTION_DEAD_THRESHOLD_NANOS;
 
-            // REVIEW.md MAJ-06: a connection isConnected() still reports alive but has gone silent
-            // (a half-open socket, a silently stalled proxy) is RECOVERABLE -- force a reconnect
-            // first, same as any ordinary disconnect would trigger, rather than treating the first
-            // detection as a permanent kill-switch emergency. Only trip after the reconnect keeps
-            // failing to clear the staleness FEED_DEAD_TRIP_THRESHOLD times in a row.
-            if (feedDead && wsClient.isConnected()) {
-                consecutiveFeedDeadDetections++;
-                LOG.warnf("feed watchdog: connection reports alive but no data across every warmed "
-                                + "book for >%dms (detection %d/%d) -- forcing a reconnect",
-                        CONNECTION_DEAD_THRESHOLD_NANOS / 1_000_000, consecutiveFeedDeadDetections,
-                        FEED_DEAD_TRIP_THRESHOLD);
-                journal.write(JournalEvents.feedReconnect("sustained-stale-book", consecutiveFeedDeadDetections));
-                wsClient.forceReconnect();
-                if (consecutiveFeedDeadDetections >= FEED_DEAD_TRIP_THRESHOLD) {
+            WatchdogDecision decision = decideWatchdogAction(anyWarmed, feedDead,
+                    consecutiveFeedDeadDetections, FEED_DEAD_TRIP_THRESHOLD);
+            consecutiveFeedDeadDetections = decision.nextConsecutiveFeedDeadDetections;
+            if (decision.action != WatchdogAction.NONE) {
+                LOG.warnf("feed watchdog: %s (detection %d/%d) -- forcing a reconnect",
+                        feedDead ? "connection reports alive but no data across every warmed book for >"
+                                + (CONNECTION_DEAD_THRESHOLD_NANOS / 1_000_000) + "ms"
+                                : "still no data across any book after a forced reconnect",
+                        decision.nextConsecutiveFeedDeadDetections, FEED_DEAD_TRIP_THRESHOLD);
+                journal.write(JournalEvents.feedReconnect(decision.reason, decision.nextConsecutiveFeedDeadDetections));
+                wsClient.forceReconnect(); // no-op if a reconnect is already in flight -- see its own javadoc
+                if (decision.action == WatchdogAction.RECONNECT_AND_TRIP) {
                     killSwitch.recordFeedUnhealthy("sustained-stale-book-after-"
-                            + consecutiveFeedDeadDetections + "-forced-reconnects");
+                            + decision.nextConsecutiveFeedDeadDetections + "-forced-reconnects");
                 }
-            } else {
-                consecutiveFeedDeadDetections = 0;
             }
 
             // Churn (5 reconnects inside a 5-minute window -- MexcWsClient.CHURN_THRESHOLD/
@@ -366,6 +362,50 @@ public class BotService {
                 killSwitch.recordFeedUnhealthy("connection-churning");
             }
         });
+    }
+
+    enum WatchdogAction { NONE, RECONNECT, RECONNECT_AND_TRIP }
+
+    record WatchdogDecision(WatchdogAction action, int nextConsecutiveFeedDeadDetections, String reason) {
+    }
+
+    /**
+     * Third-pass review finding (M3): pure decision function for the feed watchdog's escalation
+     * counter, extracted out of the Vert.x timer callback so this state machine can be unit tested
+     * without a live Vert.x/WebSocket harness (package-visible for {@code BotServiceWatchdogTest}).
+     *
+     * <p>The previous inline form reset {@code consecutiveFeedDeadDetections} to 0 whenever
+     * {@code !feedDead} -- which is ALSO true immediately after {@code forceReconnect()} runs
+     * (its {@code closeHandler} calls {@code books.resetAll()}, zeroing every book's
+     * {@code updateCount}, which makes {@code anyWarmed} false on the very next tick regardless of
+     * whether the reconnect actually restored data). A feed that goes fully dark after a forced
+     * reconnect -- exactly the failure this escalation exists to catch -- would then see
+     * {@code anyWarmed} stay false forever, silently resetting the counter to 0 on every subsequent
+     * tick: the kill switch could never trip, and the bot would sit un-trading with no operator
+     * signal beyond a readiness-check flip (MIN-05: no alarm wired to that either).
+     *
+     * <p>Only CONFIRMED health (a book with fresh, non-stale data -- {@code anyWarmed && !feedDead})
+     * legitimately clears an escalation in progress. {@code !anyWarmed} while ALREADY mid-escalation
+     * ({@code consecutiveFeedDeadDetectionsBefore > 0}) keeps counting instead, on the working
+     * assumption that the last forced reconnect has not yet proven itself. A genuinely brand-new
+     * process (never warmed, never escalated) still does nothing, matching {@code L2Book}'s own "not
+     * yet warm, not stale" semantics.
+     */
+    static WatchdogDecision decideWatchdogAction(boolean anyWarmed, boolean feedDead,
+                                                  int consecutiveFeedDeadDetectionsBefore, int tripThreshold) {
+        boolean confirmedHealthy = anyWarmed && !feedDead;
+        if (confirmedHealthy) {
+            return new WatchdogDecision(WatchdogAction.NONE, 0, null);
+        }
+        boolean stillUnhealthy = feedDead || (consecutiveFeedDeadDetectionsBefore > 0 && !anyWarmed);
+        if (!stillUnhealthy) {
+            // Never warmed yet at all, and not already mid-escalation -- legitimately nothing to do.
+            return new WatchdogDecision(WatchdogAction.NONE, consecutiveFeedDeadDetectionsBefore, null);
+        }
+        int next = consecutiveFeedDeadDetectionsBefore + 1;
+        String reason = feedDead ? "sustained-stale-book" : "post-reconnect-still-dark";
+        WatchdogAction action = next >= tripThreshold ? WatchdogAction.RECONNECT_AND_TRIP : WatchdogAction.RECONNECT;
+        return new WatchdogDecision(action, next, reason);
     }
 
     private void scheduleLatencySnapshots() {

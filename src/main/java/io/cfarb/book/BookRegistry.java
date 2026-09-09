@@ -63,6 +63,20 @@ public final class BookRegistry {
         return books[symbolIndex].topAskFixed();
     }
 
+    /** Third-pass review finding (L1): whether {@code symbolIndex}'s book has cleared its warm-up
+     * gate -- {@code exec.Unwinder} consults this before trusting a published top-of-book to price
+     * an emergency reversal (a book that is still warming up after a reconnect publishes a top that
+     * is not yet the real best price). Same accepted cross-thread trade-off as {@link #topBidFixed}. */
+    public boolean isTrusted(int symbolIndex) {
+        return books[symbolIndex].isTrusted();
+    }
+
+    /** Local receive-time age of {@code symbolIndex}'s book, for {@code exec.Unwinder}'s reversal
+     * staleness gate (third-pass review finding L1) -- see {@link L2Book#ageNanos}. */
+    public long ageNanos(int symbolIndex, long nowNanos) {
+        return books[symbolIndex].ageNanos(nowNanos);
+    }
+
     /** Reset every book (cf-arb-bot-review-plan.md Tier 1 step 1.7) -- call on WebSocket disconnect
      * and again immediately before re-subscribing on reconnect. Without this, a stale ladder and
      * version-chain survive a reconnect; if the venue's push channel ever omits version fields, the

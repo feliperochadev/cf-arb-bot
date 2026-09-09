@@ -50,6 +50,20 @@ class JournalEventsTest {
     }
 
     @Test
+    void intentExpiredIsItsOwnEventTypeNotBrokenCycleWithASentinelLeg() {
+        // Third-pass review finding: a stale-intent drop is not a broken cycle (no leg was ever
+        // attempted) -- it gets its own event type so cfarb.cycles.broken and the NDJSON line count
+        // stay consistent, and so the field name for "how old" is self-documenting rather than a
+        // -1 magic value in a field named failed_leg.
+        String line = JournalEvents.intentExpired("usdt-btc-xrp-fwd", 200_000_000L, 5_000_000_000L);
+
+        JsonNode node = assertDoesNotThrow(() -> MAPPER.readTree(line));
+        assertEquals("intent_expired", node.get("type").asText());
+        assertEquals(200.0, node.get("age_ms").asDouble());
+        assertEquals("usdt-btc-xrp-fwd", node.get("triangle").asText());
+    }
+
+    @Test
     void riskTripReasonWithEmbeddedJsonLikeTextStillParsesAsJson() {
         // Exactly the kind of reason string executor-exception failures produce.
         String reason = "executor-exception: java.lang.RuntimeException: response was {\"status\":\"error\"}";

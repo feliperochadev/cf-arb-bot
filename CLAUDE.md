@@ -109,6 +109,57 @@ ever enters `recorder-service`.
   `CycleState.Leg.inputAmountFixed` now records what each leg was handed, and the unwind walk carries
   `input - executed` backwards through the reversal chain (excluding leg 0, whose from-asset is the
   anchor and whose actual spend `anchorSpent` already measures).
+- **FIXED 2026-09-09 (third-pass review, Medium/Low sweep):**
+  - `exec.CycleExecutor`'s `UNKNOWN` leg status now trips the kill switch IMMEDIATELY
+    (`KillSwitch.recordUnrecoverableInventory`), matching `CycleState.LegStatus#UNKNOWN`'s own
+    contract — it previously only called `recordFailure` (3-strikes), so Portfolio could go
+    un-debited for up to 2 more cycles while real non-anchor inventory sat unaccounted for.
+  - `util.FixedPoint.mulDiv`'s overflow branch no longer allocates `BigInteger`s — a single
+    BTCUSDT-sized top-of-book level already overflows the plain-`long` fast path, so this was hit
+    on essentially every major-pair ladder walk on the Netty event-loop thread (a bigger R1 breach
+    than the `full.getBytes()` copy below). Replaced with an allocation-free unsigned 128-by-64 bit
+    division, cross-checked against `BigInteger` over 100k random triples in `FixedPointTest`.
+  - `strategy.Sizer.fillAsk` now caps the quantized quantity so a single IOC limit order's notional
+    AT its own worst-touched price never exceeds the modeled budget — a multi-level walk could
+    previously accumulate `baseFilled` from cheaper early levels such that `baseFilled * worstPrice`
+    exceeded `candidateNotional`, risking an insufficient-balance rejection MEXC's own balance check
+    would raise at the boundary price, not the VWAP this bot modeled.
+  - `BotService`'s feed watchdog escalation counter was UNREACHABLE: `forceReconnect()`'s own
+    `books.resetAll()` zeroed every book's `updateCount`, so the very next tick read `anyWarmed=false`
+    and silently reset the counter to 0 regardless of whether the reconnect restored data — a feed
+    that stayed dark after reconnecting could never reach `FEED_DEAD_TRIP_THRESHOLD`, so the kill
+    switch could never trip on a genuinely dead feed. The decision logic is now a pure, unit-tested
+    static method (`BotService.decideWatchdogAction`, see `BotServiceWatchdogTest`) that only clears
+    the escalation on CONFIRMED fresh data.
+  - `exec.OrderReconciler`: a 4xx placement rejection is no longer automatically
+    `REJECTED_PRESUBMIT` — venue code `-1007` ("send status unknown") and any unparseable rejection
+    body now fail closed into reconciliation instead. `isNonTerminal` now fails CLOSED (an
+    unrecognized or missing `status` field triggers the same cancel-and-verify path a known-resting
+    order gets, not "trust it as final"). A cancel-triggered re-query that STILL reports non-terminal
+    is now `UNKNOWN`, not fed into `classifyFill` as if it were authoritative.
+  - `risk.RiskGates`'s clock-skew gate no longer latches `clockSkewKnown=true` forever on the first
+    sample — a sample older than 180s (3x the 60s sampling cadence) degrades back to "unknown" and
+    fails closed in live mode. Tolerance halved from the full `recvWindow` (MEXC's own `-1021`
+    boundary, zero margin) to half of it.
+  - `exec.Unwinder`'s reversal pricing now checks `L2Book.isTrusted()`/book age (5s) before trusting
+    a published top-of-book — a book that goes quietly stale WITHOUT a `reset()` (a half-open socket
+    the watchdog hasn't caught yet, a thin symbol that hasn't ticked) still publishes a real,
+    non-sentinel top, just an increasingly out-of-date one; crossing an old top by the fixed
+    `unwind-cross-bps` buffer is the MAJ-02 failure one level removed. `clampToPriceBand`'s FLOOR
+    (never its cap) is now rounded up to a representable tick before use, so the later on-wire
+    truncation (`FixedPoint.toPlainString` never rounds) can't push the submitted price below the
+    venue's real `PERCENT_PRICE_BY_SIDE` floor. **Not resolved:** whether MEXC's `PERCENT_PRICE_BY_SIDE`
+    reference price is truly the current top-of-book or a trailing average is still unverified — see
+    the live-probe gaps below.
+  - `SymbolFilterLoader`'s price/quantity decimal-precision clamp (XRPBTC's real
+    `quote_asset_precision` is 9, clamped to `FixedPoint.SCALE`'s 8-decimal ceiling — see the class's
+    own javadoc) now logs a loud, symbol-named `WARN` at startup instead of clamping silently. At
+    XRPBTC's small price magnitude a single 1e-8 grid step is a much larger fraction of the price
+    than the same absolute step is for a large-magnitude symbol (BTCUSDT) — comparable, in fact, to
+    this bot's whole `min-net-bps` threshold — which is exactly the kind of precision loss
+    `EdgeCalculatorTest`'s cross-check against the Python pipeline cannot catch (both sides share the
+    same `FixedPoint.SCALE` ceiling). This does not by itself prove a live discrepancy; the
+    credentialed probe that would is still the open gap below.
 - **Per-stage latency histograms are still blended**: `decisionToLeg1AckNanos` records the FULL
   place→reconcile→(commission-lookup) round trip for every leg into one histogram, not separate
   receipt→decode / decode→decision / queue-wait / leg-ack stages (Tier 3).

@@ -111,8 +111,7 @@ public final class FixedPoint {
     }
 
     /**
-     * {@code (a * b) / c} without overflow for our magnitude range, falling back to
-     * {@code BigInteger} only when {@code a * b} would overflow a signed {@code long}.
+     * {@code (a * b) / c} without overflow for our magnitude range.
      * Ported from {@code cf-trader.trader.Strategist} into its rightful home per rule R2 — and
      * FIXED while porting: the original overflow test was {@code Math.multiplyHigh(a, b) == 0},
      * which only proves the product fits in the UNSIGNED 64-bit range (up to ~1.8447e19). A
@@ -127,15 +126,66 @@ public final class FixedPoint {
      * <p>The correct test: no overflow iff the high word Math.multiplyHigh(a,b) is the sign
      * extension of the low word {@code a * b} (0 if non-negative, -1 if negative) — the standard
      * technique for detecting signed 64-bit multiplication overflow via the high-word intrinsic.
+     *
+     * <p><b>Third-pass review finding (NEW-6):</b> the overflow branch used to fall back to
+     * {@code BigInteger}, allocating three objects — and this is NOT a rare tail case on this
+     * codebase's actual hot path. A single BTCUSDT-sized top-of-book level (price ~7.8e12, qty
+     * ~6.8e8, both 1e8-fixed — real captured fixture values) already overflows {@code a*b}
+     * (~5.3e21 > Long.MAX_VALUE), so {@code Sizer.fillAsk}'s {@code levelNotional} computation hit
+     * this branch on essentially every major-pair ladder walk, allocating on the Netty event-loop
+     * thread on every candidate evaluation — a direct breach of rule R1. Every operand {@code
+     * mulDiv} is ever called with in this codebase is non-negative by construction (prices,
+     * quantities, and notionals are never negative — see {@link #toPlainString}'s javadoc), so this
+     * is genuinely an UNSIGNED 128-bit multiply/divide: {@code Math.multiplyHigh} already gives the
+     * correct high word for non-negative operands (signed and unsigned interpretations coincide
+     * below 2^63), and {@link #divideUnsigned128by64} performs the division without allocating.
+     * Negative operands (never exercised by any real caller) still fall back to {@code BigInteger}
+     * rather than extending the unsigned fast path to a domain it was not built to prove correct
+     * for — correctness over speed on a path nothing here actually takes.
      */
     public static long mulDiv(long a, long b, long c) {
         long high = Math.multiplyHigh(a, b);
         long low = a * b;
         boolean overflow = high != (low >> 63);
-        return !overflow
-                ? low / c
-                : java.math.BigInteger.valueOf(a).multiply(java.math.BigInteger.valueOf(b))
-                        .divide(java.math.BigInteger.valueOf(c)).longValueExact();
+        if (!overflow) {
+            return low / c;
+        }
+        if (a < 0 || b < 0 || c <= 0) {
+            return java.math.BigInteger.valueOf(a).multiply(java.math.BigInteger.valueOf(b))
+                    .divide(java.math.BigInteger.valueOf(c)).longValueExact();
+        }
+        return divideUnsigned128by64(high, low, c);
+    }
+
+    /**
+     * {@code floor((high:low) / c)}, where {@code high:low} is the UNSIGNED 128-bit value formed by
+     * treating {@code high} as the high 64 bits and {@code low} as the low 64 bits, and {@code c} is
+     * a positive divisor. Requires the true quotient to fit in a non-negative {@code long} — true
+     * for every caller here, since the result is itself a fixed-point money/quantity amount, nowhere
+     * near 2^63.
+     *
+     * <p>Classic unsigned 128-by-64 long division via repeated shift-and-subtract, one bit at a
+     * time — allocation-free, unlike {@code BigInteger}. This branch is already the "big number"
+     * case (only reached when {@code a*b} overflows 64 signed bits), so correctness of a
+     * straightforward bit-at-a-time algorithm is preferred here over the complexity of a
+     * word-at-a-time one. {@code remainder}/{@code quotient} are manipulated as raw 64-bit unsigned
+     * bit patterns throughout (via {@link Long#compareUnsigned}) — Java's {@code <<}/{@code -}
+     * operators on {@code long} wrap modulo 2^64 regardless of sign interpretation, which is exactly
+     * the semantics unsigned arithmetic needs.
+     */
+    private static long divideUnsigned128by64(long high, long low, long c) {
+        long remainder = 0;
+        long quotient = 0;
+        for (int bit = 127; bit >= 0; bit--) {
+            boolean nextBit = bit >= 64 ? (((high >>> (bit - 64)) & 1L) != 0) : (((low >>> bit) & 1L) != 0);
+            remainder = (remainder << 1) | (nextBit ? 1L : 0L);
+            quotient <<= 1;
+            if (Long.compareUnsigned(remainder, c) >= 0) {
+                remainder -= c;
+                quotient |= 1L;
+            }
+        }
+        return quotient;
     }
 
     /**

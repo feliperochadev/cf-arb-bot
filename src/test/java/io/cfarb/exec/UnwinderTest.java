@@ -98,6 +98,15 @@ class UnwinderTest {
     }
 
     private static void seedTop(BookRegistry books, int symbolIndex, double bidPrice, double askPrice) {
+        seedTopAtTime(books, symbolIndex, bidPrice, askPrice, System.nanoTime());
+    }
+
+    /** Third-pass review finding (L1): seed a book as of an explicit receive-time nanoTime, so a
+     * test can simulate a top-of-book that is still PUBLISHED (non-sentinel, trusted) but has gone
+     * stale -- {@code nowNanos} in the past relative to when {@link Unwinder} itself later calls
+     * {@code System.nanoTime()} to check the age gate. */
+    private static void seedTopAtTime(BookRegistry books, int symbolIndex, double bidPrice, double askPrice,
+                                       long nowNanos) {
         MexcDepthDecoder.DepthFrame f = new MexcDepthDecoder.DepthFrame();
         f.fromVersion = -1;
         f.toVersion = -1;
@@ -108,7 +117,7 @@ class UnwinderTest {
         f.askPx[0] = FixedPoint.fromDouble(askPrice);
         f.askQty[0] = FixedPoint.fromDouble(1.0);
         f.askCount = 1;
-        books.book(symbolIndex).apply(f, System.nanoTime());
+        books.book(symbolIndex).apply(f, nowNanos);
     }
 
     private static final long DEFAULT_CROSS_BPS = 40;
@@ -396,6 +405,87 @@ class UnwinderTest {
         assertTrue(price > naiveUnclamped, "the raw 50% cross must have been clamped up toward the floor");
         assertTrue(price >= floor * 0.99, "clamped price should sit at (or very near, given rounding) the venue's "
                 + "own price-band floor=" + floor + ", got " + price);
+    }
+
+    @Test
+    void clampToPriceBandFloorSurvivesOnWireTruncationWithoutFallingBelowTheVenueFloor() {
+        // Third-pass review finding (L2): clampToPriceBand computes the floor at full 1e8
+        // precision, but FixedPoint.toPlainString later TRUNCATES DOWN to priceDecimals when the
+        // price is rendered onto the wire -- if the clamped price sits exactly at a floor that isn't
+        // already tick-aligned, truncation could push the SUBMITTED price below the venue's own
+        // floor. Pick a referencePrice/askMultiplierDown pair whose raw floor is deliberately NOT
+        // aligned to BTCUSDT's 2 price decimals.
+        long referencePrice = FixedPoint.fromDouble(77777.77);
+        // askMultiplierDown = 0.005 -> raw floor = 77777.77 * 0.995 = 77378.81615, NOT 2-decimal-aligned.
+        long crossedBelowFloor = FixedPoint.fromDouble(70000.0); // deliberately far below the floor
+        long clamped = Unwinder.clampToPriceBand(crossedBelowFloor, Side.BID, BTCUSDT, referencePrice);
+
+        String onWire = FixedPoint.toPlainString(clamped, BTCUSDT.priceDecimals());
+        double onWireValue = Double.parseDouble(onWire);
+        double trueFloor = 77777.77 * (1.0 - BTCUSDT.askMultiplierDown());
+        assertTrue(onWireValue >= trueFloor, "the price actually rendered onto the wire (" + onWire
+                + ") must never fall below the venue's real floor (" + trueFloor + ") after truncation");
+    }
+
+    @Test
+    void roundUpToDecimalsIsExactWhenAlreadyAlignedAndBumpsUpOtherwise() {
+        assertEquals(FixedPoint.fromDouble(1.23), Unwinder.roundUpToDecimals(FixedPoint.fromDouble(1.23), 2),
+                "an already-aligned value must round-trip exactly, never bump up spuriously");
+        long slightlyAbove = FixedPoint.fromDouble(1.2300001);
+        assertEquals(FixedPoint.fromDouble(1.24), Unwinder.roundUpToDecimals(slightlyAbove, 2));
+    }
+
+    @Test
+    void staleTopOfBookFallsBackToMarketRatherThanCrossingAManyMinutesOldPrice() {
+        // Third-pass review finding (L1): L2Book only clears topBid/topAskFixed on an explicit
+        // reset() (disconnect or version-chain gap) -- a connection that goes quietly stale WITHOUT
+        // either (a half-open socket the watchdog hasn't caught yet) still reports a real,
+        // non-sentinel top, just a many-minutes-old one. Crossing that by the fixed unwindCrossBps
+        // buffer is the MAJ-02 failure one level removed. Seed the book 10 SECONDS in the past
+        // (Unwinder's own staleness gate is 5s) relative to when Unwinder itself checks the age.
+        FakeMexcOrderApi api = new FakeMexcOrderApi();
+        BookRegistry books = books();
+        long staleSeedNanos = System.nanoTime() - 10_000_000_000L;
+        seedTopAtTime(books, 0, 77840.0, 77850.0, staleSeedNanos); // BTCUSDT, 10s stale
+        CycleState state = new CycleState("c");
+        state.legs[0].status = CycleState.LegStatus.FILLED;
+        state.legs[0].requestedPriceFixed = FixedPoint.fromDouble(77850.0);
+        state.legs[0].executedBaseQtyFixed = FixedPoint.fromDouble(0.001285);
+        state.legs[0].executedQuoteFixed = FixedPoint.fromDouble(0.001285 * 77850.0);
+        state.legs[1].status = CycleState.LegStatus.ZERO_FILL;
+
+        api.scriptQuery("BTCUSDT", FixedPoint.fromDouble(0.001284), FixedPoint.fromDouble(99.0), "FILLED", "rev-0");
+
+        Unwinder.Result r = unwinder(api, books).unwind(triangle(), state, 1);
+
+        assertEquals(1, api.placeOrderCalls);
+        assertTrue(api.placedParams.get(0).contains("type=MARKET"), "a 10s-stale top must be treated the same "
+                + "as no top at all -- must fall back to MARKET: " + api.placedParams.get(0));
+        assertFalse(api.placedParams.get(0).contains("price="), "a MARKET order must never carry a price");
+        assertFalse(r.unrecoverable());
+    }
+
+    @Test
+    void freshTopOfBookStillPricesNormallyWithinTheStalenessWindow() {
+        // No regression: a top that is recent (well inside the 5s staleness gate) must still be
+        // used to price the reversal, not fall back to MARKET unnecessarily.
+        FakeMexcOrderApi api = new FakeMexcOrderApi();
+        BookRegistry books = books();
+        seedTop(books, 0, 77840.0, 77850.0); // seeded "now" -- age ~microseconds
+        CycleState state = new CycleState("c");
+        state.legs[0].status = CycleState.LegStatus.FILLED;
+        state.legs[0].requestedPriceFixed = FixedPoint.fromDouble(77850.0);
+        state.legs[0].executedBaseQtyFixed = FixedPoint.fromDouble(0.001285);
+        state.legs[0].executedQuoteFixed = FixedPoint.fromDouble(0.001285 * 77850.0);
+        state.legs[1].status = CycleState.LegStatus.ZERO_FILL;
+
+        api.scriptQuery("BTCUSDT", FixedPoint.fromDouble(0.001284), FixedPoint.fromDouble(99.95), "FILLED", "rev-0");
+
+        unwinder(api, books).unwind(triangle(), state, 1);
+
+        assertTrue(api.placedParams.get(0).contains("price="), "a fresh top must still be priced, not sent to "
+                + "MARKET: " + api.placedParams.get(0));
+        assertFalse(api.placedParams.get(0).contains("type=MARKET"));
     }
 
     @Test

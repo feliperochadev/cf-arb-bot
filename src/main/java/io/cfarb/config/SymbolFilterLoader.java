@@ -13,6 +13,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Set;
+import org.jboss.logging.Logger;
 
 /**
  * Loads MEXC's real per-symbol lot-size/fee filters (startup only — never on the hot path, so
@@ -30,6 +31,8 @@ import java.util.Set;
  * want to swap in a freshly re-fetched snapshot without rebuilding.
  */
 public final class SymbolFilterLoader {
+
+    private static final Logger LOG = Logger.getLogger(SymbolFilterLoader.class);
 
     private SymbolFilterLoader() {
     }
@@ -66,10 +69,30 @@ public final class SymbolFilterLoader {
             // clamping here loses a small amount of price granularity on XRPBTC specifically, never
             // produces an invalid order. Widening FixedPoint.SCALE itself would be a much larger,
             // whole-codebase change and is out of this plan's scope.
+            // Third-pass review finding (L5): the clamp above was entirely SILENT -- an operator
+            // reading logs would have no way to know a symbol's real precision exceeded what this
+            // system can represent. Loud now, and quantified: at a small-magnitude price (XRPBTC's
+            // live price is order 1e-5), a single 1e-8 grid step is a MUCH larger fraction of the
+            // price than the same absolute step is for a large-magnitude one (BTCUSDT, order 1e4) --
+            // for XRPBTC specifically that fraction is already comparable to this bot's whole
+            // min-net-bps threshold (cf-arb-bot-plan.md's own headline numbers), which is exactly the
+            // kind of precision loss EdgeCalculatorTest's cross-check against the Python pipeline
+            // cannot catch (both sides of that comparison share this same FixedPoint.SCALE ceiling).
+            // This does not by itself prove a live discrepancy -- see CLAUDE.md's documented gap for
+            // the credentialed probe that would -- but a WARN an operator can actually see is a
+            // meaningfully better default than a comment nobody reads before going live.
             if (pricePrecision > 8) {
+                LOG.warnf("mexc_filters.json symbol '%s': venue advertises quote_asset_precision=%d, "
+                                + "clamped to FixedPoint.SCALE's 8-decimal ceiling -- at a small-magnitude "
+                                + "price this can be a material fraction of cf-bot.strategy.min-net-bps; "
+                                + "verify against a live captured frame before trusting this symbol's edge "
+                                + "calc at full precision (see SymbolFilterLoader's javadoc)",
+                        symbol, pricePrecision);
                 pricePrecision = 8;
             }
             if (qtyPrecision > 8) {
+                LOG.warnf("mexc_filters.json symbol '%s': venue advertises base_asset_precision=%d, "
+                                + "clamped to FixedPoint.SCALE's 8-decimal ceiling", symbol, qtyPrecision);
                 qtyPrecision = 8;
             }
             long qtyStep = FixedPoint.fromDouble(Math.pow(10.0, -qtyPrecision));

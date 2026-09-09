@@ -184,9 +184,19 @@ class CycleExecutorTest {
     void partialFillOnLeg0AbortsAndUnwindsRatherThanContinuing() throws InterruptedException {
         // leg 0 only 60% filled -- must abort (no leg 1/2 submission) and unwind leg 0 back to the
         // anchor, never continue forward at the reduced size.
+        //
+        // Two-entry sequence for leg 0's own order (third-pass review, M5): the first query reports
+        // PARTIALLY_FILLED (still resting) -- OrderReconciler cancels it and re-queries; the SECOND
+        // entry is what that re-query sees, here a terminal CANCELED with the fill amount unchanged
+        // (the cancel took effect cleanly, nothing further filled -- the ordinary case). A single
+        // scriptQuery() here would leave leg 0 stuck reporting PARTIALLY_FILLED even after the
+        // cancel, which OrderReconciler now correctly classifies UNKNOWN rather than PARTIAL.
         long requested = FixedPoint.fromDouble(0.001285);
         long partial = FixedPoint.fromDouble(0.0007);
-        api.scriptQuery("BTCUSDT", partial, FixedPoint.fromDouble(0.0007 * 77850.0), "PARTIALLY_FILLED", "o0");
+        long partialQuote = FixedPoint.fromDouble(0.0007 * 77850.0);
+        api.scriptQuerySequence("BTCUSDT",
+                FakeMexcOrderApi.response(partial, partialQuote, "PARTIALLY_FILLED", "o0"),
+                FakeMexcOrderApi.response(partial, partialQuote, "CANCELED", "o0"));
         // the unwind reversal (SELL back on BTCUSDT) fills fully
         api.scriptQuery("BTCUSDT", partial, FixedPoint.fromDouble(0.0007 * 77850.0 * 0.999), "FILLED", "rev0");
 
