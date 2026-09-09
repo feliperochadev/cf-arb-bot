@@ -14,6 +14,11 @@ quantization is applied — some winning cycles require a minimum order of 1 who
 `strategy.EdgeCalculator` puts that arithmetic INSIDE the live edge calculation, so untradeable
 triangles simply never fire rather than needing to be blacklisted by hand.
 
+Visual representation of the SPSC Queue and triangular arbitrage detector workflow:
+
+<img width="900" height="638" alt="image" src="https://github.com/user-attachments/assets/c0430b04-4aad-451d-91c2-6c5360e7cceb" />
+
+
 ## Architecture
 
 ```
