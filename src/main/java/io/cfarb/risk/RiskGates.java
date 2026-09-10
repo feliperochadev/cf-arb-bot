@@ -14,12 +14,12 @@ import org.jboss.logging.Logger;
  * live in {@link KillSwitch} instead, since those need to latch permanently rather than gate a
  * single decision.
  *
- * <p><b>S6 (notional cap):</b> a mis-sized {@code cf-bot.risk.max-notional-usd} FAILS THE BOOT — it
- * is never silently clamped or silently honoured. The constructor logs an ERROR and throws if the
- * cap is non-positive, or if {@code cf-bot.risk.absolute-max-notional-usd} (an optional
- * operator-declared hard ceiling) is set and the cap exceeds it. Until 2026-09-10 this was a frozen
- * {@code ABSOLUTE_MAX_NOTIONAL_USD = 1000.0} constant that clamped instead, which silently strangled
- * every cycle to $1k once the seed moved to 4–5 figures.
+ * <p><b>S6 (notional cap):</b> {@code cf-bot.risk.max-notional-usd} is the one per-cycle notional
+ * cap. A non-positive value FAILS THE BOOT (constructor logs an ERROR and throws) — it is never
+ * silently defaulted or clamped. Otherwise the cap is trusted as configured; at runtime every cycle
+ * is additionally bounded by live equity ({@code min(equity, cap)}) and the kill switch. Until
+ * 2026-09-10 a frozen {@code ABSOLUTE_MAX_NOTIONAL_USD = 1000.0} constant also clamped this in code,
+ * which silently strangled every cycle to $1k once the seed moved to 4–5 figures.
  *
  * <p><b>Threading:</b> {@link #canFire} and {@link #claim} are called ONLY from the single Netty
  * event-loop thread that owns the MEXC depth WebSocket connection (12 configured symbols is well
@@ -83,25 +83,14 @@ public final class RiskGates {
         this.killSwitch = killSwitch;
         this.dryRun = dryRun;
 
-        // S6: a mis-sized notional cap FAILS THE BOOT -- never silently clamped, never silently
-        // honoured. cf-arb-bot-review-plan.md Tier 2 step 2.5: a non-positive limit previously
-        // widened silently to 1 via Math.max(1, ...); fail closed (S5) on a misconfiguration instead
-        // of quietly substituting a value the operator never chose.
+        // S6: a non-positive notional cap FAILS THE BOOT -- never silently defaulted or clamped.
+        // cf-arb-bot-review-plan.md Tier 2 step 2.5: it previously widened silently to 1 via
+        // Math.max(1, ...); fail closed (S5) on a misconfiguration instead of quietly substituting a
+        // value the operator never chose. Otherwise the cap is trusted as configured -- at runtime
+        // every cycle is still bounded by min(equity, cap) and the kill switch.
         double configuredMaxNotional = riskConfig.maxNotionalUsd();
         if (configuredMaxNotional <= 0) {
             failStartup("cf-bot.risk.max-notional-usd must be > 0, got " + configuredMaxNotional);
-        }
-        if (riskConfig.absoluteMaxNotionalUsd().isPresent()) {
-            double absoluteMax = riskConfig.absoluteMaxNotionalUsd().get();
-            if (absoluteMax <= 0) {
-                failStartup("cf-bot.risk.absolute-max-notional-usd must be > 0 when set, got " + absoluteMax);
-            }
-            if (configuredMaxNotional > absoluteMax) {
-                failStartup("cf-bot.risk.max-notional-usd (" + configuredMaxNotional + ") exceeds "
-                        + "cf-bot.risk.absolute-max-notional-usd (" + absoluteMax + ") -- refusing to "
-                        + "start (security rule S6: a mis-sized notional cap fails the boot, it is not "
-                        + "clamped). Fix the config or raise absolute-max-notional-usd deliberately.");
-            }
         }
         this.effectiveMaxNotionalUsd = configuredMaxNotional;
         this.maxNotionalFixed = FixedPoint.fromDouble(configuredMaxNotional);

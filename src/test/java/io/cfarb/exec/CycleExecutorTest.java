@@ -67,7 +67,6 @@ class CycleExecutorTest {
         return new BotConfig.RiskConfig() {
             public double equityFloorUsd() { return 10.0; }
             public double maxNotionalUsd() { return 500.0; }
-            public java.util.Optional<Double> absoluteMaxNotionalUsd() { return java.util.Optional.empty(); }
             public int maxOpenCycles() { return 1; }
             public int maxCyclesPerMinute() { return 30; }
             public long cycleCooldownMs() { return 0; }

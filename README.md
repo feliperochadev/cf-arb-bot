@@ -17,10 +17,10 @@ triangles simply never fire rather than needing to be blacklisted by hand.
 The flip side: at a 4–5 figure seed those SOL/ETH-BTC cycles *are* fillable, and `cf-arb-poc`'s own
 results put every profitable MEXC cycle in that family (`BTCUSDT→SOLUSDT→SOLBTC`,
 `BTCUSDT→ETHUSDT→ETHBTC`). They are configured (`usdt-sol-btc-*`, `usdt-eth-btc-*`, added
-2026-09-10) alongside the 10 lower-cost USDT/USDC/XRP triangles. `cf-bot.risk.max-notional-usd` caps
-per-cycle notional; the optional `cf-bot.risk.absolute-max-notional-usd` is an operator hard ceiling
-that **fails the boot** (ERROR + refuse to start, security rule S6) if `max-notional-usd` exceeds it,
-rather than silently clamping.
+2026-09-10) alongside the 10 lower-cost USDT/USDC/XRP triangles. `cf-bot.risk.max-notional-usd` is
+the single per-cycle notional cap — a non-positive value **fails the boot** (ERROR + refuse to
+start, security rule S6); otherwise it is trusted as configured, with each cycle also bounded at
+runtime by `min(equity, cap)` and the kill switch.
 
 Visual representation of the SPSC Queue and triangular arbitrage detector workflow:
 

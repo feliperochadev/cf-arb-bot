@@ -25,13 +25,15 @@ ever enters `recorder-service`.
    `BotService.logStartupSafetyBanner`) — security rule S4.
 2. **Every risk gate fails closed** (S5): missing config, stale/crossed/untrusted book, unknown
    rate-limit state, equity below the floor → no order. See `risk.RiskGates` / `risk.KillSwitch`.
-3. **A mis-sized notional cap FAILS THE BOOT — it is never silently clamped** (S6).
-   `cf-bot.risk.max-notional-usd` bounds every cycle. `cf-bot.risk.absolute-max-notional-usd` is an
-   optional operator-declared hard ceiling; when set, `RiskGates` (`failStartup`) logs an ERROR and
-   refuses to start if `max-notional-usd` exceeds it, or if either value is non-positive. No code
-   constant, no clamping — a fat-fingered cap is loud and fatal, not quietly reinterpreted. (Until
-   2026-09-10 this was a frozen `RiskGates.ABSOLUTE_MAX_NOTIONAL_USD = 1000.0` that clamped instead,
-   which silently strangled every cycle to $1k once the seed moved to 4–5 figures.)
+3. **A misconfigured risk limit FAILS THE BOOT — never a silent default** (S5/S6).
+   `RiskGates.failStartup()` logs an ERROR and aborts if `max-notional-usd`, `max-open-cycles`, or
+   `max-cycles-per-minute` is ≤ 0 — not quietly widened via `Math.max(1, …)` to a value the operator
+   never chose. `cf-bot.risk.max-notional-usd` is the one per-cycle notional cap and is otherwise
+   trusted as configured; at runtime every cycle is additionally bounded by live equity
+   (`min(equity, cap)`) and the kill switch. (Until 2026-09-10 a frozen
+   `RiskGates.ABSOLUTE_MAX_NOTIONAL_USD = 1000.0` also clamped the cap in code, which silently
+   strangled every cycle to $1k once the seed moved to 4–5 figures; a later `absolute-max-notional-usd`
+   config knob was tried and then dropped as redundant.)
 4. **No secrets anywhere in code, config, tests, logs, or Terraform state** (S1/S2/S3).
    `MEXC_API_KEY`/`MEXC_API_SECRET` arrive ONLY via environment (SSM SecureString in Tokyo — see
    `../cf-arb-bot-plan.md` §6.2). The key must be TRADE-ONLY, no withdrawal permission, IP-allowlisted
@@ -193,9 +195,9 @@ ever enters `recorder-service`.
   cost 15 bps taker round-trip; non-negotiable #7's "$100 seed refuses SOLBTC" is unchanged — the
   refusal is `EdgeCalculator` arithmetic, still live, just no longer the whole story at a larger seed.
   The S6 notional ceiling that used to be a frozen `RiskGates.ABSOLUTE_MAX_NOTIONAL_USD = 1000.0`
-  (and silently clamped every cycle to $1k at a 4-5 figure seed) is now the optional
-  `cf-bot.risk.absolute-max-notional-usd` — and it FAILS THE BOOT rather than clamping when
-  `max-notional-usd` exceeds it. See non-negotiable #3.
+  (and silently clamped every cycle to $1k at a 4-5 figure seed) is gone: `cf-bot.risk.max-notional-usd`
+  is now the single notional cap, trusted as configured, and only a non-positive value fails the boot.
+  See non-negotiable #3.
 - **`opportunity` journal events now carry `gross_bps` alongside `net_bps`** (`EdgeCalculator.Result#grossBps`):
   the top-of-book cyclic edge before depth/quantization, i.e. exactly what `cf-arb-poc`'s
   `stage2_cycles.evaluate_cycle` reports as its per-tick `net_bps`. Populated even on `unfillable`

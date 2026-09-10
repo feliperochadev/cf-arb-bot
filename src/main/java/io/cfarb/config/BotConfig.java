@@ -98,18 +98,14 @@ public interface BotConfig {
         @WithDefault("50.0")
         double equityFloorUsd();
 
-        /** Bounds every cycle's notional (security rule S6). Validated at startup — see
-         * {@link #absoluteMaxNotionalUsd()} and {@code risk.RiskGates}. */
+        /** The one per-cycle notional cap (security rule S6). {@code RiskGates} logs an ERROR and
+         * REFUSES TO START if this is non-positive — a misconfigured cap is loud and fatal, never
+         * silently defaulted or clamped. Otherwise trusted as configured; at runtime every cycle is
+         * additionally bounded by live equity ({@code min(equity, cap)}) and the kill switch. (Until
+         * 2026-09-10 a frozen {@code RiskGates.ABSOLUTE_MAX_NOTIONAL_USD = 1000.0} also clamped this
+         * in code, which silently strangled every cycle to $1k once the seed moved to 4–5 figures.) */
         @WithDefault("200.0")
         double maxNotionalUsd();
-
-        /** Optional operator-declared hard ceiling on a single cycle's notional. When set,
-         * {@code RiskGates} logs an ERROR and REFUSES TO START if {@link #maxNotionalUsd()} exceeds
-         * it — a fat-fingered cap fails the boot loudly rather than being silently clamped (the
-         * pre-2026-09-10 behaviour, when this was a frozen {@code 1000.0} code constant that
-         * strangled every cycle to $1k once the seed moved to 4–5 figures) or silently honoured.
-         * Leave unset to run with {@code max-notional-usd} as the only notional bound. */
-        java.util.Optional<Double> absoluteMaxNotionalUsd();
 
         @WithDefault("1")
         int maxOpenCycles();
