@@ -35,6 +35,11 @@ A fire decision hands off to a dedicated executor thread for three sequential si
 (MEXC has no WebSocket order-entry API) — or, in dry-run mode, credits the already-honest computed
 edge without touching the network at all.
 
+**Deep dive:** [`Architecture-tour.md`](Architecture-tour.md) walks the full path frame-by-frame —
+every module, component and class it touches, in flow order, with a diagram per stage and three
+worked end-to-end scenarios (a non-opportunity tick, a profitable cycle, a broken cycle + unwind).
+Brazilian Portuguese: [`Architecture-tour-pt.md`](Architecture-tour-pt.md).
+
 ## Setup
 
 ```bash
