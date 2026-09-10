@@ -71,6 +71,13 @@ public final class EdgeCalculator {
          * {@code unfillable} journal line still carries them. Index 0..2 = leg 0..2. */
         public final long[] legTopPriceFixed = new long[3];
         public final long[] legTouchQtyFixed = new long[3];
+        /** DUPLICATE-FIRE-TASK.md ("Fix A"): per-leg max {@link io.cfarb.book.L2Book} write stamp
+         * across every ladder level the VWAP walk consumed ({@link Sizer.Result#maxWriteSeq}).
+         * {@code OpportunityDetector} stores {@code (legWorstPriceFixed, legBaseQtyFixed,
+         * legWriteSeq)} per leg on a fire and suppresses a re-fire while all three are unchanged for
+         * every leg -- the write stamp is what distinguishes "nobody touched this level" from "it
+         * was consumed and replenished". Only populated in the fillable second pass. Index 0..2. */
+        public final long[] legWriteSeq = new long[3];
     }
 
     /**
@@ -92,6 +99,7 @@ public final class EdgeCalculator {
         java.util.Arrays.fill(out.legBaseQtyFixed, 0L);
         java.util.Arrays.fill(out.legTopPriceFixed, 0L);
         java.util.Arrays.fill(out.legTouchQtyFixed, 0L);
+        java.util.Arrays.fill(out.legWriteSeq, 0L);
 
         int[] symbolIndex = triangle.symbolIndex();
         Side[] sides = triangle.side();
@@ -130,6 +138,7 @@ public final class EdgeCalculator {
             }
             out.legWorstPriceFixed[leg] = legResult.worstPriceFixed;
             out.legBaseQtyFixed[leg] = legResult.baseQtyFixed;
+            out.legWriteSeq[leg] = legResult.maxWriteSeq;
             amount = legResult.outputAmount;
         }
 

@@ -228,6 +228,100 @@ class L2BookTest {
         assertEquals(0, book.crossedResetCount(), "grace period restarts on each fresh cross");
     }
 
+    // --- DUPLICATE-FIRE-TASK.md ("Fix A"): per-level write stamps -----------------------------
+
+    @Test
+    void writeSeqAdvancesWhenALevelQuantityIsUpdatedInPlace() {
+        L2Book book = new L2Book(1, 3600);
+        MexcDepthDecoder.DepthFrame f1 = frame(-1, -1);
+        addBid(f1, 100L, 10L);
+        addAsk(f1, 101L, 10L);
+        book.apply(f1, System.nanoTime());
+        long seq0 = book.askWriteSeqAt(0);
+
+        MexcDepthDecoder.DepthFrame f2 = frame(-1, -1);
+        addAsk(f2, 101L, 7L); // same price, new qty -> in-place update
+        book.apply(f2, System.nanoTime());
+
+        assertEquals(7L, book.askQtyAt(0));
+        assertTrue(book.askWriteSeqAt(0) > seq0, "an in-place qty update must bump the write stamp");
+    }
+
+    @Test
+    void writeSeqOfAnUntouchedLevelIsUnchangedWhenADifferentLevelIsUpdated() {
+        L2Book book = new L2Book(1, 3600);
+        MexcDepthDecoder.DepthFrame f1 = frame(-1, -1);
+        addBid(f1, 100L, 10L);
+        addAsk(f1, 101L, 10L);
+        addAsk(f1, 102L, 10L);
+        book.apply(f1, System.nanoTime());
+        long seqBest = book.askWriteSeqAt(0);   // the 101 level
+        long seqSecond = book.askWriteSeqAt(1); // the 102 level
+
+        MexcDepthDecoder.DepthFrame f2 = frame(-1, -1);
+        addAsk(f2, 102L, 3L); // update ONLY the second level
+        book.apply(f2, System.nanoTime());
+
+        assertEquals(seqBest, book.askWriteSeqAt(0), "the untouched best level must keep its stamp -- "
+                + "this catches an arraycopy mirror that shifts the stamp array out of lockstep");
+        assertTrue(book.askWriteSeqAt(1) > seqSecond, "the updated level's stamp must advance");
+    }
+
+    @Test
+    void writeSeqFollowsTheCorrectLevelAcrossAnInsertShiftAndADeleteShift() {
+        L2Book book = new L2Book(1, 3600);
+        MexcDepthDecoder.DepthFrame f1 = frame(-1, -1);
+        addBid(f1, 100L, 10L);
+        addAsk(f1, 101L, 10L);
+        addAsk(f1, 103L, 10L);
+        book.apply(f1, System.nanoTime());
+        long seq101 = book.askWriteSeqAt(0);
+        long seq103 = book.askWriteSeqAt(1);
+
+        // Insert 102 between them: 101 stays at idx 0, 103 shifts idx 1 -> idx 2.
+        MexcDepthDecoder.DepthFrame f2 = frame(-1, -1);
+        addAsk(f2, 102L, 5L);
+        book.apply(f2, System.nanoTime());
+        assertEquals(101L, book.askPxAt(0));
+        assertEquals(102L, book.askPxAt(1));
+        assertEquals(103L, book.askPxAt(2));
+        assertEquals(seq101, book.askWriteSeqAt(0), "101's stamp is untouched by the insert");
+        assertTrue(book.askWriteSeqAt(1) > seq103, "the freshly inserted 102 carries a new stamp");
+        assertEquals(seq103, book.askWriteSeqAt(2), "103's stamp rode the shift-right with its price");
+
+        long seq102 = book.askWriteSeqAt(1);
+        long seq103b = book.askWriteSeqAt(2);
+
+        // Delete 101: 102 shifts idx 1 -> 0, 103 idx 2 -> 1, both stamps must ride along.
+        MexcDepthDecoder.DepthFrame f3 = frame(-1, -1);
+        addAsk(f3, 101L, 0L);
+        book.apply(f3, System.nanoTime());
+        assertEquals(102L, book.askPxAt(0));
+        assertEquals(103L, book.askPxAt(1));
+        assertEquals(seq102, book.askWriteSeqAt(0), "102's stamp rode the shift-left");
+        assertEquals(seq103b, book.askWriteSeqAt(1), "103's stamp rode the shift-left");
+    }
+
+    @Test
+    void resetDoesNotLowerWriteSeqAndRebuiltLevelsCarryStrictlyHigherStamps() {
+        L2Book book = new L2Book(1, 3600);
+        MexcDepthDecoder.DepthFrame f1 = frame(-1, -1);
+        addBid(f1, 100L, 10L);
+        addAsk(f1, 101L, 10L);
+        book.apply(f1, System.nanoTime());
+        long seqBeforeReset = book.askWriteSeqAt(0);
+
+        book.reset();
+
+        MexcDepthDecoder.DepthFrame f2 = frame(-1, -1);
+        addBid(f2, 100L, 10L);
+        addAsk(f2, 101L, 10L);
+        book.apply(f2, System.nanoTime());
+
+        assertTrue(book.askWriteSeqAt(0) > seqBeforeReset,
+                "writeSeq is monotonic across reset() so a re-warmed book always beats a stale signature");
+    }
+
     @Test
     void applyLevelRemovesAZeroQuantityLevel() {
         L2Book book = new L2Book(1, 3600);

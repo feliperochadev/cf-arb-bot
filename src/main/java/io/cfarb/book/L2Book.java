@@ -48,6 +48,29 @@ public final class L2Book {
     private final long[] askQty = new long[CAPACITY];
     private int askCount;
 
+    // DUPLICATE-FIRE-TASK.md ("Fix A"): per-price-level write stamp. Every time a level is inserted
+    // or updated in place, it is stamped with ++writeSeq; the stamp array is shifted in lockstep
+    // with pxArr/qtyArr on insert/delete so a given price keeps its stamp as neighbours move. The
+    // detector snapshots the max stamp across every level its ladder walk touched at fire time and
+    // refuses to re-fire the same triangle while that stamp (plus worst price + base qty) is
+    // unchanged -- i.e. while the venue has not rewritten the resting liquidity the last fire aimed
+    // at. This is L2-aggregate price-LEVEL identity, the closest thing to order identity MEXC's
+    // public feed offers (no order IDs, no order count -- recorder-service M6). Documented blind
+    // spot: aggre.depth@10ms emits net changes over a 10ms window, so a take-and-replace at exactly
+    // the same qty inside one window bumps no stamp and suppresses a genuinely-new opportunity (a
+    // false negative -- one missed win; there is no symmetric false-positive path, and given the
+    // ~13:1 broken-vs-won payoff asymmetry the failure lands on the safe side by construction).
+    private final long[] bidWriteSeq = new long[CAPACITY];
+    private final long[] askWriteSeq = new long[CAPACITY];
+    /** Monotonic, NEVER reset -- not even by {@link #reset()}. A book that resets and re-warms
+     * (crossed-latch self-heal, JOURNAL-TUNING-TASK.md T1c) stamps its rebuilt levels with strictly
+     * higher values than any signature the detector still holds, so the comparison naturally fails
+     * and the triangle fires again -- no explicit reset handling needed. An internal counter rather
+     * than the venue's {@code toVersion} because {@code toVersion} is {@code -1} in synthetic frames
+     * and {@code apply()} already guards {@code if (f.toVersion >= 0)}; this counter is always
+     * present and always monotonic regardless of venue version semantics. */
+    private long writeSeq;
+
     private final long warmupUpdates;
     private final long warmupNanos;
     /** JOURNAL-TUNING-TASK.md T1c: how long (ns) a book may stay crossed before {@link #apply}
@@ -104,6 +127,9 @@ public final class L2Book {
         topBidFixed = Long.MIN_VALUE;
         topAskFixed = Long.MIN_VALUE;
         crossedSinceNanos = -1;
+        // DUPLICATE-FIRE-TASK.md: writeSeq is deliberately NOT reset -- see its field javadoc. Levels
+        // rebuilt after a reset must carry strictly higher stamps than any signature the detector
+        // still holds so a re-warmed book always re-fires.
     }
 
     /**
@@ -165,6 +191,7 @@ public final class L2Book {
     private void applyLevel(boolean isBid, long px, long qty) {
         long[] pxArr = isBid ? bidPx : askPx;
         long[] qtyArr = isBid ? bidQty : askQty;
+        long[] seqArr = isBid ? bidWriteSeq : askWriteSeq;
         int count = isBid ? bidCount : askCount;
 
         int idx = findIndex(pxArr, count, px, isBid);
@@ -174,12 +201,18 @@ public final class L2Book {
             if (found) {
                 System.arraycopy(pxArr, idx + 1, pxArr, idx, count - idx - 1);
                 System.arraycopy(qtyArr, idx + 1, qtyArr, idx, count - idx - 1);
+                // DUPLICATE-FIRE-TASK.md: mirror the shift-left so surviving levels keep their stamps.
+                System.arraycopy(seqArr, idx + 1, seqArr, idx, count - idx - 1);
                 if (isBid) bidCount--; else askCount--;
             }
             return;
         }
         if (found) {
             qtyArr[idx] = qty;
+            // DUPLICATE-FIRE-TASK.md: the load-bearing case -- a level rewritten in place (consumed
+            // and replenished, or resized) gets a fresh stamp, which is what tells the detector the
+            // liquidity is no longer the liquidity it last fired at.
+            seqArr[idx] = ++writeSeq;
             return;
         }
         // insert a new level at idx, shifting the tail right
@@ -188,8 +221,11 @@ public final class L2Book {
         }
         System.arraycopy(pxArr, idx, pxArr, idx + 1, count - idx);
         System.arraycopy(qtyArr, idx, qtyArr, idx + 1, count - idx);
+        // DUPLICATE-FIRE-TASK.md: mirror the shift-right, then stamp the freshly inserted level.
+        System.arraycopy(seqArr, idx, seqArr, idx + 1, count - idx);
         pxArr[idx] = px;
         qtyArr[idx] = qty;
+        seqArr[idx] = ++writeSeq;
         if (isBid) {
             bidCount++;
             pruneIfNeeded(true);
@@ -280,6 +316,17 @@ public final class L2Book {
 
     public long askQtyAt(int i) {
         return askQty[i];
+    }
+
+    /** DUPLICATE-FIRE-TASK.md: write stamp of bid level {@code i} (0 = best). Monotonic across the
+     * book's life; a value strictly greater than one previously observed for the same price means
+     * the venue rewrote that level since. No bounds check on the hot path -- respect levelCount(). */
+    public long bidWriteSeqAt(int i) {
+        return bidWriteSeq[i];
+    }
+
+    public long askWriteSeqAt(int i) {
+        return askWriteSeq[i];
     }
 
     /** Local receive-time age in nanoseconds — the ONLY clock this bot gates on (rule S14). */

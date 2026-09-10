@@ -30,6 +30,10 @@ public final class OpportunityDetector {
      * window best carries no {@code String} until it is actually emitted. */
     private static final int REASON_UNFILLABLE = 0;
     private static final int REASON_BELOW_THRESHOLD = 1;
+    /** DUPLICATE-FIRE-TASK.md ("Fix A"): a candidate that cleared the threshold but whose fire
+     * signature is unchanged since the triangle's last fire — the book has not rewritten the
+     * liquidity that fire aimed at, so re-firing would only race depth that is being consumed. */
+    private static final int REASON_DUPLICATE = 2;
 
     private final BookRegistry books;
     private final TriangleRegistry triangles;
@@ -74,6 +78,19 @@ public final class OpportunityDetector {
     private final long[] emitLegWorstPx = new long[3];
     private final long[] emitLegBaseQty = new long[3];
 
+    // --- DUPLICATE-FIRE-TASK.md ("Fix A"): per-triangle last-fired signature ------------------
+    // Detector-thread-only, like every array here -- no synchronization. Flat [triangleIndex*3 + leg]
+    // for the three per-leg components; one boolean per triangle marks whether a signature has been
+    // stored yet (a triangle that has never fired can never be a "duplicate"). Stored ONLY after a
+    // successful orderQueue.offer() -- an intent that could not be enqueued is rolled back via
+    // riskGates.onCycleFinished() and must stay re-fireable. No TTL: the signature is replaced only
+    // when a DIFFERENT one fires, and L2Book.writeSeq being monotonic-across-reset means a re-warmed
+    // book always produces a strictly-higher stamp, so explicit clearing is unnecessary.
+    private final long[] lastFiredWorstPx;
+    private final long[] lastFiredBaseQty;
+    private final long[] lastFiredWriteSeq;
+    private final boolean[] hasFiredSignature;
+
     public OpportunityDetector(BookRegistry books, TriangleRegistry triangles, RiskGates riskGates,
                                 Portfolio portfolio, BotMetrics metrics, EventJournal journal,
                                 SpscArrayQueue<OrderIntent> orderQueue,
@@ -104,6 +121,10 @@ public final class OpportunityDetector {
         this.pendingLegTouchQty = new long[n * 3];
         this.pendingLegWorstPx = new long[n * 3];
         this.pendingLegBaseQty = new long[n * 3];
+        this.lastFiredWorstPx = new long[n * 3];
+        this.lastFiredBaseQty = new long[n * 3];
+        this.lastFiredWriteSeq = new long[n * 3];
+        this.hasFiredSignature = new boolean[n];
         // Same "0 is not a safe never-happened sentinel" reasoning as RiskGates' cooldown array:
         // nanoTime's origin is arbitrary per JVM. pendingSampledFrom==0 already means "no window
         // open", so windowStartNanos only matters once a window is open -- but seed it clear of
@@ -156,6 +177,22 @@ public final class OpportunityDetector {
             return; // real edge doesn't clear threshold + slippage buffer
         }
 
+        // DUPLICATE-FIRE-TASK.md ("Fix A"): refuse to re-fire a triangle while the liquidity this
+        // order would consume is the liquidity the last fire consumed -- same per-leg worst price,
+        // base qty, AND book write stamp. Placed AFTER the threshold test and BEFORE
+        // riskGates.claim(), matching canFire()'s non-claiming pre-check contract: a suppressed
+        // duplicate must not burn cooldown or rate-limit budget. In dry-run the paper fill never
+        // consumes depth, so the book keeps offering the identical edge; in live mode the venue's
+        // depth push lags a fill by 14-41ms, so a re-fire on the same signature prices leg 0 at a
+        // boundary that no longer exists and tends to break -- and a broken cycle costs ~13x a
+        // winning one (JOURNAL-BPS-ANALYSIS.md §12-15).
+        if (hasFiredSignature[triangleIndex] && fireSignatureUnchanged(triangleIndex)) {
+            metrics.recordDuplicateFireSuppressed(triangleIndex);
+            journalReject(triangleIndex, tri.name(), true, edgeResult.netBps, edgeResult.grossBps,
+                    candidateNotional, REASON_DUPLICATE, nowNanos);
+            return;
+        }
+
         // Claim the fire slot NOW, immediately before handing off -- canFire() above is a
         // non-claiming pre-check so a candidate that fails EdgeCalculator never burns real
         // cooldown/rate-limit budget (see RiskGates.canFire's javadoc).
@@ -174,10 +211,38 @@ public final class OpportunityDetector {
             return;
         }
         metrics.recordOpportunityFired();
+        // DUPLICATE-FIRE-TASK.md: store the signature ONLY now that the intent is actually enqueued
+        // -- the queue-full branch above rolled the claim back and must stay re-fireable.
+        storeFireSignature(triangleIndex);
         journal.write(JournalEvents.opportunity(tri.name(), edgeResult.netBps, edgeResult.grossBps,
                 candidateNotional, true, null, 0,
                 edgeResult.legTopPriceFixed, edgeResult.legTouchQtyFixed,
                 edgeResult.legWorstPriceFixed, edgeResult.legBaseQtyFixed));
+    }
+
+    /** DUPLICATE-FIRE-TASK.md: true iff the current {@link #edgeResult} matches the stored
+     * last-fired signature for {@code triangleIndex} on ALL three legs (worst price, base qty, and
+     * book write stamp). Caller must have checked {@link #hasFiredSignature} first. */
+    private boolean fireSignatureUnchanged(int triangleIndex) {
+        int base = triangleIndex * 3;
+        for (int leg = 0; leg < 3; leg++) {
+            if (lastFiredWorstPx[base + leg] != edgeResult.legWorstPriceFixed[leg]
+                    || lastFiredBaseQty[base + leg] != edgeResult.legBaseQtyFixed[leg]
+                    || lastFiredWriteSeq[base + leg] != edgeResult.legWriteSeq[leg]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void storeFireSignature(int triangleIndex) {
+        int base = triangleIndex * 3;
+        for (int leg = 0; leg < 3; leg++) {
+            lastFiredWorstPx[base + leg] = edgeResult.legWorstPriceFixed[leg];
+            lastFiredBaseQty[base + leg] = edgeResult.legBaseQtyFixed[leg];
+            lastFiredWriteSeq[base + leg] = edgeResult.legWriteSeq[leg];
+        }
+        hasFiredSignature[triangleIndex] = true;
     }
 
     /**
@@ -270,7 +335,11 @@ public final class OpportunityDetector {
     }
 
     private static String reasonString(int reason) {
-        return reason == REASON_UNFILLABLE ? "unfillable" : "below-threshold";
+        return switch (reason) {
+            case REASON_UNFILLABLE -> "unfillable";
+            case REASON_DUPLICATE -> "duplicate-signature";
+            default -> "below-threshold";
+        };
     }
 
     /** JOURNAL-TUNING-TASK.md T3: returns the index (0..2) of the first leg that is stale /

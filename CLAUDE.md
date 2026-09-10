@@ -218,6 +218,28 @@ ever enters `recorder-service`.
     T7 (`config_snapshot` event), T8 (`Sizer` solves for size — gated on a plan §5.3 update + a T4
     capture), T10 (triangle-universe pruning), T11 (`min-net-bps` / `slippage-buffer-bps` — operator,
     and only after a clean re-capture).
+- **ADDED 2026-09-10 (`DUPLICATE-FIRE-TASK.md` — "Fix A", `JOURNAL-BPS-ANALYSIS.md` §12–§15):**
+  duplicate-fire suppression. The detector fired the same `usdt-btc-usdc-fwd` opportunity 5× in
+  1.3 s (identical `detected_net_bps` to 10 dp, spaced at `cycle-cooldown-ms`) because
+  `RiskGates.claim` only advances a *time* cooldown and, in dry-run, the paper fill never consumes
+  depth — so `EdgeCalculator` kept recomputing the identical edge. Each fire now gets a per-triangle
+  **signature** `(worstPrice, baseQty, writeSeq)` per leg; a triangle will not re-fire while that
+  signature is unchanged. `L2Book` carries monotonic per-level write stamps (`bidWriteSeqAt` /
+  `askWriteSeqAt`), **never reset** — even by `reset()` — so a re-warmed book (T1c self-heal) always
+  produces a strictly higher stamp and re-fires naturally, no reset handling. `Sizer.Result`
+  carries `maxWriteSeq` across every consumed level; `EdgeCalculator.Result` surfaces it as
+  `legWriteSeq[3]`. The check sits in `OpportunityDetector.evaluate` immediately before
+  `riskGates.claim` (a suppressed duplicate burns no cooldown/rate-limit budget); the signature is
+  stored **only after a successful `orderQueue.offer`** (a rolled-back claim stays re-fireable).
+  Unconditional (live *and* dry-run), no new thread hand-off, no allocation, no config knob. Rides
+  the sampled reject path as `reject_reason: "duplicate-signature"` + counter
+  `cfarb.detector.duplicate_fire{triangle}`. **Documented blind spot (false negative, safe side):**
+  `aggre.depth@10ms` emits *net* changes over a 10 ms window, so a take-and-replace at exactly the
+  same qty inside one window bumps no stamp — a genuinely new opportunity is suppressed (one missed
+  +$0.155). No symmetric false-positive path, and the ~13:1 broken-vs-won payoff asymmetry means the
+  failure lands on the safe side by construction. **Out of scope:** "Fix B" (a consumption ledger in
+  `Sizer` that makes dry-run *fill* behaviour realistic) — needs a plan §5.3 update. This makes the
+  fire *count* honest, not the paper-fill *P&L*.
 - **Per-stage latency histograms are still blended**: `decisionToLeg1AckNanos` records the FULL
   place→reconcile→(commission-lookup) round trip for every leg into one histogram, not separate
   receipt→decode / decode→decision / queue-wait / leg-ack stages (Tier 3).
