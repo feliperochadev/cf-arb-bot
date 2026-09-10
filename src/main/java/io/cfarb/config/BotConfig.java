@@ -46,6 +46,8 @@ public interface BotConfig {
 
     JournalConfig journal();
 
+    ObservabilityConfig observability();
+
     interface VenueConfig {
         @WithDefault("wss://wbs-api.mexc.com/ws")
         String wsUrl();
@@ -179,5 +181,34 @@ public interface BotConfig {
          * Set to 0 to journal every reject (the old behavior — only sane for short local captures). */
         @WithDefault("1000")
         long rejectSampleMs();
+    }
+
+    /**
+     * Opt-in console visibility for a local dry-run, all of it OFF the hot tick path. The NDJSON
+     * journal ({@code cf-bot.journal.dir}) and Prometheus ({@code /q/metrics}) remain the real
+     * telemetry — this exists purely so an operator watching a local run can see the pipeline
+     * working without curling {@code /api/v1/state} in a loop. Every key defaults OFF; the
+     * {@code %dev} profile turns {@link #consoleReport()} and {@link #echoEvents()} on so
+     * {@code quarkus:dev} is verbose out of the box.
+     *
+     * <p>Neither knob adds a thread or a hand-off (non-negotiable #5): the rolling report runs on
+     * the existing Vert.x timer thread (already "read-only diagnostic reads" in CLAUDE.md's
+     * threading table, same mechanism as the latency-snapshot timer) and the event echo runs on the
+     * existing {@code cf-arb-journal-writer} thread. The Netty tick path is untouched.
+     */
+    interface ObservabilityConfig {
+        /** Emit a rolling activity summary (frames/s, evaluations, near-misses, fires, equity, book
+         * warmth, latency percentiles) to the console every {@link #consoleReportIntervalMs()}. */
+        @WithDefault("false")
+        boolean consoleReport();
+
+        @WithDefault("5000")
+        long consoleReportIntervalMs();
+
+        /** Echo each NDJSON journal event (opportunity/fire, cycle, broken_cycle, sampled reject,
+         * feed_reconnect, latency_snapshot) to the console from the journal-writer thread as it is
+         * appended. Chatty, but never on the tick path. */
+        @WithDefault("false")
+        boolean echoEvents();
     }
 }

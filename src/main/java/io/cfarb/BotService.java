@@ -17,6 +17,7 @@ import io.cfarb.journal.JournalEvents;
 import io.cfarb.metrics.BotMetrics;
 import io.cfarb.model.OrderIntent;
 import io.cfarb.model.SymbolFilter;
+import io.cfarb.observability.ActivityReport;
 import io.cfarb.risk.KillSwitch;
 import io.cfarb.risk.RiskGates;
 import io.cfarb.state.Portfolio;
@@ -93,6 +94,7 @@ public class BotService {
     private volatile long clockSkewNanos;
     private long clockSkewToleranceNanos;
     private int consecutiveFeedDeadDetections; // Vert.x event-loop thread only -- single timer callback
+    private BotMetrics.Snapshot lastActivitySnapshot; // Vert.x timer thread only -- console-report cadence
 
     void onStart(@Observes StartupEvent ev) {
         logStartupSafetyBanner();
@@ -135,7 +137,8 @@ public class BotService {
                 riskGates.effectiveMaxNotionalUsd, config.risk().maxOpenCycles(), config.risk().maxCyclesPerMinute(),
                 config.risk().cycleCooldownMs(), config.risk().maxConsecutiveFailures(), equityFloorUsd);
 
-        this.journal = new EventJournal(Path.of(config.journal().dir()), metrics);
+        this.journal = new EventJournal(Path.of(config.journal().dir()), metrics,
+                config.observability().echoEvents());
         journal.start();
 
         wireKillSwitchTripListener();
@@ -188,6 +191,9 @@ public class BotService {
         scheduleWarmUpAndClockSkew();
         scheduleFeedWatchdog();
         scheduleLatencySnapshots();
+        if (config.observability().consoleReport()) {
+            scheduleConsoleActivityReport();
+        }
 
         LOG.infof("cf-arb-bot started: dryRun=%s seed=$%.2f floor=$%.2f triangles=%d",
                 dryRun, config.capital().seedUsd(), config.risk().equityFloorUsd(), triangles.triangleCount());
@@ -413,6 +419,36 @@ public class BotService {
             writeLatencySnapshot("frame_to_decision", metrics.frameToDecisionHistogram());
             writeLatencySnapshot("decision_to_leg1_ack", metrics.decisionToLeg1AckHistogram());
             writeLatencySnapshot("full_cycle", metrics.fullCycleHistogram());
+        });
+    }
+
+    /** Opt-in ({@code cf-bot.observability.console-report}) rolling activity summary — same
+     * mechanism as {@link #scheduleLatencySnapshots()}: a Vert.x timer doing read-only diagnostic
+     * reads (counter snapshot, book warmth, latency percentiles), never a trading decision and
+     * never on the Netty tick path. The rendering itself lives in the pure, unit-tested
+     * {@link ActivityReport#render}. */
+    private void scheduleConsoleActivityReport() {
+        long intervalMs = config.observability().consoleReportIntervalMs();
+        lastActivitySnapshot = metrics.snapshot();
+        vertx.setPeriodic(intervalMs, id -> {
+            BotMetrics.Snapshot now = metrics.snapshot();
+            int booksWarm = 0;
+            for (int i = 0; i < books.symbolCount(); i++) {
+                if (books.book(i).isTrusted()) {
+                    booksWarm++;
+                }
+            }
+            org.HdrHistogram.ConcurrentHistogram f2d = metrics.frameToDecisionHistogram();
+            org.HdrHistogram.ConcurrentHistogram cyc = metrics.fullCycleHistogram();
+            ActivityReport.View view = new ActivityReport.View(
+                    config.dryRun(), wsClientConnected(), wsClientChurning(),
+                    booksWarm, books.symbolCount(),
+                    FixedPoint.toDouble(portfolio.equity()), portfolio.pnlPctOfSeed(),
+                    config.capital().seedUsd(),
+                    f2d.getValueAtPercentile(50) / 1000, f2d.getValueAtPercentile(99) / 1000,
+                    cyc.getValueAtPercentile(50) / 1000);
+            LOG.info(ActivityReport.render(lastActivitySnapshot, now, intervalMs, view));
+            lastActivitySnapshot = now;
         });
     }
 

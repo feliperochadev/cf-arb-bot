@@ -41,14 +41,19 @@ public final class EventJournal {
     private final MpscArrayQueue<String> queue = new MpscArrayQueue<>(4096);
     private final Path dir;
     private final BotMetrics metrics;
+    /** {@code cf-bot.observability.echo-events}: also log each appended line to the console. Done
+     * here on the dedicated writer thread (never a producer's thread), so it costs the hot path
+     * nothing beyond the enqueue it already pays. */
+    private final boolean echoToConsole;
     private volatile boolean running;
     private Thread writerThread;
     private String currentHourKey;
     private BufferedWriter currentWriter;
 
-    public EventJournal(Path dir, BotMetrics metrics) {
+    public EventJournal(Path dir, BotMetrics metrics, boolean echoToConsole) {
         this.dir = dir;
         this.metrics = metrics;
+        this.echoToConsole = echoToConsole;
     }
 
     public void start() {
@@ -88,6 +93,9 @@ public final class EventJournal {
             }
             try {
                 appendLine(line);
+                if (echoToConsole) {
+                    LOG.info(line);
+                }
             } catch (IOException e) {
                 LOG.warnf("journal write failed: %s", e.toString());
             }

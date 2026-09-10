@@ -189,6 +189,6 @@ ever enters `recorder-service`.
 |---|---|---|
 | Netty event loop (`feed.MexcWsClient`) | decode → book update → `strategy.OpportunityDetector` | allocate on the steady path, log per-tick, block |
 | `cf-arb-executor` (`exec.CycleExecutor`) | 3 sequential legs, each place→query→cancel-if-non-terminal→(trades-reconcile), `exec.Unwinder` (reads `book.L2Book`'s published top-of-book to price an emergency reversal — declared exception, see `L2Book`'s javadoc) | touch a book for anything but reading published top-of-book; make a trading DECISION from it |
-| `cf-arb-journal-writer` (`journal.EventJournal`) | NDJSON append | backpressure the hot path — drop and count instead |
+| `cf-arb-journal-writer` (`journal.EventJournal`) | NDJSON append, optional console echo of each appended line (`cf-bot.observability.echo-events`) | backpressure the hot path — drop and count instead |
 | Quarkus HTTP worker (`api.BotApiResource`, `api.ReadinessCheck`) | read-only JSON | any write to trading state (S12) |
-| Vert.x periodic timers (`BotService`: warm-up/clock-skew, feed watchdog, latency snapshots) | read-only diagnostic reads, `killSwitch.recordFeedUnhealthy` | gate or influence a trading decision directly — these feed the kill switch and journal only |
+| Vert.x periodic timers (`BotService`: warm-up/clock-skew, feed watchdog, latency snapshots, opt-in console activity report) | read-only diagnostic reads, `killSwitch.recordFeedUnhealthy` | gate or influence a trading decision directly — these feed the kill switch, journal and console only |

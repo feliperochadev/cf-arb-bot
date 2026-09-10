@@ -111,7 +111,7 @@ class CycleExecutorTest {
         killSwitch = new KillSwitch(portfolio, FixedPoint.fromDouble(10.0), 3);
         riskGates = new RiskGates(riskConfig(), strategyConfig(), execConfig(), 1, killSwitch, true);
         metrics = new BotMetrics(new SimpleMeterRegistry());
-        journal = new EventJournal(tempDir.resolve("journal"), metrics);
+        journal = new EventJournal(tempDir.resolve("journal"), metrics, false);
         journal.start();
         queue = new SpscArrayQueue<>(8);
 

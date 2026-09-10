@@ -51,6 +51,29 @@ java -jar target/quarkus-app/quarkus-run.jar   # dry-run by default -- connects 
                                                  # data (public, unauthenticated), places no orders
 ```
 
+(No `mvnw` in your checkout? The wrapper lives at the repo root — `mvnw`, `mvnw.cmd`, `.mvn/`. If
+it is genuinely missing, `mvn -N wrapper:wrapper` regenerates it, or just use a system `mvn`.)
+
+### Watching a dry-run run
+
+Dry-run is intentionally quiet on the console — the real telemetry is the NDJSON journal under
+`./journal/`, the read-only API (`/api/v1/state`, `/triangles`, `/latency`), and Prometheus at
+`/q/metrics`. To watch the pipeline work in the terminal, enable the opt-in observability knobs
+(all off the hot tick path — a Vert.x timer plus the journal-writer thread, no new hand-off):
+
+```bash
+CF_BOT_OBSERVABILITY_CONSOLE_REPORT=true \
+CF_BOT_OBSERVABILITY_ECHO_EVENTS=true \
+java -jar target/quarkus-app/quarkus-run.jar
+```
+
+- `console-report` — a rolling ~5s summary block: frames/s, evaluations, near-misses, fires,
+  cycles, equity/PnL, book warmth, latency percentiles (`console-report-interval-ms` to retune).
+- `echo-events` — each journal event (fire, paper cycle, broken cycle, sampled reject,
+  feed reconnect, latency snapshot) echoed to the console as NDJSON as it happens.
+
+`./mvnw quarkus:dev` turns both on automatically (the `%dev` profile).
+
 `config/mexc_filters.json` (MEXC's live lot-size/fee/price-precision schedule — public
 `GET /api/v3/exchangeInfo`, no API key) ships bundled on the classpath
 (`src/main/resources/config/mexc_filters.json`), so no separate deploy step is required; set
