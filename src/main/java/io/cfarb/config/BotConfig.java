@@ -98,21 +98,18 @@ public interface BotConfig {
         @WithDefault("50.0")
         double equityFloorUsd();
 
-        /** Hard-clamped in code as well as config (security rule S6) — see risk/RiskGates. */
+        /** Bounds every cycle's notional (security rule S6). Validated at startup — see
+         * {@link #absoluteMaxNotionalUsd()} and {@code risk.RiskGates}. */
         @WithDefault("200.0")
         double maxNotionalUsd();
 
-        /** The S6 backstop: {@link #maxNotionalUsd()} is clamped to this regardless of what it says,
-         * and the clamp is flagged loudly at startup ({@code RiskGates.notionalWasClamped}). This
-         * exists so a fat-fingered {@code max-notional-usd} (the classic {@code 10^9} typo) can never
-         * size a real order — but as config, not a frozen constant, so a deliberately larger seed can
-         * raise it without a recompile. {@code RiskGates} still clamps THIS value in code to
-         * {@code ABSOLUTE_MAX_NOTIONAL_CEILING} (a generous compile-time sanity limit) and rejects a
-         * non-positive value, so "a hard cap enforced in code, not only config" (CLAUDE.md
-         * non-negotiable #3) still holds for a typo in this key too. Default 1000 preserves the
-         * original frozen ceiling; raise it explicitly for a 4-5 figure seed. */
-        @WithDefault("1000.0")
-        double absoluteMaxNotionalUsd();
+        /** Optional operator-declared hard ceiling on a single cycle's notional. When set,
+         * {@code RiskGates} logs an ERROR and REFUSES TO START if {@link #maxNotionalUsd()} exceeds
+         * it — a fat-fingered cap fails the boot loudly rather than being silently clamped (the
+         * pre-2026-09-10 behaviour, when this was a frozen {@code 1000.0} code constant that
+         * strangled every cycle to $1k once the seed moved to 4–5 figures) or silently honoured.
+         * Leave unset to run with {@code max-notional-usd} as the only notional bound. */
+        java.util.Optional<Double> absoluteMaxNotionalUsd();
 
         @WithDefault("1")
         int maxOpenCycles();
