@@ -33,20 +33,29 @@ class JournalEventsTest {
     @Test
     void opportunityRejectReasonWithNewlinesAndControlCharsStillParsesAsJson() {
         String reason = "unfillable\nsecond line\twith a tab and a \" quote";
-        String line = JournalEvents.opportunity("test-triangle", 3.5, 100_000_000L, false, reason);
+        String line = JournalEvents.opportunity("test-triangle", 3.5, 12.0, 100_000_000L, false, reason);
 
         JsonNode node = assertDoesNotThrow(() -> MAPPER.readTree(line));
         assertEquals(reason, node.get("reject_reason").asText());
+        assertEquals(3.5, node.get("net_bps").asDouble());
+        assertEquals(12.0, node.get("gross_bps").asDouble());
     }
 
     @Test
     void nanNetBpsRendersAsJsonNullNotAnInvalidToken() {
         // Double.NaN.toString() is "NaN", which is not valid JSON and would break every downstream
-        // parser (Athena, DuckDB, jq) reading this line.
-        String line = JournalEvents.opportunity("test-triangle", Double.NaN, 100_000_000L, false, "unfillable");
+        // parser (Athena, DuckDB, jq) reading this line. An unfillable candidate has no net_bps but
+        // DOES carry a gross_bps (top-of-book edge) -- both fields are guarded the same way.
+        String line = JournalEvents.opportunity("test-triangle", Double.NaN, 8.25, 100_000_000L, false, "unfillable");
 
         JsonNode node = assertDoesNotThrow(() -> MAPPER.readTree(line));
         assertEquals(true, node.get("net_bps").isNull());
+        assertEquals(8.25, node.get("gross_bps").asDouble());
+
+        // both NaN (books not usable) -> both null, still valid JSON
+        JsonNode bothNaN = assertDoesNotThrow(() -> MAPPER.readTree(
+                JournalEvents.opportunity("test-triangle", Double.NaN, Double.NaN, 100_000_000L, false, "unfillable")));
+        assertEquals(true, bothNaN.get("gross_bps").isNull());
     }
 
     @Test

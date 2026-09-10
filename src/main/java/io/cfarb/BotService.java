@@ -127,10 +127,18 @@ public class BotService {
         this.riskGates = new RiskGates(config.risk(), config.strategy(), config.exec(),
                 triangles.triangleCount(), killSwitch, dryRun);
         this.clockSkewToleranceNanos = riskGates.clockSkewToleranceNanos();
+        if (riskGates.absoluteMaxWasClamped) {
+            LOG.warnf("*** cf-bot.risk.absolute-max-notional-usd=%.2f exceeds the S6 code ceiling -- "
+                            + "clamped to %.2f. This is the SAFETY backstop itself being misconfigured; "
+                            + "check the config before trusting any notional limit.",
+                    config.risk().absoluteMaxNotionalUsd(), riskGates.effectiveAbsoluteMaxNotionalUsd);
+        }
         if (riskGates.notionalWasClamped) {
-            LOG.warnf("cf-bot.risk.max-notional-usd=%.2f exceeds the absolute ceiling -- clamped to %.2f "
-                            + "(security rule S6: hard caps enforced in code, not only config)",
-                    config.risk().maxNotionalUsd(), riskGates.effectiveMaxNotionalUsd);
+            LOG.warnf("cf-bot.risk.max-notional-usd=%.2f exceeds cf-bot.risk.absolute-max-notional-usd "
+                            + "(effective %.2f) -- clamped to %.2f (security rule S6: hard caps enforced "
+                            + "in code, not only config)",
+                    config.risk().maxNotionalUsd(), riskGates.effectiveAbsoluteMaxNotionalUsd,
+                    riskGates.effectiveMaxNotionalUsd);
         }
         LOG.infof("effective risk limits: maxNotionalUsd=%.2f maxOpenCycles=%d maxCyclesPerMinute=%d "
                         + "cycleCooldownMs=%d maxConsecutiveFailures=%d equityFloorUsd=%.2f",

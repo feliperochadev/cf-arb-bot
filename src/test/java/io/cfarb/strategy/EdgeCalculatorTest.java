@@ -86,6 +86,11 @@ class EdgeCalculatorTest {
 
         assertTrue(out.fillable);
         assertEquals(15.0401002506, out.netBps, 0.01, "must match Python's log-space formula to within rounding");
+        // grossBps is the SAME top-of-book log-space product as stage2_cycles.evaluate_cycle. With a
+        // single deep level per side and a $1000 start (no VWAP slippage, negligible quantization) it
+        // must land on the same number as netBps.
+        assertEquals(15.0401002506, out.grossBps, 0.01,
+                "grossBps must match the Python evaluate_cycle formula (top-of-book, pre-slippage)");
     }
 
     @Test
@@ -119,6 +124,10 @@ class EdgeCalculatorTest {
         calc.evaluate(tri, books, FixedPoint.fromDouble(100.0), out);
         assertFalse(out.fillable, "a $100 seed buys well under 1 SOL via SOLBTC's 0.00130 rate -- "
                 + "the SOLBTC leg's real 1-SOL minimum must reject this");
+        // rec 3: an unfillable candidate still carries the top-of-book gross edge, so a dry-run
+        // journal separates "no edge existed" from "edge existed but wasn't fillable at this size".
+        assertTrue(Double.isFinite(out.grossBps),
+                "grossBps must be populated even when the candidate is unfillable at size");
 
         calc.evaluate(tri, books, FixedPoint.fromDouble(500.0), out);
         assertTrue(out.fillable, "at $500 the notional clears SOLBTC's real 1-SOL minimum "

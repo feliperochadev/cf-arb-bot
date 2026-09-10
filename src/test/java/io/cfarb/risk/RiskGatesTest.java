@@ -11,10 +11,18 @@ import org.junit.jupiter.api.Test;
 
 class RiskGatesTest {
 
+    /** 4-arg form: absolute-max-notional-usd defaults to the original frozen 1000.0, so the eight
+     * tests that only care about the ordinary max-notional cap are unaffected by its introduction. */
     private static BotConfig.RiskConfig risk(double maxNotional, int maxOpen, int maxPerMin, long cooldownMs) {
+        return risk(maxNotional, 1_000.0, maxOpen, maxPerMin, cooldownMs);
+    }
+
+    private static BotConfig.RiskConfig risk(double maxNotional, double absoluteMaxNotional,
+                                              int maxOpen, int maxPerMin, long cooldownMs) {
         return new BotConfig.RiskConfig() {
             public double equityFloorUsd() { return 50.0; }
             public double maxNotionalUsd() { return maxNotional; }
+            public double absoluteMaxNotionalUsd() { return absoluteMaxNotional; }
             public int maxOpenCycles() { return maxOpen; }
             public int maxCyclesPerMinute() { return maxPerMin; }
             public long cycleCooldownMs() { return cooldownMs; }
@@ -53,12 +61,40 @@ class RiskGatesTest {
     @Test
     void absoluteHardCapClampsEvenAMisconfiguredValue() {
         // S6: "a misconfiguration (e.g. notional=10^9) must be clamped and flagged at startup."
+        // 4-arg risk() leaves absolute-max-notional-usd at the original frozen 1000.0.
         KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(100.0)), FixedPoint.fromDouble(50.0), 3);
         RiskGates gates = new RiskGates(risk(1_000_000_000.0, 1, 30, 250), strategy(), exec(), 1, ks, true);
         assertTrue(gates.notionalWasClamped);
-        assertTrue(gates.effectiveMaxNotionalUsd < 1_000_000_000.0);
-        long huge = FixedPoint.fromDouble(1500.0); // exceeds the ABSOLUTE_MAX_NOTIONAL_USD ceiling of 1000
+        assertEquals(1_000.0, gates.effectiveMaxNotionalUsd, 1e-9);
+        long huge = FixedPoint.fromDouble(1500.0); // exceeds the 1000.0 absolute-max
         assertFalse(gates.canFire(0, huge, 1_000_000L));
+    }
+
+    @Test
+    void absoluteMaxNotionalIsConfigurableButItselfCodeClamped() {
+        KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(100.0)), FixedPoint.fromDouble(50.0), 3);
+
+        // A deliberately larger backstop lets a larger max-notional-usd through -- the whole point
+        // of making the ceiling config instead of a frozen 1000.0 constant.
+        RiskGates raised = new RiskGates(risk(50_000.0, 30_000.0, 1, 30, 250), strategy(), exec(), 1, ks, true);
+        assertEquals(30_000.0, raised.effectiveMaxNotionalUsd, 1e-9);
+        assertTrue(raised.notionalWasClamped);          // 50k clamped to the 30k backstop
+        assertFalse(raised.absoluteMaxWasClamped);       // 30k is under the $1M code ceiling
+        assertTrue(raised.canFire(0, FixedPoint.fromDouble(25_000.0), 1_000_000L));
+        assertFalse(raised.canFire(0, FixedPoint.fromDouble(35_000.0), 1_000_000L));
+
+        // S6 still holds for a typo in the BACKSTOP itself: 2e9 is clamped in code to $1M.
+        RiskGates fatFingered = new RiskGates(risk(5_000.0, 2_000_000_000.0, 1, 30, 250), strategy(), exec(), 1, ks, true);
+        assertTrue(fatFingered.absoluteMaxWasClamped);
+        assertEquals(1_000_000.0, fatFingered.effectiveAbsoluteMaxNotionalUsd, 1e-9);
+        assertEquals(5_000.0, fatFingered.effectiveMaxNotionalUsd, 1e-9); // real cap unaffected, still sane
+    }
+
+    @Test
+    void nonPositiveAbsoluteMaxNotionalIsRejected() {
+        KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(100.0)), FixedPoint.fromDouble(50.0), 3);
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> new RiskGates(risk(200.0, 0.0, 1, 30, 250), strategy(), exec(), 1, ks, true));
     }
 
     @Test

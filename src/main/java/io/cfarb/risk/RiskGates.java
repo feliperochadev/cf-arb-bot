@@ -14,7 +14,7 @@ import java.util.concurrent.atomic.AtomicLongArray;
  * permanently rather than gate a single decision.
  *
  * <p><b>Threading:</b> {@link #canFire} and {@link #claim} are called ONLY from the single Netty
- * event-loop thread that owns the MEXC depth WebSocket connection (9 configured symbols is well
+ * event-loop thread that owns the MEXC depth WebSocket connection (12 configured symbols is well
  * under MEXC's 30-streams-per-connection cap, so this bot uses exactly one connection — see
  * {@code cf-bot.symbols}) — the per-triangle cooldown array and the cycles/minute ring buffer are
  * therefore single-writer and need no synchronization, mirroring
@@ -25,17 +25,26 @@ import java.util.concurrent.atomic.AtomicLongArray;
  */
 public final class RiskGates {
 
-    /** Absolute ceiling regardless of what cf-bot.risk.max-notional-usd says — S6's "a
-     * misconfiguration (e.g. notional=10^9) must be clamped and flagged at startup validation,"
-     * sized generously above this PoC's $100 seed so it never binds in normal operation but still
-     * catches a fat-fingered config value. */
-    private static final double ABSOLUTE_MAX_NOTIONAL_USD = 1_000.0;
+    /** The S6 code ceiling. {@code cf-bot.risk.absolute-max-notional-usd} (the operator-tunable
+     * backstop that {@code max-notional-usd} is clamped to) is ITSELF clamped to this at
+     * construction, so "a hard cap enforced in code, not only config" (CLAUDE.md non-negotiable #3)
+     * still holds even if BOTH notional keys are fat-fingered. Sized generously ($1M) so it never
+     * binds a deliberate config — it exists only to stop the classic {@code 10^9} typo from reaching
+     * a real order. This is the one value that is NOT config, by design. */
+    private static final double ABSOLUTE_MAX_NOTIONAL_CEILING = 1_000_000.0;
 
     private final KillSwitch killSwitch;
     private final boolean dryRun;
     private final long maxNotionalFixed;
     public final boolean notionalWasClamped;
     public final double effectiveMaxNotionalUsd;
+    /** {@code cf-bot.risk.absolute-max-notional-usd} after the code ceiling clamp — the value
+     * {@link #effectiveMaxNotionalUsd} was actually capped against. */
+    public final double effectiveAbsoluteMaxNotionalUsd;
+    /** True when {@code cf-bot.risk.absolute-max-notional-usd} itself exceeded
+     * {@link #ABSOLUTE_MAX_NOTIONAL_CEILING} and was clamped in code — a fat-fingered SAFETY limit,
+     * worth a louder startup flag than the ordinary {@link #notionalWasClamped}. */
+    public final boolean absoluteMaxWasClamped;
 
     private final int maxOpenCycles;
     private final long cooldownNanos;
@@ -85,7 +94,18 @@ public final class RiskGates {
             throw new IllegalStateException(
                     "cf-bot.risk.max-notional-usd must be > 0, got " + configuredMaxNotional);
         }
-        double clamped = Math.min(configuredMaxNotional, ABSOLUTE_MAX_NOTIONAL_USD);
+        double configuredAbsoluteMax = riskConfig.absoluteMaxNotionalUsd();
+        if (configuredAbsoluteMax <= 0) {
+            throw new IllegalStateException(
+                    "cf-bot.risk.absolute-max-notional-usd must be > 0, got " + configuredAbsoluteMax);
+        }
+        // S6: the operator-tunable backstop is ITSELF clamped in code, so a typo in either notional
+        // key is still caught before it can size a real order.
+        double absoluteMax = Math.min(configuredAbsoluteMax, ABSOLUTE_MAX_NOTIONAL_CEILING);
+        this.absoluteMaxWasClamped = absoluteMax != configuredAbsoluteMax;
+        this.effectiveAbsoluteMaxNotionalUsd = absoluteMax;
+
+        double clamped = Math.min(configuredMaxNotional, absoluteMax);
         this.notionalWasClamped = clamped != configuredMaxNotional;
         this.effectiveMaxNotionalUsd = clamped;
         this.maxNotionalFixed = FixedPoint.fromDouble(clamped);

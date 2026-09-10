@@ -26,8 +26,11 @@ ever enters `recorder-service`.
 2. **Every risk gate fails closed** (S5): missing config, stale/crossed/untrusted book, unknown
    rate-limit state, equity below the floor → no order. See `risk.RiskGates` / `risk.KillSwitch`.
 3. **Hard caps are enforced in code, not only config** (S6). `RiskGates` clamps
-   `max-notional-usd` to an absolute ceiling regardless of what config says, and flags it at
-   startup if clamping occurred.
+   `max-notional-usd` to `cf-bot.risk.absolute-max-notional-usd` (the operator-tunable backstop,
+   added 2026-09-10 — it was a frozen `1000.0` constant that silently strangled every cycle once
+   the seed moved to 4–5 figures), and clamps THAT in code to `ABSOLUTE_MAX_NOTIONAL_CEILING`
+   (a generous $1M compile-time sanity limit) while rejecting a non-positive value — so a typo in
+   *either* notional key still cannot size a real order. Every clamp is flagged at startup.
 4. **No secrets anywhere in code, config, tests, logs, or Terraform state** (S1/S2/S3).
    `MEXC_API_KEY`/`MEXC_API_SECRET` arrive ONLY via environment (SSM SecureString in Tokyo — see
    `../cf-arb-bot-plan.md` §6.2). The key must be TRADE-ONLY, no withdrawal permission, IP-allowlisted
@@ -182,6 +185,22 @@ ever enters `recorder-service`.
 - `/api/v1/opportunities`, `/api/v1/cycles`, and several `/api/v1/state`/`/api/v1/triangles` fields
   from plan §8 (per-symbol book age, uptime, per-triangle last-fire/cumulative-PnL) are not yet
   implemented.
+- **Universe expanded 2026-09-10** (`usdt-sol-btc-*`, `usdt-eth-btc-*` + SOLUSDT/SOLBTC/ETHBTC
+  symbols) after a 20 h dry-run at the marginal 10-triangle universe produced zero fires, and
+  `cf-arb-poc`'s own triangular results placed every profitable MEXC cycle in the SOL/ETH-BTC family
+  (excluded at $100 for SOLBTC's 1-whole-SOL minimum — a seed-size call, not a permanent one). These
+  cost 15 bps taker round-trip; non-negotiable #7's "$100 seed refuses SOLBTC" is unchanged — the
+  refusal is `EdgeCalculator` arithmetic, still live, just no longer the whole story at a larger seed.
+  The S6 notional ceiling that used to be a frozen `RiskGates.ABSOLUTE_MAX_NOTIONAL_USD = 1000.0`
+  (and silently clamped every cycle to $1k at a 4-5 figure seed) is now
+  `cf-bot.risk.absolute-max-notional-usd`, itself code-clamped to a $1M sanity ceiling — see
+  non-negotiable #3.
+- **`opportunity` journal events now carry `gross_bps` alongside `net_bps`** (`EdgeCalculator.Result#grossBps`):
+  the top-of-book cyclic edge before depth/quantization, i.e. exactly what `cf-arb-poc`'s
+  `stage2_cycles.evaluate_cycle` reports as its per-tick `net_bps`. Populated even on `unfillable`
+  rejects, so a dry-run journal separates "no edge" from "edge present but un-fillable / slippage-eaten"
+  and is directly comparable to `gate0_rebaseline`. Computed on the Netty thread but allocation-free
+  (3 divisions); it is a diagnostic, never an input to the fire decision.
 
 ## Threading model quick reference
 

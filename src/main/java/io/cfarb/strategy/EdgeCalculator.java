@@ -3,6 +3,8 @@ package io.cfarb.strategy;
 import io.cfarb.book.BookRegistry;
 import io.cfarb.book.L2Book;
 import io.cfarb.graph.Triangle;
+import io.cfarb.model.Side;
+import io.cfarb.model.SymbolFilter;
 import io.cfarb.util.FixedPoint;
 
 /**
@@ -45,6 +47,14 @@ public final class EdgeCalculator {
         public long finalAmount;
         /** (finalAmount / startAmount - 1) * 10_000, or Double.NaN if unfillable. */
         public double netBps;
+        /** Top-of-book cyclic edge in bps BEFORE any depth limit or lot-size quantization:
+         * {@code (Π (legRate_i * (1 - fee_i)) - 1) * 10_000}, the exact quantity the Python research
+         * pipeline's {@code cfarb.stage2_cycles.evaluate_cycle} reports as its per-tick {@code net_bps}
+         * ("opportunity" gate). Populated whenever all three books are usable — including when
+         * {@link #fillable} is {@code false}, so a dry-run journal line distinguishes "no edge" from
+         * "edge present but un-fillable at this size". {@code Double.NaN} if any leg's book was
+         * untrusted / empty / crossed. */
+        public double grossBps;
         /** Per-leg intended amount INTO that leg (native units of that leg's from_asset) and the
          * worst ladder price the VWAP walk touched -- exec.CycleExecutor uses these to place each
          * leg's IOC order at exactly the price boundary this calculation assumed (see
@@ -67,17 +77,38 @@ public final class EdgeCalculator {
         out.fillable = false;
         out.finalAmount = 0;
         out.netBps = Double.NaN;
+        out.grossBps = Double.NaN;
 
-        long amount = startAmount;
         int[] symbolIndex = triangle.symbolIndex();
+        Side[] sides = triangle.side();
+        SymbolFilter[] filters = triangle.filter();
+
+        // First pass: top-of-book gross edge — no depth limit, no quantization, just the log-space
+        // rate product cf-arb-poc's stage2_cycles.evaluate_cycle uses. Cheap (3 divisions, zero
+        // allocation); left NaN if any leg's book isn't usable. This is a diagnostic surfaced on the
+        // journal's opportunity events, NOT an input to the fire decision — that stays netBps below.
+        double grossProduct = 1.0;
         for (int leg = 0; leg < 3; leg++) {
             L2Book book = books.book(symbolIndex[leg]);
             if (!book.isTrusted() || book.isCrossed() || book.isEmpty()) {
                 return; // caller's staleness/health gates should already have screened this, but
                         // evaluate() must never fabricate an edge from a book that isn't ready
             }
+            double px = FixedPoint.toDouble(
+                    sides[leg] == Side.ASK ? book.bestAskPx() : book.bestBidPx());
+            double legRate = (sides[leg] == Side.ASK ? 1.0 / px : px)
+                    * FixedPoint.toDouble(filters[leg].takerFeeMultiplierFixed());
+            grossProduct *= legRate;
+        }
+        out.grossBps = (grossProduct - 1.0) * 10_000.0;
+
+        // Second pass: the real achievable edge — VWAP-walk each leg's ladder to size, quantize to
+        // the exchange lot step, apply fees. This is what a fire decision uses.
+        long amount = startAmount;
+        for (int leg = 0; leg < 3; leg++) {
+            L2Book book = books.book(symbolIndex[leg]);
             out.legInputAmount[leg] = amount;
-            Sizer.fillLeg(book, triangle.side()[leg], triangle.filter()[leg], amount, legResult);
+            Sizer.fillLeg(book, sides[leg], filters[leg], amount, legResult);
             if (!legResult.filled) {
                 return; // this leg is unfillable at this size — e.g. below SOLBTC's 1-SOL minimum
             }

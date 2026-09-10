@@ -14,6 +14,13 @@ quantization is applied — some winning cycles require a minimum order of 1 who
 `strategy.EdgeCalculator` puts that arithmetic INSIDE the live edge calculation, so untradeable
 triangles simply never fire rather than needing to be blacklisted by hand.
 
+The flip side: at a 4–5 figure seed those SOL/ETH-BTC cycles *are* fillable, and `cf-arb-poc`'s own
+results put every profitable MEXC cycle in that family (`BTCUSDT→SOLUSDT→SOLBTC`,
+`BTCUSDT→ETHUSDT→ETHBTC`). They are configured (`usdt-sol-btc-*`, `usdt-eth-btc-*`, added
+2026-09-10) alongside the 10 lower-cost USDT/USDC/XRP triangles. Note `risk.RiskGates` still hard-
+clamps per-cycle notional to `ABSOLUTE_MAX_NOTIONAL_USD` (currently $1,000) in code regardless of
+`cf-bot.risk.max-notional-usd` (security rule S6) — raise that constant deliberately to size past it.
+
 Visual representation of the SPSC Queue and triangular arbitrage detector workflow:
 
 <img width="900" height="638" alt="image" src="https://github.com/user-attachments/assets/c0430b04-4aad-451d-91c2-6c5360e7cceb" />
@@ -26,7 +33,7 @@ feed.MexcWsClient  →  book.BookRegistry  →  strategy.OpportunityDetector  �
      (decode)             (L2 books)          (EdgeCalculator + RiskGates)                   (signed orders, place→reconcile)
 ```
 
-One WebSocket connection (9 configured symbols, well under MEXC's 30-per-connection cap) decodes
+One WebSocket connection (12 configured symbols, well under MEXC's 30-per-connection cap) decodes
 `spot@public.aggre.depth.v3.api.pb@10ms` protobuf frames directly into per-symbol L2 books on the
 Netty event loop — allocation-free, no `protobuf-java`. Every book update re-evaluates only the
 triangles that touch the updated symbol (a precomputed inverted index), walking each leg's real
@@ -39,7 +46,7 @@ edge without touching the network at all.
 
 ```bash
 cd cf-arb-bot
-./mvnw test              # 53 tests: fixed-point math (incl. a real overflow bug caught while
+./mvnw test              # 94 tests: fixed-point math (incl. a real overflow bug caught while
                           # porting cf-trader's mulDiv, and plain-decimal rendering for order params),
                           # a real-captured-frame protobuf decoder cross-check, HMAC signing, risk
                           # gates, book reset/reconnect, triangle-closure validation, an EdgeCalculator
@@ -71,6 +78,13 @@ java -jar target/quarkus-app/quarkus-run.jar
   cycles, equity/PnL, book warmth, latency percentiles (`console-report-interval-ms` to retune).
 - `echo-events` — each journal event (fire, paper cycle, broken cycle, sampled reject,
   feed reconnect, latency snapshot) echoed to the console as NDJSON as it happens.
+
+Each `opportunity` event carries two edges: `net_bps` (the real achievable edge — VWAP-walked to
+size, lot-size quantized, fees; this is what the fire decision uses) and `gross_bps` (top-of-book
+cyclic edge before depth/quantization — the exact quantity `cf-arb-poc`'s
+`stage2_cycles.evaluate_cycle` reports). Comparing the two separates "no edge existed" from "edge
+existed but slippage/lot-size ate it", and makes a dry-run run directly comparable to the research
+pipeline's `gate0_rebaseline` output.
 
 `./mvnw quarkus:dev` turns both on automatically (the `%dev` profile).
 

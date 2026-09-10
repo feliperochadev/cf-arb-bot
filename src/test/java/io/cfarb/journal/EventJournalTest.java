@@ -26,7 +26,7 @@ class EventJournalTest {
         EventJournal journal = new EventJournal(tempDir, metrics, true);
         journal.start();
         try {
-            journal.write(JournalEvents.opportunity("usdt-btc-xrp-fwd", 7.5, 100_00000000L, true, null));
+            journal.write(JournalEvents.opportunity("usdt-btc-xrp-fwd", 7.5, 9.1, 100_00000000L, true, null));
             journal.write(JournalEvents.riskTrip("test-reason", 90_00000000L));
             List<String> lines = awaitLines(2);
             assertEquals(2, lines.size(), lines.toString());
