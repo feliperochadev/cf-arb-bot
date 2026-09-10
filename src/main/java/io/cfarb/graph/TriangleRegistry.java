@@ -4,9 +4,11 @@ import io.cfarb.book.BookRegistry;
 import io.cfarb.config.BotConfig;
 import io.cfarb.model.Side;
 import io.cfarb.model.SymbolFilter;
+import io.cfarb.util.FixedPoint;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalDouble;
 
 /**
  * Config -> resolved {@link Triangle}[] plus the inverted index {@code trianglesBySymbol}: which
@@ -21,16 +23,31 @@ public final class TriangleRegistry {
     private final Triangle[] triangles;
     /** trianglesBySymbol[symbolIndex] = array of triangle indices touching that symbol. */
     private final int[][] trianglesBySymbol;
+    /** JOURNAL-TUNING-TASK.md T5: resolved per-triangle notional cap (1e8-fixed USD), parallel to
+     * {@link #triangles}. Equals {@code cf-bot.triangles.<name>.max-notional-usd} when set, else the
+     * global {@code cf-bot.risk.max-notional-usd}. */
+    private final long[] maxNotionalFixedByTriangle;
 
     public TriangleRegistry(BotConfig config, BookRegistry books, Map<String, SymbolFilter> filters) {
-        this(config.triangles(), config.capital().anchorAsset(), books, filters);
+        this(config.triangles(), config.capital().anchorAsset(), books, filters,
+                config.risk().maxNotionalUsd());
     }
 
     /** Narrower constructor taking only what this class actually uses -- lets tests exercise
      * triangle-closure validation without mocking the entire {@link BotConfig} interface
-     * (cf-arb-bot-review-plan.md "Tests to add": {@code TriangleRegistryTest}). */
+     * (cf-arb-bot-review-plan.md "Tests to add": {@code TriangleRegistryTest}). No global notional
+     * cap -- every triangle's effective cap is {@code Long.MAX_VALUE} unless it sets its own. */
     public TriangleRegistry(Map<String, BotConfig.TriangleConfig> triangleConfigs, String anchorAsset,
                              BookRegistry books, Map<String, SymbolFilter> filters) {
+        this(triangleConfigs, anchorAsset, books, filters, Double.POSITIVE_INFINITY);
+    }
+
+    public TriangleRegistry(Map<String, BotConfig.TriangleConfig> triangleConfigs, String anchorAsset,
+                             BookRegistry books, Map<String, SymbolFilter> filters,
+                             double globalMaxNotionalUsd) {
+        long globalCapFixed = Double.isFinite(globalMaxNotionalUsd)
+                ? FixedPoint.fromDouble(globalMaxNotionalUsd) : Long.MAX_VALUE;
+        List<Long> caps = new ArrayList<>();
         List<Triangle> built = new ArrayList<>();
         for (Map.Entry<String, BotConfig.TriangleConfig> e : triangleConfigs.entrySet()) {
             String name = e.getKey();
@@ -94,9 +111,38 @@ public final class TriangleRegistry {
                             + fromAsset[i + 1] + "'");
                 }
             }
+            // JOURNAL-TUNING-TASK.md T5: per-triangle notional cap. Absent -> inherit the global cap.
+            // A present value must be positive AND not exceed the global cap -- same "loud and fatal,
+            // never a silent widening" contract as the global cap itself (security rule S6). This
+            // throws an IllegalStateException, which Quarkus turns into a non-zero exit at boot,
+            // exactly like this class's existing triangle-closure validation above.
+            OptionalDouble perTriangleCap = tc.maxNotionalUsd();
+            long capFixed;
+            if (perTriangleCap.isPresent()) {
+                double v = perTriangleCap.getAsDouble();
+                if (v <= 0) {
+                    throw new IllegalStateException("cf-bot.triangles." + name + ".max-notional-usd must be "
+                            + "> 0, got " + v + " -- a misconfigured notional cap fails the boot, it is "
+                            + "never silently defaulted or clamped (security rule S6)");
+                }
+                if (Double.isFinite(globalMaxNotionalUsd) && v > globalMaxNotionalUsd) {
+                    throw new IllegalStateException("cf-bot.triangles." + name + ".max-notional-usd=" + v
+                            + " exceeds the global cf-bot.risk.max-notional-usd=" + globalMaxNotionalUsd
+                            + " -- a per-triangle cap may only NARROW the global cap, never widen it "
+                            + "(security rule S6)");
+                }
+                capFixed = FixedPoint.fromDouble(v);
+            } else {
+                capFixed = globalCapFixed;
+            }
+            caps.add(capFixed);
             built.add(new Triangle(name, symbolIndex, sides, symFilters, fromAsset, toAsset));
         }
         this.triangles = built.toArray(new Triangle[0]);
+        this.maxNotionalFixedByTriangle = new long[caps.size()];
+        for (int i = 0; i < caps.size(); i++) {
+            this.maxNotionalFixedByTriangle[i] = caps.get(i);
+        }
 
         List<List<Integer>> bySymbol = new ArrayList<>();
         for (int s = 0; s < books.symbolCount(); s++) {
@@ -122,6 +168,26 @@ public final class TriangleRegistry {
 
     public int triangleCount() {
         return triangles.length;
+    }
+
+    public String triangleName(int triangleIndex) {
+        return triangles[triangleIndex].name();
+    }
+
+    public List<String> triangleNames() {
+        List<String> names = new ArrayList<>(triangles.length);
+        for (Triangle t : triangles) {
+            names.add(t.name());
+        }
+        return names;
+    }
+
+    /** JOURNAL-TUNING-TASK.md T5: the effective per-cycle notional cap for this triangle (1e8-fixed
+     * USD) -- its own {@code cf-bot.triangles.<name>.max-notional-usd} if set, else the global
+     * {@code cf-bot.risk.max-notional-usd}. {@code OpportunityDetector} sizes at
+     * {@code min(eligibleBalance, this)}. */
+    public long maxNotionalFixed(int triangleIndex) {
+        return maxNotionalFixedByTriangle[triangleIndex];
     }
 
     /** Zero-allocation hot-path lookup: which triangle indices touch this symbol. */

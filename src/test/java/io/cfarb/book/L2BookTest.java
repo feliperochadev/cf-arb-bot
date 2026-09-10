@@ -119,6 +119,115 @@ class L2BookTest {
         assertEquals(1000L, book.askPxAt(0), "pruning must keep the best (lowest) ask prices, not arbitrary ones");
     }
 
+    // --- JOURNAL-TUNING-TASK.md T1c/T1d: crossed-latch self-heal ---
+
+    /**
+     * Reproduces JOURNAL-BPS-ANALYSIS.md §5.5's pruning hypothesis with hand-built frames (rule
+     * Q10 / non-negotiable #8 -- never a live network call): a fast one-way price move where the
+     * feed delivers new near-touch levels but NOT an explicit {@code qty=0} for the levels the move
+     * left behind. The stale far-side bid survives at index 0 and the book crosses -- and, with
+     * {@code maxCrossedMs=0}, never recovers, exactly the one-way latch the session data shows.
+     */
+    @Test
+    void aStalePriceLevelCanCrossTheBookAndWithoutSelfHealItNeverRecovers() {
+        L2Book book = new L2Book(1, 3600, 0L); // self-heal disabled
+        MexcDepthDecoder.DepthFrame warm = frame(-1, -1);
+        addBid(warm, 120_000_00000000L, 1_00000000L);
+        addAsk(warm, 120_001_00000000L, 1_00000000L);
+        book.apply(warm, 1_000_000_000L);
+        assertFalse(book.isCrossed());
+
+        // Price falls hard: new bids/asks ~1% lower arrive, but the 120_000 bid is never deleted.
+        for (int i = 1; i <= 5; i++) {
+            MexcDepthDecoder.DepthFrame f = frame(-1, -1);
+            addBid(f, 118_800_00000000L - i * 100_00000000L, 2_00000000L);
+            addAsk(f, 118_801_00000000L - i * 100_00000000L, 2_00000000L);
+            book.apply(f, 1_000_000_000L + i * 10_000_000L);
+        }
+        assertTrue(book.isCrossed(), "stale 120_000 bid vs a ~118_800 ask -- crossed");
+
+        // More frames arrive; the book stays latched crossed forever.
+        for (int i = 6; i <= 40; i++) {
+            MexcDepthDecoder.DepthFrame f = frame(-1, -1);
+            addAsk(f, 118_795_00000000L, 3_00000000L);
+            book.apply(f, 1_000_000_000L + i * 10_000_000L);
+        }
+        assertTrue(book.isCrossed(), "no self-heal path -> permanent per-symbol outage");
+    }
+
+    /** With {@code cf-bot.book.max-crossed-ms} set, the same latch is broken: once the book has been
+     * crossed longer than the grace period, the next {@code apply()} resets it (untrusting it so it
+     * fails closed) and rebuilds from that frame. */
+    @Test
+    void selfHealResetsABookThatHasBeenCrossedLongerThanTheGracePeriod() {
+        L2Book book = new L2Book(10, 3600, 500L); // heal after 500ms crossed; 10 updates to warm
+        long t = 1_000_000_000L;
+
+        for (int i = 0; i < 10; i++) {
+            MexcDepthDecoder.DepthFrame warm = frame(-1, -1);
+            addBid(warm, 100L, 10L);
+            addAsk(warm, 101L, 10L);
+            book.apply(warm, t);
+        }
+        assertTrue(book.isTrusted());
+
+        // Cross it: a new bid above the ask, ask left in place.
+        MexcDepthDecoder.DepthFrame cross = frame(-1, -1);
+        addBid(cross, 105L, 5L);
+        book.apply(cross, t + 1_000_000L); // +1ms
+        assertTrue(book.isCrossed());
+        assertEquals(0, book.crossedResetCount());
+
+        // 400ms later -- still inside the grace period, still crossed, not yet healed.
+        MexcDepthDecoder.DepthFrame within = frame(-1, -1);
+        addAsk(within, 106L, 7L);
+        book.apply(within, t + 401_000_000L);
+        assertTrue(book.isCrossed());
+        assertEquals(0, book.crossedResetCount());
+
+        // 600ms after it first crossed -- the next apply() force-resets and rebuilds from this frame.
+        MexcDepthDecoder.DepthFrame heal = frame(-1, -1);
+        addBid(heal, 200L, 3L);
+        addAsk(heal, 201L, 3L);
+        book.apply(heal, t + 601_000_000L);
+
+        assertEquals(1, book.crossedResetCount(), "one self-heal reset");
+        assertFalse(book.isCrossed(), "rebuilt clean from the healing frame");
+        assertFalse(book.isTrusted(), "reset untrusts the book so it fails closed while re-warming (S5)");
+        assertEquals(200L, book.bidPxAt(0));
+        assertEquals(201L, book.askPxAt(0));
+    }
+
+    @Test
+    void selfHealClearsOnceTheBookUncrossesNormally() {
+        L2Book book = new L2Book(1, 3600, 500L);
+        long t = 1_000_000_000L;
+        MexcDepthDecoder.DepthFrame warm = frame(-1, -1);
+        addBid(warm, 100L, 10L);
+        addAsk(warm, 101L, 10L);
+        book.apply(warm, t);
+
+        MexcDepthDecoder.DepthFrame cross = frame(-1, -1);
+        addBid(cross, 105L, 5L);
+        book.apply(cross, t + 1_000_000L);
+        assertTrue(book.isCrossed());
+
+        // The 105 bid is deleted before the grace period elapses -- book uncrosses, no reset.
+        MexcDepthDecoder.DepthFrame fix = frame(-1, -1);
+        addBid(fix, 105L, 0L);
+        book.apply(fix, t + 100_000_000L);
+        assertFalse(book.isCrossed());
+
+        // Re-cross and wait past the grace period from the SECOND cross, not the first.
+        MexcDepthDecoder.DepthFrame cross2 = frame(-1, -1);
+        addBid(cross2, 110L, 5L);
+        book.apply(cross2, t + 200_000_000L);
+        MexcDepthDecoder.DepthFrame later = frame(-1, -1);
+        addAsk(later, 111L, 1L);
+        book.apply(later, t + 400_000_000L); // only 200ms since the re-cross
+        assertEquals(0, book.crossedResetCount(), "grace period restarts on each fresh cross");
+    }
+
     @Test
     void applyLevelRemovesAZeroQuantityLevel() {
         L2Book book = new L2Book(1, 3600);

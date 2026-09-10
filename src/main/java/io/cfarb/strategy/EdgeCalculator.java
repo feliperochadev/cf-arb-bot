@@ -65,6 +65,12 @@ public final class EdgeCalculator {
          * cf-arb-bot-review-plan.md Tier 1 step 1.1: exec.CycleExecutor must submit exactly this,
          * not re-derive a (smaller) quantity from budget/worstPrice. */
         public final long[] legBaseQtyFixed = new long[3];
+        /** JOURNAL-TUNING-TASK.md T4: per-leg top-of-book price (the traded side -- ask price for an
+         * ASK leg, bid price for a BID leg) and the quantity available AT that touch, 1e8-fixed.
+         * Populated in the gross-edge first pass whenever all three books are usable, so an
+         * {@code unfillable} journal line still carries them. Index 0..2 = leg 0..2. */
+        public final long[] legTopPriceFixed = new long[3];
+        public final long[] legTouchQtyFixed = new long[3];
     }
 
     /**
@@ -78,6 +84,14 @@ public final class EdgeCalculator {
         out.finalAmount = 0;
         out.netBps = Double.NaN;
         out.grossBps = Double.NaN;
+        // JOURNAL-TUNING-TASK.md T4: Result is reused across evaluations -- zero every per-leg array
+        // so a journal line for an unfillable candidate (whose second pass returns mid-loop) never
+        // carries a stale leg's data from a previous triangle's evaluation.
+        java.util.Arrays.fill(out.legInputAmount, 0L);
+        java.util.Arrays.fill(out.legWorstPriceFixed, 0L);
+        java.util.Arrays.fill(out.legBaseQtyFixed, 0L);
+        java.util.Arrays.fill(out.legTopPriceFixed, 0L);
+        java.util.Arrays.fill(out.legTouchQtyFixed, 0L);
 
         int[] symbolIndex = triangle.symbolIndex();
         Side[] sides = triangle.side();
@@ -94,8 +108,10 @@ public final class EdgeCalculator {
                 return; // caller's staleness/health gates should already have screened this, but
                         // evaluate() must never fabricate an edge from a book that isn't ready
             }
-            double px = FixedPoint.toDouble(
-                    sides[leg] == Side.ASK ? book.bestAskPx() : book.bestBidPx());
+            long topPxFixed = sides[leg] == Side.ASK ? book.bestAskPx() : book.bestBidPx();
+            out.legTopPriceFixed[leg] = topPxFixed;
+            out.legTouchQtyFixed[leg] = sides[leg] == Side.ASK ? book.bestAskQty() : book.bestBidQty();
+            double px = FixedPoint.toDouble(topPxFixed);
             double legRate = (sides[leg] == Side.ASK ? 1.0 / px : px)
                     * FixedPoint.toDouble(filters[leg].takerFeeMultiplierFixed());
             grossProduct *= legRate;

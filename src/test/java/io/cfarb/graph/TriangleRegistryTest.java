@@ -2,6 +2,7 @@ package io.cfarb.graph;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.cfarb.book.BookRegistry;
 import io.cfarb.config.BotConfig;
@@ -27,11 +28,18 @@ class TriangleRegistryTest {
     }
 
     private static BotConfig.TriangleConfig triangleConfig(String... legs) {
+        return triangleConfig(java.util.OptionalDouble.empty(), legs);
+    }
+
+    private static BotConfig.TriangleConfig triangleConfig(java.util.OptionalDouble maxNotionalUsd, String... legs) {
         return new BotConfig.TriangleConfig() {
             public boolean enabled() { return true; }
             public List<String> legs() { return List.of(legs); }
+            public java.util.OptionalDouble maxNotionalUsd() { return maxNotionalUsd; }
         };
     }
+
+    private static final String[] VALID_LEGS = {"BTCUSDT:ASK", "XRPBTC:ASK", "XRPUSDT:BID"};
 
     private static final Map<String, SymbolFilter> FILTERS = Map.of(
             "BTCUSDT", filter("BTCUSDT", "BTC", "USDT"),
@@ -53,6 +61,41 @@ class TriangleRegistryTest {
         Triangle t = registry.triangle(0);
         assertEquals("USDT", t.fromAsset()[0]);
         assertEquals("USDT", t.toAsset()[2]);
+    }
+
+    // --- JOURNAL-TUNING-TASK.md T5: per-triangle notional cap ---
+
+    @Test
+    void absentPerTriangleCapInheritsTheGlobalCap() {
+        Map<String, BotConfig.TriangleConfig> triangles = Map.of("t", triangleConfig(VALID_LEGS));
+        TriangleRegistry r = new TriangleRegistry(triangles, "USDT", BOOKS, FILTERS, 5_000.0);
+        assertEquals(FixedPoint.fromDouble(5_000.0), r.maxNotionalFixed(0));
+    }
+
+    @Test
+    void aPresentPerTriangleCapNarrowsTheGlobalCap() {
+        Map<String, BotConfig.TriangleConfig> triangles = Map.of("t",
+                triangleConfig(java.util.OptionalDouble.of(200.0), VALID_LEGS));
+        TriangleRegistry r = new TriangleRegistry(triangles, "USDT", BOOKS, FILTERS, 5_000.0);
+        assertEquals(FixedPoint.fromDouble(200.0), r.maxNotionalFixed(0));
+    }
+
+    @Test
+    void aNonPositivePerTriangleCapFailsTheBoot() {
+        Map<String, BotConfig.TriangleConfig> triangles = Map.of("t",
+                triangleConfig(java.util.OptionalDouble.of(0.0), VALID_LEGS));
+        IllegalStateException ex = assertThrows(IllegalStateException.class,
+                () -> new TriangleRegistry(triangles, "USDT", BOOKS, FILTERS, 5_000.0));
+        assertTrue(ex.getMessage().contains("must be > 0"));
+    }
+
+    @Test
+    void aPerTriangleCapAboveTheGlobalCapFailsTheBoot() {
+        Map<String, BotConfig.TriangleConfig> triangles = Map.of("t",
+                triangleConfig(java.util.OptionalDouble.of(9_999.0), VALID_LEGS));
+        IllegalStateException ex = assertThrows(IllegalStateException.class,
+                () -> new TriangleRegistry(triangles, "USDT", BOOKS, FILTERS, 5_000.0));
+        assertTrue(ex.getMessage().contains("may only NARROW"));
     }
 
     @Test

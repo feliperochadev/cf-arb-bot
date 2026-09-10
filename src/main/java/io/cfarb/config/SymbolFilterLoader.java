@@ -38,14 +38,29 @@ public final class SymbolFilterLoader {
     }
 
     public static Map<String, SymbolFilter> load(Path path) throws IOException {
-        return parse(Files.readAllBytes(path), path.toString());
+        return parse(Files.readAllBytes(path), path.toString(), 0.0);
     }
 
     public static Map<String, SymbolFilter> load(InputStream in, String sourceDescription) throws IOException {
-        return parse(in.readAllBytes(), sourceDescription);
+        return parse(in.readAllBytes(), sourceDescription, 0.0);
     }
 
-    private static Map<String, SymbolFilter> parse(byte[] bytes, String source) throws IOException {
+    /** JOURNAL-TUNING-TASK.md T9: {@code takerDiscountPct} (0–100, from {@code cf-bot.fees.taker-discount-pct})
+     * scales every symbol's {@code taker_bps}/{@code maker_bps} by {@code (1 - pct/100)} at load —
+     * MEXC's MX-holding discount is not in {@code mexc_filters.json}. Validated by the caller
+     * ({@code BotService}) before it gets here. */
+    public static Map<String, SymbolFilter> load(Path path, double takerDiscountPct) throws IOException {
+        return parse(Files.readAllBytes(path), path.toString(), takerDiscountPct);
+    }
+
+    public static Map<String, SymbolFilter> load(InputStream in, String sourceDescription, double takerDiscountPct)
+            throws IOException {
+        return parse(in.readAllBytes(), sourceDescription, takerDiscountPct);
+    }
+
+    private static Map<String, SymbolFilter> parse(byte[] bytes, String source, double takerDiscountPct)
+            throws IOException {
+        double feeScale = 1.0 - takerDiscountPct / 100.0;
         ObjectMapper mapper = new ObjectMapper();
         JsonNode root = mapper.readTree(bytes);
         JsonNode symbolsNode = root.get("symbols");
@@ -98,7 +113,10 @@ public final class SymbolFilterLoader {
             long qtyStep = FixedPoint.fromDouble(Math.pow(10.0, -qtyPrecision));
             long minQty = FixedPoint.fromDouble(requireDouble(n, "min_qty", symbol, source));
             long minNotional = FixedPoint.fromDouble(requireDouble(n, "min_notional", symbol, source));
-            double takerBps = requireDouble(n, "taker_bps", symbol, source);
+            // JOURNAL-TUNING-TASK.md T9: apply the MX-token taker discount (feeScale = 1 - pct/100).
+            // A no-op when takerDiscountPct is 0 (the default) or when taker_bps is already 0
+            // (USDC/USD1 promotional pairs).
+            double takerBps = requireDouble(n, "taker_bps", symbol, source) * feeScale;
             long feeMultiplierFixed = FixedPoint.fromDouble(1.0 - takerBps / 10_000.0);
             Set<String> orderTypes = new HashSet<>();
             JsonNode orderTypesNode = n.get("order_types");

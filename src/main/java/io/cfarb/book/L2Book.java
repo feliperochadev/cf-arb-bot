@@ -50,12 +50,26 @@ public final class L2Book {
 
     private final long warmupUpdates;
     private final long warmupNanos;
+    /** JOURNAL-TUNING-TASK.md T1c: how long (ns) a book may stay crossed before {@link #apply}
+     * force-{@link #reset}s it. {@code 0} disables the self-heal (pre-JOURNAL-TUNING behavior). */
+    private final long maxCrossedNanos;
     private long updateCount;
     private long warmStartNanos = -1;
     private boolean trusted;
     private long lastToVersion = -1;
     private long lastUpdateNanos = -1;
     private long lastSendTimeMs = -1;
+
+    // JOURNAL-TUNING-TASK.md T1b/T1c: nanoTime the book FIRST became crossed (-1 = not currently
+    // crossed). Written only on the Netty event-loop thread in apply()/reset(); read from the
+    // Vert.x feed-watchdog timer thread for the crossed-book WARN and from the Quarkus HTTP worker
+    // for GET /api/v1/books -- the same advisory cross-thread read the watchdog already makes of
+    // updateCount()/ageNanos() (see the class javadoc). volatile so those readers see a recent value.
+    private volatile long crossedSinceNanos = -1;
+    /** JOURNAL-TUNING-TASK.md T1c: monotonic count of crossed-latch self-heal resets. The feed
+     * watchdog diffs this per symbol to journal a {@code book_reset} event without doing any work
+     * on the hot path. volatile for the same cross-thread-read reason as {@link #crossedSinceNanos}. */
+    private volatile long crossedResetCount;
 
     // cf-arb-bot-review-plan.md (second pass) Tier A4: published top-of-book, read by the executor
     // thread ONLY for pricing an emergency unwind reversal (exec.Unwinder) -- never for a trading
@@ -68,9 +82,16 @@ public final class L2Book {
     private volatile long topBidFixed = Long.MIN_VALUE;
     private volatile long topAskFixed = Long.MIN_VALUE;
 
+    /** Self-heal disabled ({@code maxCrossedMs = 0}) — kept for the many unit tests that construct a
+     * book directly and do not exercise JOURNAL-TUNING-TASK.md T1c. */
     public L2Book(long warmupUpdates, long warmupSeconds) {
+        this(warmupUpdates, warmupSeconds, 0L);
+    }
+
+    public L2Book(long warmupUpdates, long warmupSeconds, long maxCrossedMs) {
         this.warmupUpdates = warmupUpdates;
         this.warmupNanos = warmupSeconds * 1_000_000_000L;
+        this.maxCrossedNanos = maxCrossedMs > 0 ? maxCrossedMs * 1_000_000L : 0L;
     }
 
     public void reset() {
@@ -82,6 +103,7 @@ public final class L2Book {
         lastToVersion = -1;
         topBidFixed = Long.MIN_VALUE;
         topAskFixed = Long.MIN_VALUE;
+        crossedSinceNanos = -1;
     }
 
     /**
@@ -91,6 +113,16 @@ public final class L2Book {
      * {@code book.py}'s "reset on gap" contract) so the caller can count it.
      */
     public boolean apply(MexcDepthDecoder.DepthFrame f, long nowNanos) {
+        // JOURNAL-TUNING-TASK.md T1c self-heal: a book that has been crossed longer than the grace
+        // period is reset HERE, on its owning Netty event-loop thread, and rebuilt from this frame
+        // onward -- rather than latching permanently until a version-chain gap forces a reset
+        // (JOURNAL-BPS-ANALYSIS.md §5.5: BTCUSDT stays crossed for hours). reset() clears trusted,
+        // so isTrusted() re-gates every triangle touching this symbol until it re-warms (rule S5).
+        if (maxCrossedNanos > 0 && crossedSinceNanos >= 0
+                && nowNanos - crossedSinceNanos >= maxCrossedNanos) {
+            reset();
+            crossedResetCount++;
+        }
         boolean gap = lastToVersion >= 0 && f.fromVersion >= 0 && f.fromVersion > lastToVersion + 1;
         if (gap) {
             reset();
@@ -116,6 +148,16 @@ public final class L2Book {
         // top-of-book price that is stale relative to what apply() just wrote.
         topBidFixed = bidCount > 0 ? bidPx[0] : Long.MIN_VALUE;
         topAskFixed = askCount > 0 ? askPx[0] : Long.MIN_VALUE;
+        // JOURNAL-TUNING-TASK.md T1b/T1c: record the crossed-state transition. Only written on an
+        // actual edge (clean -> crossed, or crossed -> clean), so the steady state costs one
+        // comparison and no volatile store (rule R1).
+        if (isCrossed()) {
+            if (crossedSinceNanos < 0) {
+                crossedSinceNanos = nowNanos;
+            }
+        } else if (crossedSinceNanos >= 0) {
+            crossedSinceNanos = -1;
+        }
         maybePromote(nowNanos);
         return !gap;
     }
@@ -253,6 +295,20 @@ public final class L2Book {
 
     public long updateCount() {
         return updateCount;
+    }
+
+    /** JOURNAL-TUNING-TASK.md T1a/T1b: nanoseconds this book has been continuously crossed, or 0 if
+     * it is not currently crossed. Advisory cross-thread read (feed watchdog / GET /api/v1/books),
+     * same trade-off as {@link #updateCount()} — see the class javadoc. */
+    public long crossedForNanos(long nowNanos) {
+        long since = crossedSinceNanos;
+        return since < 0 ? 0L : Math.max(0L, nowNanos - since);
+    }
+
+    /** JOURNAL-TUNING-TASK.md T1c: monotonic count of crossed-latch self-heal resets this book has
+     * performed. The feed watchdog diffs this per symbol to journal a {@code book_reset} event. */
+    public long crossedResetCount() {
+        return crossedResetCount;
     }
 
     /** Published top-of-book, for {@code exec.Unwinder}'s emergency reversal pricing ONLY (Tier

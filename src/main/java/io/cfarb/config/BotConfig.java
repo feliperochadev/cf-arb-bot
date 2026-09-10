@@ -48,6 +48,10 @@ public interface BotConfig {
 
     ObservabilityConfig observability();
 
+    BookConfig book();
+
+    FeesConfig fees();
+
     interface VenueConfig {
         @WithDefault("wss://wbs-api.mexc.com/ws")
         String wsUrl();
@@ -68,6 +72,18 @@ public interface BotConfig {
 
         /** "SYMBOL:BID" or "SYMBOL:ASK" per leg, exactly 3 entries, in traversal order. */
         List<String> legs();
+
+        /** JOURNAL-TUNING-TASK.md T5: optional per-triangle notional cap in USD. Absent means the
+         * triangle inherits the global {@code cf-bot.risk.max-notional-usd}. A present value is
+         * subject to the SAME fail-the-boot validation as the global cap ({@code TriangleRegistry}
+         * throws on a non-positive value, and on a value ABOVE the global cap — never a silent
+         * widening, security rule S6). Lets a thin cross triangle (e.g. {@code usdt-eth-xrp-fwd})
+         * be given $200 while a deep one keeps the full cap — JOURNAL-BPS-ANALYSIS.md §3.1 measured
+         * depth-walk drag scaling ~linearly with size, 5–55 bps on the thin-cross triangles.
+         *
+         * <p>A bare {@code Optional*} (no {@code @WithDefault}) is SmallRye's idiom for "absent means
+         * empty" — {@code TriangleRegistry} substitutes the global cap in that case. */
+        java.util.OptionalDouble maxNotionalUsd();
     }
 
     interface StrategyConfig {
@@ -186,6 +202,46 @@ public interface BotConfig {
          * Set to 0 to journal every reject (the old behavior — only sane for short local captures). */
         @WithDefault("1000")
         long rejectSampleMs();
+    }
+
+    /**
+     * JOURNAL-TUNING-TASK.md T1c: L2 book self-heal. A crossed book (top bid ≥ top ask) has no
+     * self-healing path in {@code L2Book.apply()} today — once it crosses it stays crossed until a
+     * version-chain gap forces a {@code reset()}, which JOURNAL-BPS-ANALYSIS.md §5.5 shows can be
+     * hours. That is a silent, permanent, per-symbol outage (17 of 17 sessions: the BTCUSDT
+     * triangles die once and never recover).
+     */
+    interface BookConfig {
+        /** Grace period a book may stay crossed before {@code L2Book.apply()} force-{@code reset()}s
+         * it and lets it re-warm. {@code reset()} clears {@code trusted}, so the book fails closed
+         * (rule S5) while rebuilding — no risk of trading off a half-rebuilt ladder. Checked on the
+         * Netty event-loop thread inside {@code apply()} (the book's owning thread — a cross-thread
+         * {@code reset()} from the watchdog timer would race the level arrays, so detection and the
+         * reset both stay on that one thread; the watchdog only observes and journals the event).
+         * A non-positive value DISABLES self-heal entirely and logs a prominent startup WARN — the
+         * pre-JOURNAL-TUNING behavior, only sane for a short diagnostic capture. */
+        @WithDefault("500")
+        long maxCrossedMs();
+    }
+
+    /**
+     * JOURNAL-TUNING-TASK.md T9: fee-model adjustment. {@code mexc_filters.json} carries the
+     * undiscounted per-symbol taker/maker commission straight from {@code exchangeInfo}. MEXC's
+     * MX-token holding discount (MEXC-PAIR-EXPANSION.md §2: holding ≥ 500 MX for 24 h → 50 % taker
+     * discount, 5.0 → 2.5 bps on the standard USDT legs) is not reflected there. This knob scales
+     * every symbol's taker/maker bps at load time so the operator does not have to hand-edit the
+     * snapshot.
+     */
+    interface FeesConfig {
+        /** Percentage taker/maker fee reduction applied to EVERY symbol's {@code taker_bps} /
+         * {@code maker_bps} at load ({@code effective = raw * (1 - pct/100)}). {@code 0.0} = no
+         * change (the shipped default — {@code mexc_filters.json}'s numbers used verbatim). Set to
+         * {@code 50.0} once the operator holds ≥ 500 MX and has verified the tier is actually 50 %
+         * (JOURNAL-TUNING-TASK.md T9 flags it as also discussed as 20 %). A value outside
+         * {@code [0, 100)} fails the boot. Zero-fee symbols (USDC/USD1 pairs) are unaffected —
+         * {@code 0 * anything = 0}. */
+        @WithDefault("0.0")
+        double takerDiscountPct();
     }
 
     /**

@@ -18,12 +18,18 @@ public final class BookRegistry {
     private final L2Book[] books;
 
     public BookRegistry(List<String> symbols, long warmupUpdates, long warmupSeconds) {
+        this(symbols, warmupUpdates, warmupSeconds, 0L);
+    }
+
+    /** {@code maxCrossedMs} is JOURNAL-TUNING-TASK.md T1c's per-book crossed-latch self-heal grace
+     * period ({@code cf-bot.book.max-crossed-ms}); {@code 0} disables it. */
+    public BookRegistry(List<String> symbols, long warmupUpdates, long warmupSeconds, long maxCrossedMs) {
         this.symbols = symbols.toArray(new String[0]);
         this.symbolBytes = new byte[this.symbols.length][];
         this.books = new L2Book[this.symbols.length];
         for (int i = 0; i < this.symbols.length; i++) {
             symbolBytes[i] = this.symbols[i].getBytes(java.nio.charset.StandardCharsets.US_ASCII);
-            books[i] = new L2Book(warmupUpdates, warmupSeconds);
+            books[i] = new L2Book(warmupUpdates, warmupSeconds, maxCrossedMs);
         }
     }
 

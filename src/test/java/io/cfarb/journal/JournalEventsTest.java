@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.cfarb.util.FixedPoint;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -70,6 +71,48 @@ class JournalEventsTest {
         assertEquals("intent_expired", node.get("type").asText());
         assertEquals(200.0, node.get("age_ms").asDouble());
         assertEquals("usdt-btc-xrp-fwd", node.get("triangle").asText());
+    }
+
+    @Test
+    void richOpportunityCarriesSampledFromAndFlatPerLegDepthArrays() {
+        // JOURNAL-TUNING-TASK.md T2 + T4.
+        long[] topPx = {FixedPoint.fromDouble(120000.0), FixedPoint.fromDouble(0.0001), FixedPoint.fromDouble(1.38)};
+        long[] touchQty = {FixedPoint.fromDouble(0.5), FixedPoint.fromDouble(200.0), FixedPoint.fromDouble(1500.0)};
+        long[] worstPx = {FixedPoint.fromDouble(120001.0), FixedPoint.fromDouble(0.000101), FixedPoint.fromDouble(1.379)};
+        long[] baseQty = {FixedPoint.fromDouble(0.008), FixedPoint.fromDouble(180.0), FixedPoint.fromDouble(180.0)};
+
+        String line = JournalEvents.opportunity("usdt-eth-xrp-fwd", -2.5, 1.75, 100_000_000L, false,
+                "below-threshold", 47, topPx, touchQty, worstPx, baseQty);
+        JsonNode n = assertDoesNotThrow(() -> MAPPER.readTree(line));
+
+        assertEquals(47, n.get("sampled_from").asInt());
+        assertEquals("below-threshold", n.get("reject_reason").asText());
+        assertEquals(3, n.get("leg_top_px").size());
+        assertEquals(120000.0, n.get("leg_top_px").get(0).asDouble(), 1e-6);
+        assertEquals(200.0, n.get("leg_touch_qty").get(1).asDouble(), 1e-6);
+        assertEquals(1.379, n.get("leg_worst_px").get(2).asDouble(), 1e-6);
+        assertEquals(180.0, n.get("leg_base_qty").get(2).asDouble(), 1e-6);
+    }
+
+    @Test
+    void plainOpportunityOmitsSampledFromAndLegArrays() {
+        String line = JournalEvents.opportunity("t", 7.5, 9.0, 100_000_000L, true, null);
+        JsonNode n = assertDoesNotThrow(() -> MAPPER.readTree(line));
+        assertEquals(false, n.has("sampled_from"));
+        assertEquals(false, n.has("leg_top_px"));
+        assertEquals(true, n.get("fired").asBoolean());
+    }
+
+    @Test
+    void bookResetEventParsesAndNamesTheSymbolAndReason() {
+        String line = JournalEvents.bookReset("BTCUSDT", "crossed-latch",
+                FixedPoint.fromDouble(120431.55), FixedPoint.fromDouble(120429.10), 481203L, 500.0);
+        JsonNode n = assertDoesNotThrow(() -> MAPPER.readTree(line));
+        assertEquals("book_reset", n.get("type").asText());
+        assertEquals("BTCUSDT", n.get("symbol").asText());
+        assertEquals("crossed-latch", n.get("reason").asText());
+        assertEquals(481203L, n.get("update_count").asLong());
+        assertEquals(500.0, n.get("crossed_for_ms").asDouble());
     }
 
     @Test
