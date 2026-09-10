@@ -14,6 +14,14 @@ quantization is applied — some winning cycles require a minimum order of 1 who
 `strategy.EdgeCalculator` puts that arithmetic INSIDE the live edge calculation, so untradeable
 triangles simply never fire rather than needing to be blacklisted by hand.
 
+The flip side: at a 4–5 figure seed those SOL/ETH-BTC cycles *are* fillable, and `cf-arb-poc`'s own
+results put every profitable MEXC cycle in that family (`BTCUSDT→SOLUSDT→SOLBTC`,
+`BTCUSDT→ETHUSDT→ETHBTC`). They are configured (`usdt-sol-btc-*`, `usdt-eth-btc-*`, added
+2026-09-10) alongside the 10 lower-cost USDT/USDC/XRP triangles. `cf-bot.risk.max-notional-usd` is
+the single per-cycle notional cap — a non-positive value **fails the boot** (ERROR + refuse to
+start, security rule S6); otherwise it is trusted as configured, with each cycle also bounded at
+runtime by `min(equity, cap)` and the kill switch.
+
 Visual representation of the SPSC Queue and triangular arbitrage detector workflow:
 
 <img width="900" height="638" alt="image" src="https://github.com/user-attachments/assets/c0430b04-4aad-451d-91c2-6c5360e7cceb" />
@@ -26,7 +34,7 @@ feed.MexcWsClient  →  book.BookRegistry  →  strategy.OpportunityDetector  �
      (decode)             (L2 books)          (EdgeCalculator + RiskGates)                   (signed orders, place→reconcile)
 ```
 
-One WebSocket connection (9 configured symbols, well under MEXC's 30-per-connection cap) decodes
+One WebSocket connection (12 configured symbols, well under MEXC's 30-per-connection cap) decodes
 `spot@public.aggre.depth.v3.api.pb@10ms` protobuf frames directly into per-symbol L2 books on the
 Netty event loop — allocation-free, no `protobuf-java`. Every book update re-evaluates only the
 triangles that touch the updated symbol (a precomputed inverted index), walking each leg's real
@@ -44,7 +52,7 @@ Brazilian Portuguese: [`Architecture-tour-pt.md`](Architecture-tour-pt.md).
 
 ```bash
 cd cf-arb-bot
-./mvnw test              # 53 tests: fixed-point math (incl. a real overflow bug caught while
+./mvnw test              # 94 tests: fixed-point math (incl. a real overflow bug caught while
                           # porting cf-trader's mulDiv, and plain-decimal rendering for order params),
                           # a real-captured-frame protobuf decoder cross-check, HMAC signing, risk
                           # gates, book reset/reconnect, triangle-closure validation, an EdgeCalculator
@@ -55,6 +63,36 @@ cd cf-arb-bot
 java -jar target/quarkus-app/quarkus-run.jar   # dry-run by default -- connects to live MEXC market
                                                  # data (public, unauthenticated), places no orders
 ```
+
+(No `mvnw` in your checkout? The wrapper lives at the repo root — `mvnw`, `mvnw.cmd`, `.mvn/`. If
+it is genuinely missing, `mvn -N wrapper:wrapper` regenerates it, or just use a system `mvn`.)
+
+### Watching a dry-run run
+
+Dry-run is intentionally quiet on the console — the real telemetry is the NDJSON journal under
+`./journal/`, the read-only API (`/api/v1/state`, `/triangles`, `/latency`), and Prometheus at
+`/q/metrics`. To watch the pipeline work in the terminal, enable the opt-in observability knobs
+(all off the hot tick path — a Vert.x timer plus the journal-writer thread, no new hand-off):
+
+```bash
+CF_BOT_OBSERVABILITY_CONSOLE_REPORT=true \
+CF_BOT_OBSERVABILITY_ECHO_EVENTS=true \
+java -jar target/quarkus-app/quarkus-run.jar
+```
+
+- `console-report` — a rolling ~5s summary block: frames/s, evaluations, near-misses, fires,
+  cycles, equity/PnL, book warmth, latency percentiles (`console-report-interval-ms` to retune).
+- `echo-events` — each journal event (fire, paper cycle, broken cycle, sampled reject,
+  feed reconnect, latency snapshot) echoed to the console as NDJSON as it happens.
+
+Each `opportunity` event carries two edges: `net_bps` (the real achievable edge — VWAP-walked to
+size, lot-size quantized, fees; this is what the fire decision uses) and `gross_bps` (top-of-book
+cyclic edge before depth/quantization — the exact quantity `cf-arb-poc`'s
+`stage2_cycles.evaluate_cycle` reports). Comparing the two separates "no edge existed" from "edge
+existed but slippage/lot-size ate it", and makes a dry-run run directly comparable to the research
+pipeline's `gate0_rebaseline` output.
+
+`./mvnw quarkus:dev` turns both on automatically (the `%dev` profile).
 
 `config/mexc_filters.json` (MEXC's live lot-size/fee/price-precision schedule — public
 `GET /api/v3/exchangeInfo`, no API key) ships bundled on the classpath

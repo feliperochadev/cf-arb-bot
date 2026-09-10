@@ -94,4 +94,25 @@ public class BotMetrics {
     public ConcurrentHistogram frameToDecisionHistogram() { return frameToDecisionNanos; }
     public ConcurrentHistogram decisionToLeg1AckHistogram() { return decisionToLeg1AckNanos; }
     public ConcurrentHistogram fullCycleHistogram() { return fullCycleNanos; }
+
+    /** Immutable point-in-time read of every counter, for the opt-in console activity report
+     * ({@code io.cfarb.observability.ActivityReport}) — the Vert.x timer diffs two of these to
+     * render per-second rates without exposing a dozen live-counter getters. Micrometer
+     * {@code Counter.count()} returns a {@code double}; the counters here only ever increment by
+     * whole numbers, so the cast to {@code long} is exact for any realistic run length. */
+    public Snapshot snapshot() {
+        return new Snapshot(
+                (long) framesReceived.count(), (long) framesDropped.count(),
+                (long) opportunitiesDetected.count(), (long) opportunitiesFired.count(),
+                (long) opportunitiesRejectedUnfillable.count(), (long) cyclesCompleted.count(),
+                (long) cyclesBroken.count(), (long) orderQueueDrops.count(),
+                (long) journalDrops.count(), (long) journalSuppressed.count(),
+                (long) riskTrips.count(), (long) intentsExpired.count());
+    }
+
+    public record Snapshot(long framesReceived, long framesDropped, long opportunitiesDetected,
+            long opportunitiesFired, long opportunitiesRejectedUnfillable, long cyclesCompleted,
+            long cyclesBroken, long orderQueueDrops, long journalDrops, long journalSuppressed,
+            long riskTrips, long intentsExpired) {
+    }
 }

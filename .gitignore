@@ -4,5 +4,8 @@ target/
 .quarkus/
 .env
 *.log
+# cf-bot.journal.dir default -- the runtime NDJSON journal, written at the repo root by local runs.
+# Anchored so it never matches the io.cfarb.journal source/test package directories.
+/journal/
 *.iml
 .DS_Store

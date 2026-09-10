@@ -2,6 +2,7 @@ package io.cfarb.risk;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.cfarb.config.BotConfig;
@@ -51,14 +52,25 @@ class RiskGatesTest {
     }
 
     @Test
-    void absoluteHardCapClampsEvenAMisconfiguredValue() {
-        // S6: "a misconfiguration (e.g. notional=10^9) must be clamped and flagged at startup."
+    void largeButPositiveNotionalCapIsTrustedAsConfigured() {
+        // max-notional-usd is the ONE notional cap -- no code ceiling clamps it any more. A big
+        // deliberate value boots and is honoured verbatim; runtime min(equity, cap) + the kill
+        // switch are what actually bound a live cycle.
         KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(100.0)), FixedPoint.fromDouble(50.0), 3);
-        RiskGates gates = new RiskGates(risk(1_000_000_000.0, 1, 30, 250), strategy(), exec(), 1, ks, true);
-        assertTrue(gates.notionalWasClamped);
-        assertTrue(gates.effectiveMaxNotionalUsd < 1_000_000_000.0);
-        long huge = FixedPoint.fromDouble(1500.0); // exceeds the ABSOLUTE_MAX_NOTIONAL_USD ceiling of 1000
-        assertFalse(gates.canFire(0, huge, 1_000_000L));
+        RiskGates gates = new RiskGates(risk(50_000.0, 1, 30, 250), strategy(), exec(), 1, ks, true);
+        assertEquals(50_000.0, gates.effectiveMaxNotionalUsd, 1e-9);
+        assertTrue(gates.canFire(0, FixedPoint.fromDouble(40_000.0), 1_000_000L));
+        assertFalse(gates.canFire(0, FixedPoint.fromDouble(60_000.0), 1_000_000L));
+    }
+
+    @Test
+    void nonPositiveNotionalCapRefusesToBoot() {
+        // S6: a misconfigured cap is loud and fatal -- RiskGates.failStartup() logs ERROR + throws.
+        KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(100.0)), FixedPoint.fromDouble(50.0), 3);
+        assertThrows(IllegalStateException.class, () -> new RiskGates(
+                risk(0.0, 1, 30, 250), strategy(), exec(), 1, ks, true));
+        assertThrows(IllegalStateException.class, () -> new RiskGates(
+                risk(-5.0, 1, 30, 250), strategy(), exec(), 1, ks, true));
     }
 
     @Test

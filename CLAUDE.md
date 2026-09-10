@@ -25,9 +25,15 @@ ever enters `recorder-service`.
    `BotService.logStartupSafetyBanner`) — security rule S4.
 2. **Every risk gate fails closed** (S5): missing config, stale/crossed/untrusted book, unknown
    rate-limit state, equity below the floor → no order. See `risk.RiskGates` / `risk.KillSwitch`.
-3. **Hard caps are enforced in code, not only config** (S6). `RiskGates` clamps
-   `max-notional-usd` to an absolute ceiling regardless of what config says, and flags it at
-   startup if clamping occurred.
+3. **A misconfigured risk limit FAILS THE BOOT — never a silent default** (S5/S6).
+   `RiskGates.failStartup()` logs an ERROR and aborts if `max-notional-usd`, `max-open-cycles`, or
+   `max-cycles-per-minute` is ≤ 0 — not quietly widened via `Math.max(1, …)` to a value the operator
+   never chose. `cf-bot.risk.max-notional-usd` is the one per-cycle notional cap and is otherwise
+   trusted as configured; at runtime every cycle is additionally bounded by live equity
+   (`min(equity, cap)`) and the kill switch. (Until 2026-09-10 a frozen
+   `RiskGates.ABSOLUTE_MAX_NOTIONAL_USD = 1000.0` also clamped the cap in code, which silently
+   strangled every cycle to $1k once the seed moved to 4–5 figures; a later `absolute-max-notional-usd`
+   config knob was tried and then dropped as redundant.)
 4. **No secrets anywhere in code, config, tests, logs, or Terraform state** (S1/S2/S3).
    `MEXC_API_KEY`/`MEXC_API_SECRET` arrive ONLY via environment (SSM SecureString in Tokyo — see
    `../cf-arb-bot-plan.md` §6.2). The key must be TRADE-ONLY, no withdrawal permission, IP-allowlisted
@@ -182,6 +188,22 @@ ever enters `recorder-service`.
 - `/api/v1/opportunities`, `/api/v1/cycles`, and several `/api/v1/state`/`/api/v1/triangles` fields
   from plan §8 (per-symbol book age, uptime, per-triangle last-fire/cumulative-PnL) are not yet
   implemented.
+- **Universe expanded 2026-09-10** (`usdt-sol-btc-*`, `usdt-eth-btc-*` + SOLUSDT/SOLBTC/ETHBTC
+  symbols) after a 20 h dry-run at the marginal 10-triangle universe produced zero fires, and
+  `cf-arb-poc`'s own triangular results placed every profitable MEXC cycle in the SOL/ETH-BTC family
+  (excluded at $100 for SOLBTC's 1-whole-SOL minimum — a seed-size call, not a permanent one). These
+  cost 15 bps taker round-trip; non-negotiable #7's "$100 seed refuses SOLBTC" is unchanged — the
+  refusal is `EdgeCalculator` arithmetic, still live, just no longer the whole story at a larger seed.
+  The S6 notional ceiling that used to be a frozen `RiskGates.ABSOLUTE_MAX_NOTIONAL_USD = 1000.0`
+  (and silently clamped every cycle to $1k at a 4-5 figure seed) is gone: `cf-bot.risk.max-notional-usd`
+  is now the single notional cap, trusted as configured, and only a non-positive value fails the boot.
+  See non-negotiable #3.
+- **`opportunity` journal events now carry `gross_bps` alongside `net_bps`** (`EdgeCalculator.Result#grossBps`):
+  the top-of-book cyclic edge before depth/quantization, i.e. exactly what `cf-arb-poc`'s
+  `stage2_cycles.evaluate_cycle` reports as its per-tick `net_bps`. Populated even on `unfillable`
+  rejects, so a dry-run journal separates "no edge" from "edge present but un-fillable / slippage-eaten"
+  and is directly comparable to `gate0_rebaseline`. Computed on the Netty thread but allocation-free
+  (3 divisions); it is a diagnostic, never an input to the fire decision.
 
 ## Threading model quick reference
 
@@ -189,6 +211,6 @@ ever enters `recorder-service`.
 |---|---|---|
 | Netty event loop (`feed.MexcWsClient`) | decode → book update → `strategy.OpportunityDetector` | allocate on the steady path, log per-tick, block |
 | `cf-arb-executor` (`exec.CycleExecutor`) | 3 sequential legs, each place→query→cancel-if-non-terminal→(trades-reconcile), `exec.Unwinder` (reads `book.L2Book`'s published top-of-book to price an emergency reversal — declared exception, see `L2Book`'s javadoc) | touch a book for anything but reading published top-of-book; make a trading DECISION from it |
-| `cf-arb-journal-writer` (`journal.EventJournal`) | NDJSON append | backpressure the hot path — drop and count instead |
+| `cf-arb-journal-writer` (`journal.EventJournal`) | NDJSON append, optional console echo of each appended line (`cf-bot.observability.echo-events`) | backpressure the hot path — drop and count instead |
 | Quarkus HTTP worker (`api.BotApiResource`, `api.ReadinessCheck`) | read-only JSON | any write to trading state (S12) |
-| Vert.x periodic timers (`BotService`: warm-up/clock-skew, feed watchdog, latency snapshots) | read-only diagnostic reads, `killSwitch.recordFeedUnhealthy` | gate or influence a trading decision directly — these feed the kill switch and journal only |
+| Vert.x periodic timers (`BotService`: warm-up/clock-skew, feed watchdog, latency snapshots, opt-in console activity report) | read-only diagnostic reads, `killSwitch.recordFeedUnhealthy` | gate or influence a trading decision directly — these feed the kill switch, journal and console only |

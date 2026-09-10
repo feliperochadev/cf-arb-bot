@@ -21,10 +21,19 @@ public final class JournalEvents {
     private JournalEvents() {
     }
 
-    public static String opportunity(String triangleName, double netBps, long notionalFixed, boolean fired, String rejectReason) {
+    /** {@code net_bps} is the real achievable edge (VWAP-walked to size, lot-size quantized, fees) —
+     * the value the fire decision is made on. {@code gross_bps} is the top-of-book cyclic edge
+     * BEFORE depth/quantization ({@code EdgeCalculator.Result#grossBps}), i.e. the exact quantity
+     * {@code cf-arb-poc}'s {@code stage2_cycles.evaluate_cycle} reports as its per-tick {@code net_bps}:
+     * carrying both lets a dry-run journal be compared directly against that pipeline and separates
+     * "no edge existed" from "edge existed but slippage/lot-size ate it". Either renders as JSON
+     * {@code null} when {@code NaN} (e.g. an unfillable candidate has no {@code net_bps}). */
+    public static String opportunity(String triangleName, double netBps, double grossBps, long notionalFixed,
+                                      boolean fired, String rejectReason) {
         return "{\"type\":\"opportunity\",\"ts_us\":" + EpochMicros.now()
                 + ",\"triangle\":\"" + esc(triangleName) + "\""
                 + ",\"net_bps\":" + jsonNumber(netBps)
+                + ",\"gross_bps\":" + jsonNumber(grossBps)
                 + ",\"notional_usd\":" + io.cfarb.util.FixedPoint.toDouble(notionalFixed)
                 + ",\"fired\":" + fired
                 + (rejectReason != null ? ",\"reject_reason\":\"" + esc(rejectReason) + "\"" : "")

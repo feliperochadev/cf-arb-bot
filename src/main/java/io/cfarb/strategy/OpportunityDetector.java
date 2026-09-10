@@ -105,13 +105,16 @@ public final class OpportunityDetector {
             metrics.recordOpportunityRejectedUnfillable();
             // cf-arb-bot-review-plan.md Tier 2 step 2.6 / plan §8: "the rejects are the interesting
             // half" -- but SAMPLED, not one line per candidate per frame (see journalReject).
-            journalReject(triangleIndex, tri.name(), Double.NaN, candidateNotional, "unfillable", nowNanos);
+            // netBps is NaN here (no fill), but grossBps still carries the top-of-book edge so an
+            // "unfillable" reject is distinguishable from "no edge at all".
+            journalReject(triangleIndex, tri.name(), Double.NaN, edgeResult.grossBps, candidateNotional,
+                    "unfillable", nowNanos);
             return; // top-of-book may have looked good, but the real ladder/lot-size can't fill it
         }
         metrics.recordOpportunityDetected();
         if (edgeResult.netBps <= minNetBps + slippageBufferBps) {
-            journalReject(triangleIndex, tri.name(), edgeResult.netBps, candidateNotional,
-                    "below-threshold", nowNanos);
+            journalReject(triangleIndex, tri.name(), edgeResult.netBps, edgeResult.grossBps,
+                    candidateNotional, "below-threshold", nowNanos);
             return; // real edge doesn't clear threshold + slippage buffer
         }
 
@@ -126,12 +129,13 @@ public final class OpportunityDetector {
         if (!orderQueue.offer(intent)) {
             riskGates.onCycleFinished(); // roll back the claim -- we couldn't even enqueue it
             metrics.recordOrderQueueDrop();
-            journal.write(JournalEvents.opportunity(tri.name(), edgeResult.netBps, candidateNotional, false,
-                    "order-queue-full"));
+            journal.write(JournalEvents.opportunity(tri.name(), edgeResult.netBps, edgeResult.grossBps,
+                    candidateNotional, false, "order-queue-full"));
             return;
         }
         metrics.recordOpportunityFired();
-        journal.write(JournalEvents.opportunity(tri.name(), edgeResult.netBps, candidateNotional, true, null));
+        journal.write(JournalEvents.opportunity(tri.name(), edgeResult.netBps, edgeResult.grossBps,
+                candidateNotional, true, null));
     }
 
     /**
@@ -141,8 +145,8 @@ public final class OpportunityDetector {
      * one of the two reject paths, and {@code canFire}'s per-triangle cooldown only advances on
      * {@link RiskGates#claim} — so a triangle that never fires was writing a journal line on EVERY
      * book update it touched. At the measured feed rate (aggre.depth@10ms, 14-41ms per symbol) over
-     * 9 symbols and 10 triangles that is roughly 900 lines/second, ~10 GB/day against a 20 GB root
-     * volume — in dry-run, the default mode. It also put ~900 {@code String} allocations/second
+     * ~12 symbols and ~14 triangles that is roughly 1k+ lines/second, ~10 GB/day against a 20 GB root
+     * volume — in dry-run, the default mode. It also put ~1k {@code String} allocations/second
      * (JournalEvents' formatting) on the Netty event-loop thread, which rule R1 forbids outright.
      *
      * <p>Fires and genuine anomalies (order-queue-full) stay UNSAMPLED — they are rare by
@@ -150,14 +154,14 @@ public final class OpportunityDetector {
      * rejects are counted ({@code cfarb.journal.suppressed}), never silently dropped:
      * recorder-service non-negotiable #2, "a dropped frame that isn't counted is a lie."
      */
-    private void journalReject(int triangleIndex, String name, double netBps, long candidateNotional,
-                                String reason, long nowNanos) {
+    private void journalReject(int triangleIndex, String name, double netBps, double grossBps,
+                                long candidateNotional, String reason, long nowNanos) {
         if (nowNanos - lastRejectJournalNanos[triangleIndex] < rejectJournalIntervalNanos) {
             metrics.recordJournalSuppressed();
             return;
         }
         lastRejectJournalNanos[triangleIndex] = nowNanos;
-        journal.write(JournalEvents.opportunity(name, netBps, candidateNotional, false, reason));
+        journal.write(JournalEvents.opportunity(name, netBps, grossBps, candidateNotional, false, reason));
     }
 
     private boolean allLegsFresh(Triangle tri, long nowNanos) {

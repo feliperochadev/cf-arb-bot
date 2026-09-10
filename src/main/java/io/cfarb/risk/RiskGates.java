@@ -4,17 +4,25 @@ import io.cfarb.config.BotConfig;
 import io.cfarb.util.FixedPoint;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLongArray;
+import org.jboss.logging.Logger;
 
 /**
- * Every trading gate, all fail CLOSED (security rule S5), all hard-clamped in code as well as
- * config (rule S6) — cf-arb-bot-plan.md §5.5. Four of these (the startup notional clamp, the
- * per-triangle cooldown CAS, the sliding-window cycles/minute cap, the open-cycle cap) are ported
- * patterns from {@code cf-trader.trader.Strategist}/{@code Orderer}; the equity floor and
- * consecutive-failure trip live in {@link KillSwitch} instead, since those need to latch
- * permanently rather than gate a single decision.
+ * Every trading gate, all fail CLOSED (security rule S5) — cf-arb-bot-plan.md §5.5. Four of these
+ * (the startup notional validation, the per-triangle cooldown CAS, the sliding-window cycles/minute
+ * cap, the open-cycle cap) are ported patterns from
+ * {@code cf-trader.trader.Strategist}/{@code Orderer}; the equity floor and consecutive-failure trip
+ * live in {@link KillSwitch} instead, since those need to latch permanently rather than gate a
+ * single decision.
+ *
+ * <p><b>S6 (notional cap):</b> {@code cf-bot.risk.max-notional-usd} is the one per-cycle notional
+ * cap. A non-positive value FAILS THE BOOT (constructor logs an ERROR and throws) — it is never
+ * silently defaulted or clamped. Otherwise the cap is trusted as configured; at runtime every cycle
+ * is additionally bounded by live equity ({@code min(equity, cap)}) and the kill switch. Until
+ * 2026-09-10 a frozen {@code ABSOLUTE_MAX_NOTIONAL_USD = 1000.0} constant also clamped this in code,
+ * which silently strangled every cycle to $1k once the seed moved to 4–5 figures.
  *
  * <p><b>Threading:</b> {@link #canFire} and {@link #claim} are called ONLY from the single Netty
- * event-loop thread that owns the MEXC depth WebSocket connection (9 configured symbols is well
+ * event-loop thread that owns the MEXC depth WebSocket connection (12 configured symbols is well
  * under MEXC's 30-streams-per-connection cap, so this bot uses exactly one connection — see
  * {@code cf-bot.symbols}) — the per-triangle cooldown array and the cycles/minute ring buffer are
  * therefore single-writer and need no synchronization, mirroring
@@ -25,16 +33,14 @@ import java.util.concurrent.atomic.AtomicLongArray;
  */
 public final class RiskGates {
 
-    /** Absolute ceiling regardless of what cf-bot.risk.max-notional-usd says — S6's "a
-     * misconfiguration (e.g. notional=10^9) must be clamped and flagged at startup validation,"
-     * sized generously above this PoC's $100 seed so it never binds in normal operation but still
-     * catches a fat-fingered config value. */
-    private static final double ABSOLUTE_MAX_NOTIONAL_USD = 1_000.0;
+    private static final Logger LOG = Logger.getLogger(RiskGates.class);
 
     private final KillSwitch killSwitch;
     private final boolean dryRun;
     private final long maxNotionalFixed;
-    public final boolean notionalWasClamped;
+    /** The validated per-cycle notional cap in USD — equal to {@code cf-bot.risk.max-notional-usd}
+     * (a bad value fails the boot rather than being clamped, so there is no "effective vs configured"
+     * split any more; the name is kept for callers/logging). */
     public final double effectiveMaxNotionalUsd;
 
     private final int maxOpenCycles;
@@ -77,22 +83,20 @@ public final class RiskGates {
         this.killSwitch = killSwitch;
         this.dryRun = dryRun;
 
-        // cf-arb-bot-review-plan.md Tier 2 step 2.5: a non-positive limit here previously widened
-        // silently to 1 via Math.max(1, ...) instead of being rejected -- fail closed (S5) on a
-        // misconfiguration instead of quietly substituting a default the operator never chose.
+        // S6: a non-positive notional cap FAILS THE BOOT -- never silently defaulted or clamped.
+        // cf-arb-bot-review-plan.md Tier 2 step 2.5: it previously widened silently to 1 via
+        // Math.max(1, ...); fail closed (S5) on a misconfiguration instead of quietly substituting a
+        // value the operator never chose. Otherwise the cap is trusted as configured -- at runtime
+        // every cycle is still bounded by min(equity, cap) and the kill switch.
         double configuredMaxNotional = riskConfig.maxNotionalUsd();
         if (configuredMaxNotional <= 0) {
-            throw new IllegalStateException(
-                    "cf-bot.risk.max-notional-usd must be > 0, got " + configuredMaxNotional);
+            failStartup("cf-bot.risk.max-notional-usd must be > 0, got " + configuredMaxNotional);
         }
-        double clamped = Math.min(configuredMaxNotional, ABSOLUTE_MAX_NOTIONAL_USD);
-        this.notionalWasClamped = clamped != configuredMaxNotional;
-        this.effectiveMaxNotionalUsd = clamped;
-        this.maxNotionalFixed = FixedPoint.fromDouble(clamped);
+        this.effectiveMaxNotionalUsd = configuredMaxNotional;
+        this.maxNotionalFixed = FixedPoint.fromDouble(configuredMaxNotional);
 
         if (riskConfig.maxOpenCycles() <= 0) {
-            throw new IllegalStateException(
-                    "cf-bot.risk.max-open-cycles must be > 0, got " + riskConfig.maxOpenCycles());
+            failStartup("cf-bot.risk.max-open-cycles must be > 0, got " + riskConfig.maxOpenCycles());
         }
         this.maxOpenCycles = riskConfig.maxOpenCycles();
         this.cooldownNanos = riskConfig.cycleCooldownMs() * 1_000_000L;
@@ -105,8 +109,7 @@ public final class RiskGates {
         this.clockSkewToleranceNanos = (execConfig.recvWindowMs() * 1_000_000L) / 2;
 
         if (riskConfig.maxCyclesPerMinute() <= 0) {
-            throw new IllegalStateException(
-                    "cf-bot.risk.max-cycles-per-minute must be > 0, got " + riskConfig.maxCyclesPerMinute());
+            failStartup("cf-bot.risk.max-cycles-per-minute must be > 0, got " + riskConfig.maxCyclesPerMinute());
         }
         this.maxCyclesPerMinute = riskConfig.maxCyclesPerMinute();
         this.ringTimestampsNanos = new long[maxCyclesPerMinute];
@@ -121,6 +124,15 @@ public final class RiskGates {
         for (int i = 0; i < lastFireNanosByTriangle.length(); i++) {
             lastFireNanosByTriangle.set(i, neverFiredSentinel);
         }
+    }
+
+    /** A bad risk-config value logs an ERROR and deliberately aborts the boot (thrown from the
+     * constructor, which runs in {@code BotService}'s {@code @PostConstruct} — Quarkus turns an
+     * uncaught startup exception into a non-zero exit). Never clamped or defaulted: a
+     * misconfigured risk limit must be visible and fatal, not silently reinterpreted. */
+    private static void failStartup(String message) {
+        LOG.error(message);
+        throw new IllegalStateException(message);
     }
 
     /**
