@@ -204,12 +204,16 @@ ever enters `recorder-service`.
     or one ABOVE the global cap, FAILS THE BOOT (never a silent widening — S6). The global
     `cf-bot.risk.max-notional-usd` default was cut **$20,000 → $1,000** (analysis §3: drag scales
     ~linearly with size; the best 24 h episode went −19.6 bps @ $10k → +0.7 bps @ $100).
-  - **MX-token fee discount knob (T9):** `cf-bot.fees.taker-discount-pct` (default `0.0` — no
-    change). `SymbolFilterLoader` scales every symbol's `taker_bps` by `(1 - pct/100)` at load, so
-    a 5.0 bps leg → 2.5 bps at 50 %, while an already-0.0 bps leg (USDC/USD1 pairs) stays 0. **The
-    tier is unverified** (MEXC-PAIR-EXPANSION.md §2 says 50 %, also discussed as 20 %) and it moves
-    `EdgeCalculator`'s inputs, so it ships OFF — the operator sets it once ≥ 500 MX is actually held.
-    A value outside `[0, 100)` fails the boot.
+  - **MX-token fee discount (T9):** `cf-bot.fees.taker-discount-pct`, set to **`50.0`**.
+    `SymbolFilterLoader` scales every symbol's `taker_bps` by `(1 - pct/100)` at load, so a 5.0 bps
+    standard USDT leg → 2.5 bps, `GOLD(XAUT)USD1` 1.0 → 0.5, and an already-0.0 bps leg (every
+    USDC/USD1 pair, `XRPUSDT`, `USDCUSDT`) stays 0. **Tier verified 2026-09-10 against MEXC's own
+    fee pages:** standard spot taker 0.05 %; holding ≥ 500 MX for 24 h → **50 %** discount →
+    0.025 %. (The separate, non-stackable "MX Deduction" feature is 20 %; MEXC auto-applies the
+    greater, so a ≥ 500 MX holder gets 50 %.) **Assumes the trading account holds ≥ 500 MX** — drop
+    to `20.0` if only MX Deduction is enabled, `0.0` for undiscounted. Value outside `[0, 100)`
+    fails the boot. Flows through `SymbolFilter` into both `EdgeCalculator` (`gross_bps`) and
+    `Sizer` (`net_bps`).
   - **Still deferred from the task:** T1e (real book fix), T6 (per-symbol `max-book-age-ms`),
     T7 (`config_snapshot` event), T8 (`Sizer` solves for size — gated on a plan §5.3 update + a T4
     capture), T10 (triangle-universe pruning), T11 (`min-net-bps` / `slippage-buffer-bps` — operator,
