@@ -79,6 +79,50 @@ public class BotApiResource {
         return out;
     }
 
+    /**
+     * JOURNAL-TUNING-TASK.md T1a: per-symbol L2 book state — plan §8's unimplemented "per-symbol
+     * book age" field, plus the crossed/trusted/empty predicates and top-of-book so an operator can
+     * see WHICH predicate is false for a triangle whose {@code booksReady} is false. A negative
+     * {@code spreadBps} is the {@code BTCUSDT} crossed-latch (§5.5) directly visible. Read-only, on
+     * the Quarkus HTTP worker thread — the same advisory cross-thread read {@code /triangles}
+     * already performs (see {@link L2Book}'s javadoc); no new hand-off.
+     */
+    @GET
+    @Path("/books")
+    public Map<String, Object> booksState() {
+        BookRegistry books = botService.bookRegistry();
+        long nowNanos = System.nanoTime();
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (int i = 0; i < books.symbolCount(); i++) {
+            L2Book book = books.book(i);
+            long topBid = book.bestBidPx();
+            long topAsk = book.bestAskPx();
+            boolean haveTop = topBid != Long.MIN_VALUE && topAsk != Long.MIN_VALUE;
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("trusted", book.isTrusted());
+            row.put("crossed", book.isCrossed());
+            row.put("empty", book.isEmpty());
+            row.put("ageMs", book.ageNanos(nowNanos) / 1_000_000.0);
+            row.put("updateCount", book.updateCount());
+            row.put("bidCount", book.bidLevelCount());
+            row.put("askCount", book.askLevelCount());
+            row.put("topBid", haveTop ? FixedPoint.toDouble(topBid) : null);
+            row.put("topAsk", haveTop ? FixedPoint.toDouble(topAsk) : null);
+            row.put("spreadBps", haveTop ? spreadBps(topBid, topAsk) : null);
+            row.put("crossedForMs", book.crossedForNanos(nowNanos) / 1_000_000.0);
+            row.put("selfHealResets", book.crossedResetCount());
+            out.put(books.symbol(i), row);
+        }
+        return out;
+    }
+
+    private static double spreadBps(long topBidFixed, long topAskFixed) {
+        double bid = FixedPoint.toDouble(topBidFixed);
+        double ask = FixedPoint.toDouble(topAskFixed);
+        double mid = (bid + ask) / 2.0;
+        return mid == 0 ? 0.0 : (ask - bid) / mid * 10_000.0;
+    }
+
     @GET
     @Path("/config")
     public Map<String, Object> effectiveConfig() {

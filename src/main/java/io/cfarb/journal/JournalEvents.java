@@ -30,14 +30,72 @@ public final class JournalEvents {
      * {@code null} when {@code NaN} (e.g. an unfillable candidate has no {@code net_bps}). */
     public static String opportunity(String triangleName, double netBps, double grossBps, long notionalFixed,
                                       boolean fired, String rejectReason) {
-        return "{\"type\":\"opportunity\",\"ts_us\":" + EpochMicros.now()
-                + ",\"triangle\":\"" + esc(triangleName) + "\""
-                + ",\"net_bps\":" + jsonNumber(netBps)
-                + ",\"gross_bps\":" + jsonNumber(grossBps)
-                + ",\"notional_usd\":" + io.cfarb.util.FixedPoint.toDouble(notionalFixed)
-                + ",\"fired\":" + fired
-                + (rejectReason != null ? ",\"reject_reason\":\"" + esc(rejectReason) + "\"" : "")
+        return opportunity(triangleName, netBps, grossBps, notionalFixed, fired, rejectReason, 0,
+                null, null, null, null);
+    }
+
+    /**
+     * Rich form (JOURNAL-TUNING-TASK.md T2 + T4).
+     *
+     * <p><b>T2 — {@code sampled_from}:</b> when {@code > 0}, the number of detector evaluations this
+     * one line summarises. {@code OpportunityDetector} now keeps the BEST (highest {@code net_bps};
+     * for {@code unfillable}, highest {@code gross_bps}) reject per {@code reject-sample-ms} window
+     * instead of the first, so the tail — the only part that matters for tuning — stops being
+     * invisible (JOURNAL-BPS-ANALYSIS.md §9.1: 97 % of evaluations were discarded as a uniform
+     * sample).
+     *
+     * <p><b>T4 — per-leg depth:</b> when the four {@code leg*Fixed} arrays are non-null (each
+     * length 3, index = leg 0..2) the event carries, per leg: top-of-book price, available quantity
+     * AT the touch, the worst price the VWAP walk reached, and the quantized base quantity. Flat
+     * arrays of plain numbers (not nested objects) to bound the line size. Lets a notebook compute
+     * "largest notional that stays inside the touch" for every sample without re-running the bot
+     * (JOURNAL-BPS-ANALYSIS.md §9.2). Only built on the sampled/fired path — never for a suppressed
+     * candidate.
+     */
+    public static String opportunity(String triangleName, double netBps, double grossBps, long notionalFixed,
+                                      boolean fired, String rejectReason, int sampledFrom,
+                                      long[] legTopPxFixed, long[] legTouchQtyFixed,
+                                      long[] legWorstPxFixed, long[] legBaseQtyFixed) {
+        StringBuilder sb = new StringBuilder(160);
+        sb.append("{\"type\":\"opportunity\",\"ts_us\":").append(EpochMicros.now())
+                .append(",\"triangle\":\"").append(esc(triangleName)).append('"')
+                .append(",\"net_bps\":").append(jsonNumber(netBps))
+                .append(",\"gross_bps\":").append(jsonNumber(grossBps))
+                .append(",\"notional_usd\":").append(io.cfarb.util.FixedPoint.toDouble(notionalFixed))
+                .append(",\"fired\":").append(fired);
+        if (rejectReason != null) {
+            sb.append(",\"reject_reason\":\"").append(esc(rejectReason)).append('"');
+        }
+        if (sampledFrom > 0) {
+            sb.append(",\"sampled_from\":").append(sampledFrom);
+        }
+        if (legTopPxFixed != null && legTouchQtyFixed != null
+                && legWorstPxFixed != null && legBaseQtyFixed != null) {
+            sb.append(",\"leg_top_px\":").append(jsonArr3(legTopPxFixed));
+            sb.append(",\"leg_touch_qty\":").append(jsonArr3(legTouchQtyFixed));
+            sb.append(",\"leg_worst_px\":").append(jsonArr3(legWorstPxFixed));
+            sb.append(",\"leg_base_qty\":").append(jsonArr3(legBaseQtyFixed));
+        }
+        return sb.append('}').toString();
+    }
+
+    /** JOURNAL-TUNING-TASK.md T1c: a crossed L2 book was force-reset by the self-heal path. */
+    public static String bookReset(String symbol, String reason, long topBidFixed, long topAskFixed,
+                                    long updateCount, double crossedForMs) {
+        return "{\"type\":\"book_reset\",\"ts_us\":" + EpochMicros.now()
+                + ",\"symbol\":\"" + esc(symbol) + "\""
+                + ",\"reason\":\"" + esc(reason) + "\""
+                + ",\"top_bid\":" + io.cfarb.util.FixedPoint.toDouble(topBidFixed)
+                + ",\"top_ask\":" + io.cfarb.util.FixedPoint.toDouble(topAskFixed)
+                + ",\"update_count\":" + updateCount
+                + ",\"crossed_for_ms\":" + crossedForMs
                 + "}";
+    }
+
+    private static String jsonArr3(long[] a) {
+        return "[" + io.cfarb.util.FixedPoint.toDouble(a[0]) + ","
+                + io.cfarb.util.FixedPoint.toDouble(a[1]) + ","
+                + io.cfarb.util.FixedPoint.toDouble(a[2]) + "]";
     }
 
     public static String cycle(String triangleName, long notionalFixed, double detectedNetBps,

@@ -26,6 +26,15 @@ import org.jctools.queues.SpscArrayQueue;
  */
 public final class OpportunityDetector {
 
+    /** JOURNAL-TUNING-TASK.md T2 reject-reason codes, stored in a primitive array so the pending
+     * window best carries no {@code String} until it is actually emitted. */
+    private static final int REASON_UNFILLABLE = 0;
+    private static final int REASON_BELOW_THRESHOLD = 1;
+    /** DUPLICATE-FIRE-TASK.md ("Fix A"): a candidate that cleared the threshold but whose fire
+     * signature is unchanged since the triangle's last fire — the book has not rewritten the
+     * liquidity that fire aimed at, so re-firing would only race depth that is being consumed. */
+    private static final int REASON_DUPLICATE = 2;
+
     private final BookRegistry books;
     private final TriangleRegistry triangles;
     private final RiskGates riskGates;
@@ -38,16 +47,49 @@ public final class OpportunityDetector {
     private final double slippageBufferBps;
     private final boolean compound;
     private final long seedFixed;
-    private final long maxNotionalFixed;
 
     private final EdgeCalculator edgeCalculator = new EdgeCalculator();
     private final EdgeCalculator.Result edgeResult = new EdgeCalculator.Result();
 
-    /** Third-pass review finding: per-triangle timestamp of the last REJECT journaled, so the
-     * reject stream is sampled rather than emitted at full feed rate. See {@link #journalReject}.
-     * Detector-thread-only, like every other counter here -- no synchronization. */
-    private final long[] lastRejectJournalNanos;
     private final long rejectJournalIntervalNanos;
+
+    // --- JOURNAL-TUNING-TASK.md T2: per-triangle running-best reject inside each sample window ---
+    // Detector-thread-only, like every counter here -- no synchronization. Emitted (one NDJSON line
+    // summarising the whole window) edge-triggered by the first candidate AFTER the window expires;
+    // a triangle that goes quiet holds its last window unemitted, which is acceptable -- the line
+    // carries sampled_from so a reader knows how many ticks it represents.
+    private final long[] windowStartNanos;
+    private final int[] pendingSampledFrom;
+    private final boolean[] pendingFillable;
+    private final double[] pendingNetBps;
+    private final double[] pendingGrossBps;
+    private final long[] pendingNotional;
+    private final int[] pendingReason;
+    // T4 per-leg depth, flat [triangleIndex*3 + leg] -- snapshotted from edgeResult whenever a
+    // candidate becomes the new window best.
+    private final long[] pendingLegTopPx;
+    private final long[] pendingLegTouchQty;
+    private final long[] pendingLegWorstPx;
+    private final long[] pendingLegBaseQty;
+    // Reusable length-3 scratch for handing one triangle's leg slice to JournalEvents on emit --
+    // allocated once, never on a per-candidate path.
+    private final long[] emitLegTopPx = new long[3];
+    private final long[] emitLegTouchQty = new long[3];
+    private final long[] emitLegWorstPx = new long[3];
+    private final long[] emitLegBaseQty = new long[3];
+
+    // --- DUPLICATE-FIRE-TASK.md ("Fix A"): per-triangle last-fired signature ------------------
+    // Detector-thread-only, like every array here -- no synchronization. Flat [triangleIndex*3 + leg]
+    // for the three per-leg components; one boolean per triangle marks whether a signature has been
+    // stored yet (a triangle that has never fired can never be a "duplicate"). Stored ONLY after a
+    // successful orderQueue.offer() -- an intent that could not be enqueued is rolled back via
+    // riskGates.onCycleFinished() and must stay re-fireable. No TTL: the signature is replaced only
+    // when a DIFFERENT one fires, and L2Book.writeSeq being monotonic-across-reset means a re-warmed
+    // book always produces a strictly-higher stamp, so explicit clearing is unnecessary.
+    private final long[] lastFiredWorstPx;
+    private final long[] lastFiredBaseQty;
+    private final long[] lastFiredWriteSeq;
+    private final boolean[] hasFiredSignature;
 
     public OpportunityDetector(BookRegistry books, TriangleRegistry triangles, RiskGates riskGates,
                                 Portfolio portfolio, BotMetrics metrics, EventJournal journal,
@@ -65,13 +107,29 @@ public final class OpportunityDetector {
         this.slippageBufferBps = slippageBufferBps;
         this.compound = compound;
         this.seedFixed = portfolio.seed();
-        this.maxNotionalFixed = io.cfarb.util.FixedPoint.fromDouble(riskGates.effectiveMaxNotionalUsd);
         this.rejectJournalIntervalNanos = rejectJournalIntervalMs * 1_000_000L;
-        this.lastRejectJournalNanos = new long[Math.max(1, triangles.triangleCount())];
+
+        int n = Math.max(1, triangles.triangleCount());
+        this.windowStartNanos = new long[n];
+        this.pendingSampledFrom = new int[n];
+        this.pendingFillable = new boolean[n];
+        this.pendingNetBps = new double[n];
+        this.pendingGrossBps = new double[n];
+        this.pendingNotional = new long[n];
+        this.pendingReason = new int[n];
+        this.pendingLegTopPx = new long[n * 3];
+        this.pendingLegTouchQty = new long[n * 3];
+        this.pendingLegWorstPx = new long[n * 3];
+        this.pendingLegBaseQty = new long[n * 3];
+        this.lastFiredWorstPx = new long[n * 3];
+        this.lastFiredBaseQty = new long[n * 3];
+        this.lastFiredWriteSeq = new long[n * 3];
+        this.hasFiredSignature = new boolean[n];
         // Same "0 is not a safe never-happened sentinel" reasoning as RiskGates' cooldown array:
-        // nanoTime's origin is arbitrary per JVM. Seed far enough in the past that the FIRST reject
-        // for every triangle is always journaled, while staying clear of subtraction overflow.
-        java.util.Arrays.fill(lastRejectJournalNanos, Long.MIN_VALUE / 2);
+        // nanoTime's origin is arbitrary per JVM. pendingSampledFrom==0 already means "no window
+        // open", so windowStartNanos only matters once a window is open -- but seed it clear of
+        // subtraction overflow anyway.
+        java.util.Arrays.fill(windowStartNanos, Long.MIN_VALUE / 2);
     }
 
     /** Called after {@code symbolIndex}'s book has just been updated. {@code nowNanos} must be
@@ -85,17 +143,22 @@ public final class OpportunityDetector {
 
     private void evaluate(int triangleIndex, long nowNanos) {
         Triangle tri = triangles.triangle(triangleIndex);
-        if (!allLegsFresh(tri, nowNanos)) {
+        int staleLeg = firstStaleLeg(tri, nowNanos);
+        if (staleLeg >= 0) {
+            // JOURNAL-TUNING-TASK.md T3: the single most common evaluate() outcome, previously
+            // silent -- §5's whole duty-cycle analysis had to be reconstructed from absent rows.
+            metrics.recordDetectorStaleSkip(triangleIndex);
+            metrics.recordDetectorStaleSkipLeg(tri.symbolIndex()[staleLeg]);
             return; // fail closed: a stale/crossed/untrusted leg never reaches EdgeCalculator (S5)
         }
 
-        // cf-arb-bot-review-plan.md Tier 2 step 2.7: the previous version always sized at the FULL
-        // current equity and simply stopped firing once that exceeded max-notional-usd -- with a
-        // $100 seed and a $200 cap, compounding past $200 silently halted the bot entirely instead
-        // of sizing down. Size at min(eligible anchor balance, max-notional); compound=false pins
-        // the eligible balance to the original seed rather than the compounding equity.
+        // cf-arb-bot-review-plan.md Tier 2 step 2.7: size at min(eligible anchor balance, cap);
+        // compound=false pins the eligible balance to the original seed rather than the compounding
+        // equity. JOURNAL-TUNING-TASK.md T5: the cap is now per-triangle (defaults to the global
+        // cf-bot.risk.max-notional-usd), so a thin cross triangle can be sized smaller than a deep
+        // one -- JOURNAL-BPS-ANALYSIS.md §3.1 measured drag scaling ~linearly with size.
         long eligibleBalance = compound ? portfolio.equity() : seedFixed;
-        long candidateNotional = Math.min(eligibleBalance, maxNotionalFixed);
+        long candidateNotional = Math.min(eligibleBalance, triangles.maxNotionalFixed(triangleIndex));
         if (!riskGates.canFire(triangleIndex, candidateNotional, nowNanos)) {
             return;
         }
@@ -103,19 +166,31 @@ public final class OpportunityDetector {
         edgeCalculator.evaluate(tri, books, candidateNotional, edgeResult);
         if (!edgeResult.fillable) {
             metrics.recordOpportunityRejectedUnfillable();
-            // cf-arb-bot-review-plan.md Tier 2 step 2.6 / plan §8: "the rejects are the interesting
-            // half" -- but SAMPLED, not one line per candidate per frame (see journalReject).
-            // netBps is NaN here (no fill), but grossBps still carries the top-of-book edge so an
-            // "unfillable" reject is distinguishable from "no edge at all".
-            journalReject(triangleIndex, tri.name(), Double.NaN, edgeResult.grossBps, candidateNotional,
-                    "unfillable", nowNanos);
+            journalReject(triangleIndex, tri.name(), false, Double.NaN, edgeResult.grossBps,
+                    candidateNotional, REASON_UNFILLABLE, nowNanos);
             return; // top-of-book may have looked good, but the real ladder/lot-size can't fill it
         }
         metrics.recordOpportunityDetected();
         if (edgeResult.netBps <= minNetBps + slippageBufferBps) {
-            journalReject(triangleIndex, tri.name(), edgeResult.netBps, edgeResult.grossBps,
-                    candidateNotional, "below-threshold", nowNanos);
+            journalReject(triangleIndex, tri.name(), true, edgeResult.netBps, edgeResult.grossBps,
+                    candidateNotional, REASON_BELOW_THRESHOLD, nowNanos);
             return; // real edge doesn't clear threshold + slippage buffer
+        }
+
+        // DUPLICATE-FIRE-TASK.md ("Fix A"): refuse to re-fire a triangle while the liquidity this
+        // order would consume is the liquidity the last fire consumed -- same per-leg worst price,
+        // base qty, AND book write stamp. Placed AFTER the threshold test and BEFORE
+        // riskGates.claim(), matching canFire()'s non-claiming pre-check contract: a suppressed
+        // duplicate must not burn cooldown or rate-limit budget. In dry-run the paper fill never
+        // consumes depth, so the book keeps offering the identical edge; in live mode the venue's
+        // depth push lags a fill by 14-41ms, so a re-fire on the same signature prices leg 0 at a
+        // boundary that no longer exists and tends to break -- and a broken cycle costs ~13x a
+        // winning one (JOURNAL-BPS-ANALYSIS.md §12-15).
+        if (hasFiredSignature[triangleIndex] && fireSignatureUnchanged(triangleIndex)) {
+            metrics.recordDuplicateFireSuppressed(triangleIndex);
+            journalReject(triangleIndex, tri.name(), true, edgeResult.netBps, edgeResult.grossBps,
+                    candidateNotional, REASON_DUPLICATE, nowNanos);
+            return;
         }
 
         // Claim the fire slot NOW, immediately before handing off -- canFire() above is a
@@ -130,50 +205,156 @@ public final class OpportunityDetector {
             riskGates.onCycleFinished(); // roll back the claim -- we couldn't even enqueue it
             metrics.recordOrderQueueDrop();
             journal.write(JournalEvents.opportunity(tri.name(), edgeResult.netBps, edgeResult.grossBps,
-                    candidateNotional, false, "order-queue-full"));
+                    candidateNotional, false, "order-queue-full", 0,
+                    edgeResult.legTopPriceFixed, edgeResult.legTouchQtyFixed,
+                    edgeResult.legWorstPriceFixed, edgeResult.legBaseQtyFixed));
             return;
         }
         metrics.recordOpportunityFired();
+        // DUPLICATE-FIRE-TASK.md: store the signature ONLY now that the intent is actually enqueued
+        // -- the queue-full branch above rolled the claim back and must stay re-fireable.
+        storeFireSignature(triangleIndex);
         journal.write(JournalEvents.opportunity(tri.name(), edgeResult.netBps, edgeResult.grossBps,
-                candidateNotional, true, null));
+                candidateNotional, true, null, 0,
+                edgeResult.legTopPriceFixed, edgeResult.legTouchQtyFixed,
+                edgeResult.legWorstPriceFixed, edgeResult.legBaseQtyFixed));
     }
 
-    /**
-     * Journal a REJECTED candidate, at most once per triangle per {@code cf-bot.journal.reject-sample-ms}.
-     *
-     * <p><b>Third-pass review finding.</b> Every candidate that clears the cheap risk gates reaches
-     * one of the two reject paths, and {@code canFire}'s per-triangle cooldown only advances on
-     * {@link RiskGates#claim} — so a triangle that never fires was writing a journal line on EVERY
-     * book update it touched. At the measured feed rate (aggre.depth@10ms, 14-41ms per symbol) over
-     * ~12 symbols and ~14 triangles that is roughly 1k+ lines/second, ~10 GB/day against a 20 GB root
-     * volume — in dry-run, the default mode. It also put ~1k {@code String} allocations/second
-     * (JournalEvents' formatting) on the Netty event-loop thread, which rule R1 forbids outright.
-     *
-     * <p>Fires and genuine anomalies (order-queue-full) stay UNSAMPLED — they are rare by
-     * construction and are the events an operator actually reconstructs a session from. Suppressed
-     * rejects are counted ({@code cfarb.journal.suppressed}), never silently dropped:
-     * recorder-service non-negotiable #2, "a dropped frame that isn't counted is a lie."
-     */
-    private void journalReject(int triangleIndex, String name, double netBps, double grossBps,
-                                long candidateNotional, String reason, long nowNanos) {
-        if (nowNanos - lastRejectJournalNanos[triangleIndex] < rejectJournalIntervalNanos) {
-            metrics.recordJournalSuppressed();
-            return;
-        }
-        lastRejectJournalNanos[triangleIndex] = nowNanos;
-        journal.write(JournalEvents.opportunity(name, netBps, grossBps, candidateNotional, false, reason));
-    }
-
-    private boolean allLegsFresh(Triangle tri, long nowNanos) {
-        for (int symbolIndex : tri.symbolIndex()) {
-            L2Book book = books.book(symbolIndex);
-            if (!book.isTrusted() || book.isEmpty() || book.isCrossed()) {
-                return false;
-            }
-            if (!riskGates.isBookFresh(book.ageNanos(nowNanos))) {
+    /** DUPLICATE-FIRE-TASK.md: true iff the current {@link #edgeResult} matches the stored
+     * last-fired signature for {@code triangleIndex} on ALL three legs (worst price, base qty, and
+     * book write stamp). Caller must have checked {@link #hasFiredSignature} first. */
+    private boolean fireSignatureUnchanged(int triangleIndex) {
+        int base = triangleIndex * 3;
+        for (int leg = 0; leg < 3; leg++) {
+            if (lastFiredWorstPx[base + leg] != edgeResult.legWorstPriceFixed[leg]
+                    || lastFiredBaseQty[base + leg] != edgeResult.legBaseQtyFixed[leg]
+                    || lastFiredWriteSeq[base + leg] != edgeResult.legWriteSeq[leg]) {
                 return false;
             }
         }
         return true;
+    }
+
+    private void storeFireSignature(int triangleIndex) {
+        int base = triangleIndex * 3;
+        for (int leg = 0; leg < 3; leg++) {
+            lastFiredWorstPx[base + leg] = edgeResult.legWorstPriceFixed[leg];
+            lastFiredBaseQty[base + leg] = edgeResult.legBaseQtyFixed[leg];
+            lastFiredWriteSeq[base + leg] = edgeResult.legWriteSeq[leg];
+        }
+        hasFiredSignature[triangleIndex] = true;
+    }
+
+    /**
+     * Journal a REJECTED candidate — at most one NDJSON line per triangle per
+     * {@code cf-bot.journal.reject-sample-ms}, carrying the BEST candidate seen in that window
+     * (JOURNAL-TUNING-TASK.md T2) plus {@code sampled_from} and per-leg depth (T4).
+     *
+     * <p><b>Why the change.</b> The previous form kept the FIRST reject in each window and dropped
+     * the rest — a uniform ~1 Hz sample of a ~300/s stream, so every peak was invisible
+     * (JOURNAL-BPS-ANALYSIS.md §9.1: 97.1 % of evaluations discarded). Tuning needs the tail. Same
+     * line count, same file size; the running best lives in the primitive arrays above, no object
+     * per candidate and no {@code String} formatting until a window actually closes.
+     *
+     * <p>Suppressed rejects are still counted ({@code cfarb.journal.suppressed}) — the first
+     * candidate of a window is the provisional keep and is not counted as suppressed, every
+     * subsequent one folded into the window best is, exactly mirroring the old first-vs-rest
+     * semantics (recorder-service non-negotiable #2: a dropped frame that isn't counted is a lie).
+     */
+    private void journalReject(int triangleIndex, String name, boolean fillable, double netBps,
+                               double grossBps, long candidateNotional, int reason, long nowNanos) {
+        if (rejectJournalIntervalNanos <= 0) {
+            // Sampling disabled: journal every reject immediately (only sane for short local captures).
+            emitNow(name, fillable, netBps, grossBps, candidateNotional, reason, 1);
+            return;
+        }
+        if (pendingSampledFrom[triangleIndex] == 0) {
+            windowStartNanos[triangleIndex] = nowNanos;
+            setPending(triangleIndex, fillable, netBps, grossBps, candidateNotional, reason);
+            pendingSampledFrom[triangleIndex] = 1;
+            return;
+        }
+        if (nowNanos - windowStartNanos[triangleIndex] >= rejectJournalIntervalNanos) {
+            emitPending(triangleIndex, name);
+            windowStartNanos[triangleIndex] = nowNanos;
+            setPending(triangleIndex, fillable, netBps, grossBps, candidateNotional, reason);
+            pendingSampledFrom[triangleIndex] = 1;
+            return;
+        }
+        if (isBetterThanPending(triangleIndex, fillable, netBps, grossBps)) {
+            setPending(triangleIndex, fillable, netBps, grossBps, candidateNotional, reason);
+        }
+        pendingSampledFrom[triangleIndex]++;
+        metrics.recordJournalSuppressed();
+    }
+
+    /** A fillable (below-threshold) candidate always beats an unfillable one — it is strictly
+     * closer to firing. Within the same fillability, rank by the metric that matters: {@code netBps}
+     * for a fillable candidate, {@code grossBps} for an unfillable one (which has no {@code netBps}). */
+    private boolean isBetterThanPending(int tri, boolean fillable, double netBps, double grossBps) {
+        boolean pf = pendingFillable[tri];
+        if (fillable != pf) {
+            return fillable;
+        }
+        return fillable ? netBps > pendingNetBps[tri] : grossBps > pendingGrossBps[tri];
+    }
+
+    private void setPending(int tri, boolean fillable, double netBps, double grossBps,
+                            long notional, int reason) {
+        pendingFillable[tri] = fillable;
+        pendingNetBps[tri] = netBps;
+        pendingGrossBps[tri] = grossBps;
+        pendingNotional[tri] = notional;
+        pendingReason[tri] = reason;
+        int base = tri * 3;
+        System.arraycopy(edgeResult.legTopPriceFixed, 0, pendingLegTopPx, base, 3);
+        System.arraycopy(edgeResult.legTouchQtyFixed, 0, pendingLegTouchQty, base, 3);
+        System.arraycopy(edgeResult.legWorstPriceFixed, 0, pendingLegWorstPx, base, 3);
+        System.arraycopy(edgeResult.legBaseQtyFixed, 0, pendingLegBaseQty, base, 3);
+    }
+
+    private void emitPending(int tri, String name) {
+        int base = tri * 3;
+        System.arraycopy(pendingLegTopPx, base, emitLegTopPx, 0, 3);
+        System.arraycopy(pendingLegTouchQty, base, emitLegTouchQty, 0, 3);
+        System.arraycopy(pendingLegWorstPx, base, emitLegWorstPx, 0, 3);
+        System.arraycopy(pendingLegBaseQty, base, emitLegBaseQty, 0, 3);
+        journal.write(JournalEvents.opportunity(name, pendingNetBps[tri], pendingGrossBps[tri],
+                pendingNotional[tri], false, reasonString(pendingReason[tri]), pendingSampledFrom[tri],
+                emitLegTopPx, emitLegTouchQty, emitLegWorstPx, emitLegBaseQty));
+        pendingSampledFrom[tri] = 0;
+    }
+
+    /** Sampling-disabled path (interval 0): the current candidate is written as its own line. */
+    private void emitNow(String name, boolean fillable, double netBps, double grossBps,
+                         long notional, int reason, int sampledFrom) {
+        journal.write(JournalEvents.opportunity(name, netBps, grossBps, notional, false,
+                reasonString(reason), sampledFrom,
+                edgeResult.legTopPriceFixed, edgeResult.legTouchQtyFixed,
+                edgeResult.legWorstPriceFixed, edgeResult.legBaseQtyFixed));
+    }
+
+    private static String reasonString(int reason) {
+        return switch (reason) {
+            case REASON_UNFILLABLE -> "unfillable";
+            case REASON_DUPLICATE -> "duplicate-signature";
+            default -> "below-threshold";
+        };
+    }
+
+    /** JOURNAL-TUNING-TASK.md T3: returns the index (0..2) of the first leg that is stale /
+     * untrusted / empty / crossed, or -1 if every leg is fresh. */
+    private int firstStaleLeg(Triangle tri, long nowNanos) {
+        int[] symbolIndex = tri.symbolIndex();
+        for (int leg = 0; leg < 3; leg++) {
+            L2Book book = books.book(symbolIndex[leg]);
+            if (!book.isTrusted() || book.isEmpty() || book.isCrossed()) {
+                return leg;
+            }
+            if (!riskGates.isBookFresh(book.ageNanos(nowNanos))) {
+                return leg;
+            }
+        }
+        return -1;
     }
 }

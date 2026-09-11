@@ -120,6 +120,7 @@ class CycleExecutorTest {
                 new BotConfig.TriangleConfig() {
                     public boolean enabled() { return true; }
                     public List<String> legs() { return List.of("BTCUSDT:ASK", "XRPBTC:ASK", "XRPUSDT:BID"); }
+                    public java.util.OptionalDouble maxNotionalUsd() { return java.util.OptionalDouble.empty(); }
                 });
         io.cfarb.book.BookRegistry books = new io.cfarb.book.BookRegistry(
                 List.of("BTCUSDT", "XRPBTC", "XRPUSDT"), 1, 0);

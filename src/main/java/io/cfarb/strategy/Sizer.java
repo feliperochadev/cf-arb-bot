@@ -42,6 +42,12 @@ public final class Sizer {
          * 1e8-fixed quote-asset units -- kept alongside {@link #baseQtyFixed} so the executor never
          * needs to re-derive one from the other via a boundary-price division. */
         public long quoteFixed;
+        /** DUPLICATE-FIRE-TASK.md ("Fix A"): the highest {@link L2Book} write stamp across EVERY
+         * ladder level this walk consumed -- not just the worst. A rewrite at any consumed depth
+         * must invalidate a fire signature, so the detector compares this alongside
+         * {@link #worstPriceFixed} / {@link #baseQtyFixed} to decide "is the liquidity I am about to
+         * trade the liquidity I just traded". */
+        public long maxWriteSeq;
     }
 
     /**
@@ -63,6 +69,7 @@ public final class Sizer {
         out.worstPriceFixed = 0;
         out.baseQtyFixed = 0;
         out.quoteFixed = 0;
+        out.maxWriteSeq = 0;
         if (inputAmount <= 0) {
             return;
         }
@@ -78,6 +85,7 @@ public final class Sizer {
         long baseFilled = 0;
         long quoteSpent = 0;
         long worstPrice = 0;
+        long maxWriteSeq = 0;
         int n = book.askLevelCount();
         for (int i = 0; i < n && quoteSpent < quoteBudget; i++) {
             long price = book.askPxAt(i);
@@ -92,6 +100,8 @@ public final class Sizer {
                 quoteSpent = quoteBudget;
             }
             worstPrice = price;
+            // DUPLICATE-FIRE-TASK.md: one long compare-and-store per level already being visited.
+            maxWriteSeq = Math.max(maxWriteSeq, book.askWriteSeqAt(i));
         }
         if (quoteSpent < quoteBudget) {
             return; // the displayed ladder can't fully absorb the intended size — reject, don't partial-fill
@@ -125,6 +135,7 @@ public final class Sizer {
         out.worstPriceFixed = worstPrice;
         out.baseQtyFixed = baseFilled;
         out.quoteFixed = actualQuoteNotional;
+        out.maxWriteSeq = maxWriteSeq;
         out.outputAmount = FixedPoint.mulDiv(baseFilled, filter.takerFeeMultiplierFixed(), FixedPoint.SCALE);
         out.filled = true;
     }
@@ -138,6 +149,7 @@ public final class Sizer {
         long sold = 0;
         long quoteReceived = 0;
         long worstPrice = 0;
+        long maxWriteSeq = 0;
         int n = book.bidLevelCount();
         for (int i = 0; i < n && sold < qtyToSell; i++) {
             long price = book.bidPxAt(i);
@@ -147,6 +159,8 @@ public final class Sizer {
             sold += take;
             quoteReceived += FixedPoint.mulDiv(price, take, FixedPoint.SCALE);
             worstPrice = price;
+            // DUPLICATE-FIRE-TASK.md: track the highest write stamp across every consumed bid level.
+            maxWriteSeq = Math.max(maxWriteSeq, book.bidWriteSeqAt(i));
         }
         if (sold < qtyToSell || quoteReceived < filter.minNotional()) {
             return; // insufficient displayed depth to fill the intended (quantized) size
@@ -154,6 +168,7 @@ public final class Sizer {
         out.worstPriceFixed = worstPrice;
         out.baseQtyFixed = qtyToSell;
         out.quoteFixed = quoteReceived;
+        out.maxWriteSeq = maxWriteSeq;
         out.outputAmount = FixedPoint.mulDiv(quoteReceived, filter.takerFeeMultiplierFixed(), FixedPoint.SCALE);
         out.filled = true;
     }

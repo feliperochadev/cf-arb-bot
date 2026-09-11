@@ -95,13 +95,21 @@ public class BotService {
     private long clockSkewToleranceNanos;
     private int consecutiveFeedDeadDetections; // Vert.x event-loop thread only -- single timer callback
     private BotMetrics.Snapshot lastActivitySnapshot; // Vert.x timer thread only -- console-report cadence
+    // JOURNAL-TUNING-TASK.md T1b/T1c: feed-watchdog-timer-thread-only state for the crossed-book
+    // WARN (one per episode) and for journaling the self-heal resets L2Book.apply() performs.
+    private boolean[] bookCrossedWarned;
+    private long[] lastSeenCrossedResetCount;
 
     void onStart(@Observes StartupEvent ev) {
         logStartupSafetyBanner();
 
         Map<String, SymbolFilter> filters = loadFilters();
-        this.books = new BookRegistry(config.symbols(), WARMUP_UPDATES, WARMUP_SECONDS);
+        long maxCrossedMs = resolveMaxCrossedMs();
+        this.books = new BookRegistry(config.symbols(), WARMUP_UPDATES, WARMUP_SECONDS, maxCrossedMs);
         this.triangles = new TriangleRegistry(config, books, filters);
+        this.bookCrossedWarned = new boolean[books.symbolCount()];
+        this.lastSeenCrossedResetCount = new long[books.symbolCount()];
+        metrics.initRuntimeCounters(triangles.triangleNames(), config.symbols());
         LOG.infof("loaded %d triangles across %d symbols", triangles.triangleCount(), books.symbolCount());
 
         boolean dryRun = config.dryRun();
@@ -364,7 +372,47 @@ public class BotService {
             if (wsClient.isChurning()) {
                 killSwitch.recordFeedUnhealthy("connection-churning");
             }
+
+            scanBooksForCrossState(nowNanos);
         });
+    }
+
+    /**
+     * JOURNAL-TUNING-TASK.md T1b/T1c. The crossed-latch DETECTION and the {@code reset()} both live
+     * on the Netty event-loop thread inside {@code L2Book.apply()} (the book's owning thread — a
+     * cross-thread {@code reset()} from here would race the level arrays, breaking L2Book's
+     * single-writer invariant / non-negotiable #5). This timer only OBSERVES: it emits one WARN per
+     * crossed episode (rate-limited by {@link #bookCrossedWarned}) and journals a {@code book_reset}
+     * event whenever a book's self-heal counter advances. Same advisory cross-thread reads the feed
+     * watchdog already makes of {@code updateCount()}/{@code ageNanos()} (see {@link L2Book}'s javadoc).
+     */
+    private void scanBooksForCrossState(long nowNanos) {
+        for (int i = 0; i < books.symbolCount(); i++) {
+            L2Book book = books.book(i);
+            boolean crossed = book.isCrossed();
+            if (crossed && !bookCrossedWarned[i]) {
+                bookCrossedWarned[i] = true;
+                metrics.recordBookCrossed(i);
+                LOG.warnf("*** book %s CROSSED: topBid=%.8f topAsk=%.8f updateCount=%d -- L2Book has "
+                                + "no in-place uncross; the crossed-latch self-heal will reset it after "
+                                + "cf-bot.book.max-crossed-ms if it persists (JOURNAL-BPS-ANALYSIS.md §5.5)",
+                        books.symbol(i), FixedPoint.toDouble(book.bestBidPx()),
+                        FixedPoint.toDouble(book.bestAskPx()), book.updateCount());
+            } else if (!crossed) {
+                bookCrossedWarned[i] = false;
+            }
+
+            long resets = book.crossedResetCount();
+            if (resets > lastSeenCrossedResetCount[i]) {
+                lastSeenCrossedResetCount[i] = resets;
+                metrics.recordBookReset(i, "crossed-latch");
+                journal.write(JournalEvents.bookReset(books.symbol(i), "crossed-latch",
+                        book.bestBidPx(), book.bestAskPx(), book.updateCount(),
+                        config.book().maxCrossedMs()));
+                LOG.warnf("book %s force-reset (crossed-latch self-heal, total resets=%d) -- re-warming",
+                        books.symbol(i), resets);
+            }
+        }
     }
 
     enum WatchdogAction { NONE, RECONNECT, RECONNECT_AND_TRIP }
@@ -492,22 +540,49 @@ public class BotService {
      * {@code config/mexc_filters.json} path meant the deployed service could never find this file --
      * Terraform never provisioned it, and systemd's WorkingDirectory would not have contained it). */
     private Map<String, SymbolFilter> loadFilters() {
+        // JOURNAL-TUNING-TASK.md T9: MX-token taker discount, applied to every symbol's bps at load.
+        double discountPct = config.fees().takerDiscountPct();
+        if (discountPct < 0 || discountPct >= 100) {
+            throw new IllegalStateException("cf-bot.fees.taker-discount-pct must be in [0, 100), got "
+                    + discountPct);
+        }
+        if (discountPct > 0) {
+            LOG.warnf("*** cf-bot.fees.taker-discount-pct=%.2f -- every symbol's taker fee in "
+                    + "mexc_filters.json is scaled by %.4f before EdgeCalculator sees it. Confirm the "
+                    + "operator actually holds >= 500 MX and the tier is really %.0f%% "
+                    + "(JOURNAL-TUNING-TASK.md T9)", discountPct, 1.0 - discountPct / 100.0, discountPct);
+        }
         try {
             if (config.filtersPath().isPresent()) {
-                return SymbolFilterLoader.load(Path.of(config.filtersPath().get()));
+                return SymbolFilterLoader.load(Path.of(config.filtersPath().get()), discountPct);
             }
             String resource = "/config/mexc_filters.json";
             try (InputStream in = BotService.class.getResourceAsStream(resource)) {
                 if (in == null) {
                     throw new IOException("classpath resource " + resource + " not found");
                 }
-                return SymbolFilterLoader.load(in, "classpath:" + resource);
+                return SymbolFilterLoader.load(in, "classpath:" + resource, discountPct);
             }
         } catch (IOException e) {
             throw new IllegalStateException("cannot load mexc_filters.json -- run the Gate 0 "
                     + "exchangeInfo fetch first (cf-arb-bot-plan.md §3 step 2/3), or set "
                     + "cf-bot.filters-path to a freshly re-fetched snapshot", e);
         }
+    }
+
+    /** JOURNAL-TUNING-TASK.md T1c: {@code cf-bot.book.max-crossed-ms}. A non-positive value disables
+     * the crossed-latch self-heal and logs a prominent WARN — the operator has explicitly opted out
+     * of it, back to the pre-JOURNAL-TUNING permanent-latch behavior. */
+    private long resolveMaxCrossedMs() {
+        long ms = config.book().maxCrossedMs();
+        if (ms <= 0) {
+            LOG.warnf("*** cf-bot.book.max-crossed-ms=%d -- L2 book crossed-latch self-heal is "
+                    + "DISABLED. A book that crosses (JOURNAL-BPS-ANALYSIS.md §5.5) will stay "
+                    + "unusable until a version-chain gap forces a reset, which can be hours.", ms);
+            return 0;
+        }
+        LOG.infof("L2 book crossed-latch self-heal: reset after %dms crossed (cf-bot.book.max-crossed-ms)", ms);
+        return ms;
     }
 
     // Accessors for BotApiResource/ReadinessCheck (read-only).

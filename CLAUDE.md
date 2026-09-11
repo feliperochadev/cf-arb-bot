@@ -166,6 +166,80 @@ ever enters `recorder-service`.
     `EdgeCalculatorTest`'s cross-check against the Python pipeline cannot catch (both sides share the
     same `FixedPoint.SCALE` ceiling). This does not by itself prove a live discrepancy; the
     credentialed probe that would is still the open gap below.
+- **ADDED 2026-09-10 (JOURNAL-TUNING-TASK.md P0 — `JOURNAL-BPS-ANALYSIS.md` acted on):**
+  - **`L2Book` crossed-latch self-heal (T1c).** A crossed book (`bidPx[0] >= askPx[0]`) had no
+    in-place uncross — it stayed unusable until a version-chain gap forced a `reset()`, which the
+    24 h capture showed can be hours (§5.5: 17/17 sessions the BTCUSDT triangles die once and never
+    recover). `L2Book.apply()` now tracks `crossedSinceNanos` and, once a book has been crossed
+    longer than `cf-bot.book.max-crossed-ms` (default 500; `<= 0` disables + WARNs), force-`reset()`s
+    it **on the Netty thread inside `apply()`** — NOT from the watchdog timer, which cannot touch the
+    level arrays (single-writer invariant / non-negotiable #5). The feed watchdog only observes:
+    one rate-limited WARN per crossed episode (`cfarb.book.crossed{symbol}`) and a `book_reset`
+    journal event + `cfarb.book.reset{symbol,reason}` each time `crossedResetCount()` advances.
+    `GET /api/v1/books` (T1a) exposes per-symbol `trusted`/`crossed`/`empty`/`ageMs`/`spreadBps`/… —
+    a negative `spreadBps` is the latch directly visible. **The real fix (T1e: wider ladder / prune
+    by price distance / periodic re-sync) is deferred** — it needs the T1a/T1d evidence and a clean
+    re-capture; the self-heal is the mitigation that works regardless of root cause. `L2BookTest`
+    reproduces the latch with synthetic frames and asserts the self-heal breaks it.
+  - **Reject journaling: best-per-window, not first-per-window (T2).** `OpportunityDetector` now
+    keeps the highest-`net_bps` (for `unfillable`, highest-`gross_bps`) candidate per
+    `reject-sample-ms` window in primitive arrays and emits THAT at window close, with
+    `sampled_from` on the line. Same line count / file size / R1 budget; the first candidate of a
+    window is the provisional keep (not counted suppressed), every later one folded in is
+    (`cfarb.journal.suppressed` unchanged in meaning). Emission stays edge-triggered by the next
+    candidate after expiry — a quiet triangle holds its last window unemitted (acceptable; the
+    reader has `sampled_from`).
+  - **`opportunity` events carry per-leg depth (T4):** `leg_top_px` / `leg_touch_qty` /
+    `leg_worst_px` / `leg_base_qty`, flat 3-arrays, on the sampled + fired paths only (never for a
+    suppressed candidate). `EdgeCalculator.Result` gained `legTopPriceFixed[]`/`legTouchQtyFixed[]`
+    and now zeroes every per-leg array at the top of `evaluate()` so an `unfillable` line (whose
+    second pass returns mid-loop) never carries a previous triangle's stale leg data.
+  - **Stale-skip counters (T3):** `cfarb.detector.stale_skip{triangle}` +
+    `cfarb.detector.stale_skip_leg{symbol}` — the most common `evaluate()` outcome, previously
+    silent. Pre-resolved into flat arrays by `BotMetrics.initRuntimeCounters()` (hot path stays a
+    lock-free array increment).
+  - **Per-triangle notional cap (T5):** `cf-bot.triangles.<name>.max-notional-usd`, resolved in
+    `TriangleRegistry` (parallel `long[]`, `OpportunityDetector` sizes at
+    `min(eligibleBalance, triangleCap)`). Absent → inherits the global cap; a non-positive value,
+    or one ABOVE the global cap, FAILS THE BOOT (never a silent widening — S6). The global
+    `cf-bot.risk.max-notional-usd` default was cut **$20,000 → $1,000** (analysis §3: drag scales
+    ~linearly with size; the best 24 h episode went −19.6 bps @ $10k → +0.7 bps @ $100).
+  - **MX-token fee discount (T9):** `cf-bot.fees.taker-discount-pct`, set to **`50.0`**.
+    `SymbolFilterLoader` scales every symbol's `taker_bps` by `(1 - pct/100)` at load, so a 5.0 bps
+    standard USDT leg → 2.5 bps, `GOLD(XAUT)USD1` 1.0 → 0.5, and an already-0.0 bps leg (every
+    USDC/USD1 pair, `XRPUSDT`, `USDCUSDT`) stays 0. **Tier verified 2026-09-10 against MEXC's own
+    fee pages:** standard spot taker 0.05 %; holding ≥ 500 MX for 24 h → **50 %** discount →
+    0.025 %. (The separate, non-stackable "MX Deduction" feature is 20 %; MEXC auto-applies the
+    greater, so a ≥ 500 MX holder gets 50 %.) **Assumes the trading account holds ≥ 500 MX** — drop
+    to `20.0` if only MX Deduction is enabled, `0.0` for undiscounted. Value outside `[0, 100)`
+    fails the boot. Flows through `SymbolFilter` into both `EdgeCalculator` (`gross_bps`) and
+    `Sizer` (`net_bps`).
+  - **Still deferred from the task:** T1e (real book fix), T6 (per-symbol `max-book-age-ms`),
+    T7 (`config_snapshot` event), T8 (`Sizer` solves for size — gated on a plan §5.3 update + a T4
+    capture), T10 (triangle-universe pruning), T11 (`min-net-bps` / `slippage-buffer-bps` — operator,
+    and only after a clean re-capture).
+- **ADDED 2026-09-10 (`DUPLICATE-FIRE-TASK.md` — "Fix A", `JOURNAL-BPS-ANALYSIS.md` §12–§15):**
+  duplicate-fire suppression. The detector fired the same `usdt-btc-usdc-fwd` opportunity 5× in
+  1.3 s (identical `detected_net_bps` to 10 dp, spaced at `cycle-cooldown-ms`) because
+  `RiskGates.claim` only advances a *time* cooldown and, in dry-run, the paper fill never consumes
+  depth — so `EdgeCalculator` kept recomputing the identical edge. Each fire now gets a per-triangle
+  **signature** `(worstPrice, baseQty, writeSeq)` per leg; a triangle will not re-fire while that
+  signature is unchanged. `L2Book` carries monotonic per-level write stamps (`bidWriteSeqAt` /
+  `askWriteSeqAt`), **never reset** — even by `reset()` — so a re-warmed book (T1c self-heal) always
+  produces a strictly higher stamp and re-fires naturally, no reset handling. `Sizer.Result`
+  carries `maxWriteSeq` across every consumed level; `EdgeCalculator.Result` surfaces it as
+  `legWriteSeq[3]`. The check sits in `OpportunityDetector.evaluate` immediately before
+  `riskGates.claim` (a suppressed duplicate burns no cooldown/rate-limit budget); the signature is
+  stored **only after a successful `orderQueue.offer`** (a rolled-back claim stays re-fireable).
+  Unconditional (live *and* dry-run), no new thread hand-off, no allocation, no config knob. Rides
+  the sampled reject path as `reject_reason: "duplicate-signature"` + counter
+  `cfarb.detector.duplicate_fire{triangle}`. **Documented blind spot (false negative, safe side):**
+  `aggre.depth@10ms` emits *net* changes over a 10 ms window, so a take-and-replace at exactly the
+  same qty inside one window bumps no stamp — a genuinely new opportunity is suppressed (one missed
+  +$0.155). No symmetric false-positive path, and the ~13:1 broken-vs-won payoff asymmetry means the
+  failure lands on the safe side by construction. **Out of scope:** "Fix B" (a consumption ledger in
+  `Sizer` that makes dry-run *fill* behaviour realistic) — needs a plan §5.3 update. This makes the
+  fire *count* honest, not the paper-fill *P&L*.
 - **Per-stage latency histograms are still blended**: `decisionToLeg1AckNanos` records the FULL
   place→reconcile→(commission-lookup) round trip for every leg into one histogram, not separate
   receipt→decode / decode→decision / queue-wait / leg-ack stages (Tier 3).
@@ -203,14 +277,17 @@ ever enters `recorder-service`.
   `stage2_cycles.evaluate_cycle` reports as its per-tick `net_bps`. Populated even on `unfillable`
   rejects, so a dry-run journal separates "no edge" from "edge present but un-fillable / slippage-eaten"
   and is directly comparable to `gate0_rebaseline`. Computed on the Netty thread but allocation-free
-  (3 divisions); it is a diagnostic, never an input to the fire decision.
+  (3 divisions); it is a diagnostic, never an input to the fire decision. **2026-09-10
+  (JOURNAL-TUNING-TASK T2/T4):** the sampled reject is now the window's BEST candidate (not its
+  first), the line carries `sampled_from`, and both sampled rejects and fires carry per-leg
+  `leg_top_px`/`leg_touch_qty`/`leg_worst_px`/`leg_base_qty`.
 
 ## Threading model quick reference
 
 | Thread | Owns | Never |
 |---|---|---|
-| Netty event loop (`feed.MexcWsClient`) | decode → book update → `strategy.OpportunityDetector` | allocate on the steady path, log per-tick, block |
+| Netty event loop (`feed.MexcWsClient`) | decode → book update (incl. the JOURNAL-TUNING T1c crossed-latch `L2Book.reset()` — the book's own thread, not a hand-off) → `strategy.OpportunityDetector` | allocate on the steady path, log per-tick, block |
 | `cf-arb-executor` (`exec.CycleExecutor`) | 3 sequential legs, each place→query→cancel-if-non-terminal→(trades-reconcile), `exec.Unwinder` (reads `book.L2Book`'s published top-of-book to price an emergency reversal — declared exception, see `L2Book`'s javadoc) | touch a book for anything but reading published top-of-book; make a trading DECISION from it |
 | `cf-arb-journal-writer` (`journal.EventJournal`) | NDJSON append, optional console echo of each appended line (`cf-bot.observability.echo-events`) | backpressure the hot path — drop and count instead |
 | Quarkus HTTP worker (`api.BotApiResource`, `api.ReadinessCheck`) | read-only JSON | any write to trading state (S12) |
-| Vert.x periodic timers (`BotService`: warm-up/clock-skew, feed watchdog, latency snapshots, opt-in console activity report) | read-only diagnostic reads, `killSwitch.recordFeedUnhealthy` | gate or influence a trading decision directly — these feed the kill switch, journal and console only |
+| Vert.x periodic timers (`BotService`: warm-up/clock-skew, feed watchdog, latency snapshots, opt-in console activity report) | read-only diagnostic reads, `killSwitch.recordFeedUnhealthy`, the JOURNAL-TUNING T1b crossed-book WARN + `book_reset` journal event (observes `L2Book.crossedResetCount()`, never calls `reset()` itself) | gate or influence a trading decision directly — these feed the kill switch, journal and console only |

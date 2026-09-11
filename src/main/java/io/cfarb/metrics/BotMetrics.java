@@ -1,9 +1,13 @@
 package io.cfarb.metrics;
 
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import org.HdrHistogram.ConcurrentHistogram;
 
 /**
@@ -31,6 +35,25 @@ public class BotMetrics {
     private io.micrometer.core.instrument.Counter journalSuppressed;
     private io.micrometer.core.instrument.Counter riskTrips;
     private io.micrometer.core.instrument.Counter intentsExpired;
+
+    // JOURNAL-TUNING-TASK.md T3: per-triangle / per-symbol stale-leg skip counters. Pre-resolved
+    // into flat arrays by initRuntimeCounters() (called once at startup) so the detector hot path
+    // is a lock-free array-indexed increment, never a tagged-counter map lookup. Null until wired
+    // (unit tests that construct BotMetrics directly): the record* methods no-op in that case.
+    private Counter[] detectorStaleSkipByTriangle;
+    private Counter[] detectorStaleSkipLegBySymbol;
+    // DUPLICATE-FIRE-TASK.md ("Fix A"): per-triangle count of fires suppressed because the book
+    // levels the order would consume are unchanged (same worst price, base qty, and write stamp) at
+    // the last fire. Same flat-array pattern as the T3 counters -- lock-free array increment on the
+    // detector hot path, null until initRuntimeCounters() wires it.
+    private Counter[] duplicateFireByTriangle;
+    // JOURNAL-TUNING-TASK.md T1b: crossed-book episode counter, pre-resolved by symbol index.
+    private Counter[] bookCrossedBySymbol;
+    // JOURNAL-TUNING-TASK.md T1c: crossed-latch self-heal resets, keyed by "symbol|reason". Lazily
+    // resolved -- book resets happen minutes-to-hours apart and only on the Vert.x watchdog thread,
+    // never the hot path.
+    private final Map<String, Counter> bookResetCounters = new ConcurrentHashMap<>();
+    private List<String> symbolNamesForCounters = List.of();
 
     // ConcurrentHistogram: written from the detector thread and the executor thread, read from the
     // HTTP worker thread serving /api/v1/latency.
@@ -86,6 +109,62 @@ public class BotMetrics {
     public void recordJournalSuppressed() { journalSuppressed.increment(); }
     public void recordRiskTrip() { riskTrips.increment(); }
     public void recordIntentExpired() { intentsExpired.increment(); }
+
+    /**
+     * JOURNAL-TUNING-TASK.md T1b/T3: pre-resolve the per-triangle / per-symbol tagged counters into
+     * flat arrays. Called once from {@code BotService} after the triangle and book registries are
+     * built, before the detector or feed watchdog run. Safe to call again (idempotent-ish — it just
+     * rebuilds the arrays).
+     */
+    public void initRuntimeCounters(List<String> triangleNames, List<String> symbolNames) {
+        this.symbolNamesForCounters = List.copyOf(symbolNames);
+        detectorStaleSkipByTriangle = new Counter[triangleNames.size()];
+        duplicateFireByTriangle = new Counter[triangleNames.size()];
+        for (int i = 0; i < triangleNames.size(); i++) {
+            detectorStaleSkipByTriangle[i] = registry.counter("cfarb.detector.stale_skip",
+                    "triangle", triangleNames.get(i));
+            duplicateFireByTriangle[i] = registry.counter("cfarb.detector.duplicate_fire",
+                    "triangle", triangleNames.get(i));
+        }
+        detectorStaleSkipLegBySymbol = new Counter[symbolNames.size()];
+        bookCrossedBySymbol = new Counter[symbolNames.size()];
+        for (int i = 0; i < symbolNames.size(); i++) {
+            detectorStaleSkipLegBySymbol[i] = registry.counter("cfarb.detector.stale_skip_leg",
+                    "symbol", symbolNames.get(i));
+            bookCrossedBySymbol[i] = registry.counter("cfarb.book.crossed", "symbol", symbolNames.get(i));
+        }
+    }
+
+    /** JOURNAL-TUNING-TASK.md T3: a triangle skipped because a leg was stale/untrusted/crossed —
+     * the single most common {@code OpportunityDetector.evaluate} outcome, previously uncounted. */
+    public void recordDetectorStaleSkip(int triangleIndex) {
+        if (detectorStaleSkipByTriangle != null) detectorStaleSkipByTriangle[triangleIndex].increment();
+    }
+
+    /** JOURNAL-TUNING-TASK.md T3: attributes a stale-skip to the FIRST failing leg's symbol. */
+    public void recordDetectorStaleSkipLeg(int symbolIndex) {
+        if (detectorStaleSkipLegBySymbol != null) detectorStaleSkipLegBySymbol[symbolIndex].increment();
+    }
+
+    /** DUPLICATE-FIRE-TASK.md ("Fix A"): a fire was suppressed because the triangle's fire signature
+     * (per-leg worst price + base qty + book write stamp) is unchanged since the last fire. */
+    public void recordDuplicateFireSuppressed(int triangleIndex) {
+        if (duplicateFireByTriangle != null) duplicateFireByTriangle[triangleIndex].increment();
+    }
+
+    /** JOURNAL-TUNING-TASK.md T1b: a book first went crossed (one increment per crossed episode,
+     * not per tick). */
+    public void recordBookCrossed(int symbolIndex) {
+        if (bookCrossedBySymbol != null) bookCrossedBySymbol[symbolIndex].increment();
+    }
+
+    /** JOURNAL-TUNING-TASK.md T1c: a book was force-{@code reset()} to recover from a crossed latch. */
+    public void recordBookReset(int symbolIndex, String reason) {
+        String symbol = symbolIndex >= 0 && symbolIndex < symbolNamesForCounters.size()
+                ? symbolNamesForCounters.get(symbolIndex) : String.valueOf(symbolIndex);
+        bookResetCounters.computeIfAbsent(symbol + "|" + reason,
+                k -> registry.counter("cfarb.book.reset", "symbol", symbol, "reason", reason)).increment();
+    }
 
     public void recordFrameToDecisionNanos(long nanos) { if (nanos >= 0) frameToDecisionNanos.recordValue(nanos); }
     public void recordDecisionToLeg1AckNanos(long nanos) { if (nanos >= 0) decisionToLeg1AckNanos.recordValue(nanos); }
