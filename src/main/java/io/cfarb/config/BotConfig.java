@@ -224,6 +224,17 @@ public interface BotConfig {
          * acting on one that is already older than that all but guarantees leg failures. */
         @WithDefault("150")
         long maxIntentAgeMs();
+
+        /** PRE-LIVE-PLAN.md P1-5: a marketable limit fills at the BOOK's price up to your limit, so
+         * crossing costs nothing when the book has not moved since detection (measured expected cost
+         * ~0.11 bps against a 4.833 bps mean edge, converting 72% of adverse moves into fills).
+         * {@code exec.CycleExecutor} crosses each leg's modelled price by this many bps -- ASK legs
+         * up, BID legs down -- clamped inside the symbol's {@code PERCENT_PRICE_BY_SIDE} band.
+         * {@code 0.0} (default) is inert and reproduces today's submitted price byte-for-byte.
+         * {@code EdgeCalculator} is never touched: this is purely an execution-time adjustment. A
+         * value outside {@code [0, 50]} FAILS THE BOOT (S6). */
+        @WithDefault("0.0")
+        double legCrossBps();
     }
 
     interface JournalConfig {

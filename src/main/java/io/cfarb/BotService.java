@@ -213,7 +213,7 @@ public class BotService {
 
         this.executor = new CycleExecutor(orderQueue, triangles, riskGates, killSwitch, portfolio,
                 metrics, journal, dryRun, restClient, unwinder, config.exec().orderType(),
-                config.exec().legTimeoutMs(), config.exec().maxIntentAgeMs());
+                config.exec().legTimeoutMs(), config.exec().maxIntentAgeMs(), config.exec().legCrossBps());
         executor.start();
 
         List<String> subscribeMessages = MexcProtocol.subscribeMessages(config.venue().depthChannel(), config.symbols());

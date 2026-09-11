@@ -118,6 +118,7 @@ class OpportunityDetectorTest {
             public long legTimeoutMs() { return 1_500; }
             public long unwindCrossBps() { return 40; }
             public long maxIntentAgeMs() { return 150; }
+            public double legCrossBps() { return 0.0; }
         };
     }
 
