@@ -71,6 +71,8 @@ class CycleExecutorTest {
             public int maxCyclesPerMinute() { return 30; }
             public long cycleCooldownMs() { return 0; }
             public int maxConsecutiveFailures() { return 3; }
+            public double maxNotionalPerWindowUsd() { return 1_000_000.0; }
+            public long notionalWindowMs() { return 60_000; }
         };
     }
 
@@ -171,7 +173,7 @@ class CycleExecutorTest {
         scriptGenerousFill(api, "XRPBTC", FixedPoint.fromDouble(0.000017), "o1");
         scriptGenerousFill(api, "XRPUSDT", FixedPoint.fromDouble(1.40), "o2");
 
-        riskGates.claim(0, System.nanoTime());
+        riskGates.claim(0, FixedPoint.fromDouble(100.0), System.nanoTime());
         assertTrue(queue.offer(intent()));
         waitUntil(() -> riskGates.openCycleCount() == 0);
 
@@ -201,7 +203,7 @@ class CycleExecutorTest {
         // the unwind reversal (SELL back on BTCUSDT) fills fully
         api.scriptQuery("BTCUSDT", partial, FixedPoint.fromDouble(0.0007 * 77850.0 * 0.999), "FILLED", "rev0");
 
-        riskGates.claim(0, System.nanoTime());
+        riskGates.claim(0, FixedPoint.fromDouble(100.0), System.nanoTime());
         assertTrue(queue.offer(intent()));
         waitUntil(() -> riskGates.openCycleCount() == 0);
 
@@ -219,7 +221,7 @@ class CycleExecutorTest {
         api.scriptQuery("XRPBTC", 0, 0, "CANCELED", "o1");
         api.scriptQuery("BTCUSDT", FixedPoint.fromDouble(0.001284), FixedPoint.fromDouble(99.9), "FILLED", "rev0");
 
-        riskGates.claim(0, System.nanoTime());
+        riskGates.claim(0, FixedPoint.fromDouble(100.0), System.nanoTime());
         assertTrue(queue.offer(intent()));
         waitUntil(() -> riskGates.openCycleCount() == 0);
 
@@ -242,7 +244,7 @@ class CycleExecutorTest {
         scriptGenerousFill(api, "XRPBTC", FixedPoint.fromDouble(0.000017), "o1");
         scriptGenerousFill(api, "XRPUSDT", FixedPoint.fromDouble(1.40), "o2");
 
-        riskGates.claim(0, System.nanoTime());
+        riskGates.claim(0, FixedPoint.fromDouble(100.0), System.nanoTime());
         assertTrue(queue.offer(intent()));
         waitUntil(() -> riskGates.openCycleCount() == 0);
 

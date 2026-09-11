@@ -77,6 +77,17 @@ public final class RiskGates {
     private int ringHead;
     private int ringCount;
 
+    // PRE-LIVE-PLAN.md P0-2(a): per-triangle notional BUDGET per rolling window -- distinct from
+    // max-notional-usd (which bounds one order) and max-cycles-per-minute (which bounds a COUNT).
+    // Neither existing gate binds a rapid sequence of full-sized fires: the 2026-09-11 burst put
+    // 43 fires x $2,010 = $86,430 of notional through in 19s against $2,500 of equity. Plain
+    // long[] -- detector-thread-only, same as lastFireNanosByTriangle's array-shaped siblings
+    // above (only openCycles crosses threads); see the class-level threading doc.
+    private final long maxNotionalPerWindowFixed;
+    private final long notionalWindowNanos;
+    private final long[] windowStartNanos;
+    private final long[] windowSpentFixed;
+
     public RiskGates(BotConfig.RiskConfig riskConfig, BotConfig.StrategyConfig strategyConfig,
                       BotConfig.ExecConfig execConfig, int triangleCount, KillSwitch killSwitch,
                       boolean dryRun) {
@@ -124,6 +135,22 @@ public final class RiskGates {
         for (int i = 0; i < lastFireNanosByTriangle.length(); i++) {
             lastFireNanosByTriangle.set(i, neverFiredSentinel);
         }
+
+        // PRE-LIVE-PLAN.md P0-2(a): S6 -- a misconfigured window budget is loud and fatal, same as
+        // every other risk limit above, never silently defaulted or widened.
+        double configuredWindowNotional = riskConfig.maxNotionalPerWindowUsd();
+        if (configuredWindowNotional <= 0) {
+            failStartup("cf-bot.risk.max-notional-per-window-usd must be > 0, got " + configuredWindowNotional);
+        }
+        if (riskConfig.notionalWindowMs() <= 0) {
+            failStartup("cf-bot.risk.notional-window-ms must be > 0, got " + riskConfig.notionalWindowMs());
+        }
+        this.maxNotionalPerWindowFixed = FixedPoint.fromDouble(configuredWindowNotional);
+        this.notionalWindowNanos = riskConfig.notionalWindowMs() * 1_000_000L;
+        int windowSlots = Math.max(1, triangleCount);
+        this.windowStartNanos = new long[windowSlots];
+        this.windowSpentFixed = new long[windowSlots];
+        java.util.Arrays.fill(windowStartNanos, neverFiredSentinel);
     }
 
     /** A bad risk-config value logs an ERROR and deliberately aborts the boot (thrown from the
@@ -176,6 +203,12 @@ public final class RiskGates {
         if (nowNanos - lastFireNanosByTriangle.get(triangleIndex) < cooldownNanos) {
             return false;
         }
+        // PRE-LIVE-PLAN.md P0-2(a): per-triangle notional budget per rolling window -- the backstop
+        // that caps burst downside independent of WHY the detector keeps re-firing (see class doc).
+        rollWindowIfExpired(triangleIndex, nowNanos);
+        if (windowSpentFixed[triangleIndex] + candidateNotionalFixed > maxNotionalPerWindowFixed) {
+            return false;
+        }
         if (ringCount >= maxCyclesPerMinute) {
             long oldest = ringTimestampsNanos[ringHead];
             if (nowNanos - oldest < 60_000_000_000L) {
@@ -186,8 +219,10 @@ public final class RiskGates {
     }
 
     /** Claim the fire slot and mark a cycle as open. Executor must call {@link #onCycleFinished()}
-     * exactly once when the cycle completes or is unwound, or the open-cycle slot leaks forever. */
-    public void claim(int triangleIndex, long nowNanos) {
+     * exactly once when the cycle completes or is unwound, or the open-cycle slot leaks forever.
+     * {@code notionalFixed} is the size actually chosen (not the cap) -- it debits the P0-2(a)
+     * window budget so a sequence of smaller fires is not charged as if each were cap-sized. */
+    public void claim(int triangleIndex, long notionalFixed, long nowNanos) {
         lastFireNanosByTriangle.set(triangleIndex, nowNanos);
         int idx = (ringHead + ringCount) % maxCyclesPerMinute;
         ringTimestampsNanos[idx] = nowNanos;
@@ -197,6 +232,28 @@ public final class RiskGates {
             ringHead = (ringHead + 1) % maxCyclesPerMinute;
         }
         openCycles.incrementAndGet();
+        rollWindowIfExpired(triangleIndex, nowNanos);
+        windowSpentFixed[triangleIndex] += notionalFixed;
+    }
+
+    /** Resets the triangle's window budget when the rolling window has elapsed. Idempotent within
+     * the same {@code nowNanos} -- safe to call from both the non-claiming {@link #canFire} check
+     * and {@link #claim}, and from {@link #windowBudgetWouldBlock}'s telemetry peek below. */
+    private void rollWindowIfExpired(int triangleIndex, long nowNanos) {
+        if (nowNanos - windowStartNanos[triangleIndex] >= notionalWindowNanos) {
+            windowStartNanos[triangleIndex] = nowNanos;
+            windowSpentFixed[triangleIndex] = 0;
+        }
+    }
+
+    /** PRE-LIVE-PLAN.md P0-2(a) telemetry: true iff the window notional budget ALONE would refuse
+     * this candidate -- called by {@code OpportunityDetector} only after {@link #canFire} has
+     * already returned false, purely to attribute the block for {@code cfarb.risk.window_budget_block}.
+     * Never used to gate a decision (that is {@link #canFire}'s job); rolling the window again here
+     * with the same {@code nowNanos} {@code canFire} just used is a no-op, not a second window. */
+    public boolean windowBudgetWouldBlock(int triangleIndex, long candidateNotionalFixed, long nowNanos) {
+        rollWindowIfExpired(triangleIndex, nowNanos);
+        return windowSpentFixed[triangleIndex] + candidateNotionalFixed > maxNotionalPerWindowFixed;
     }
 
     /** Called by the executor thread when a cycle finishes, successfully or not. Clamped at zero

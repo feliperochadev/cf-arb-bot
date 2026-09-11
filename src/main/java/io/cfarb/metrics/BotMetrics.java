@@ -47,6 +47,10 @@ public class BotMetrics {
     // the last fire. Same flat-array pattern as the T3 counters -- lock-free array increment on the
     // detector hot path, null until initRuntimeCounters() wires it.
     private Counter[] duplicateFireByTriangle;
+    // PRE-LIVE-PLAN.md P0-2(a): per-triangle count of fires blocked by the rolling-window notional
+    // budget (RiskGates#windowBudgetWouldBlock) -- same flat-array pattern as the other per-triangle
+    // counters here.
+    private Counter[] windowBudgetBlockByTriangle;
     // JOURNAL-TUNING-TASK.md T1b: crossed-book episode counter, pre-resolved by symbol index.
     private Counter[] bookCrossedBySymbol;
     // JOURNAL-TUNING-TASK.md T1c: crossed-latch self-heal resets, keyed by "symbol|reason". Lazily
@@ -120,10 +124,13 @@ public class BotMetrics {
         this.symbolNamesForCounters = List.copyOf(symbolNames);
         detectorStaleSkipByTriangle = new Counter[triangleNames.size()];
         duplicateFireByTriangle = new Counter[triangleNames.size()];
+        windowBudgetBlockByTriangle = new Counter[triangleNames.size()];
         for (int i = 0; i < triangleNames.size(); i++) {
             detectorStaleSkipByTriangle[i] = registry.counter("cfarb.detector.stale_skip",
                     "triangle", triangleNames.get(i));
             duplicateFireByTriangle[i] = registry.counter("cfarb.detector.duplicate_fire",
+                    "triangle", triangleNames.get(i));
+            windowBudgetBlockByTriangle[i] = registry.counter("cfarb.risk.window_budget_block",
                     "triangle", triangleNames.get(i));
         }
         detectorStaleSkipLegBySymbol = new Counter[symbolNames.size()];
@@ -150,6 +157,11 @@ public class BotMetrics {
      * (per-leg worst price + base qty + book write stamp) is unchanged since the last fire. */
     public void recordDuplicateFireSuppressed(int triangleIndex) {
         if (duplicateFireByTriangle != null) duplicateFireByTriangle[triangleIndex].increment();
+    }
+
+    /** PRE-LIVE-PLAN.md P0-2(a): a fire was blocked by the rolling-window notional budget. */
+    public void recordWindowBudgetBlock(int triangleIndex) {
+        if (windowBudgetBlockByTriangle != null) windowBudgetBlockByTriangle[triangleIndex].increment();
     }
 
     /** JOURNAL-TUNING-TASK.md T1b: a book first went crossed (one increment per crossed episode,

@@ -80,6 +80,8 @@ class OpportunityDetectorTest {
             public int maxCyclesPerMinute() { return 1_000; }
             public long cycleCooldownMs() { return 0; }
             public int maxConsecutiveFailures() { return 3; }
+            public double maxNotionalPerWindowUsd() { return 1_000_000.0; }
+            public long notionalWindowMs() { return 60_000; }
         };
     }
 
@@ -422,6 +424,8 @@ class OpportunityDetectorTest {
             public int maxCyclesPerMinute() { return 10_000; }
             public long cycleCooldownMs() { return 0; }
             public int maxConsecutiveFailures() { return 3; }
+            public double maxNotionalPerWindowUsd() { return 1_000_000.0; }
+            public long notionalWindowMs() { return 60_000; }
         };
         RiskGates gates = new RiskGates(risk, strategy(), exec(), triangles.triangleCount(), ks, true);
         BotMetrics metrics = new BotMetrics(new SimpleMeterRegistry());
@@ -511,6 +515,8 @@ class OpportunityDetectorTest {
             public int maxCyclesPerMinute() { return 10_000; }
             public long cycleCooldownMs() { return 0; }       // time cooldown must not mask the behaviour under test
             public int maxConsecutiveFailures() { return 3; }
+            public double maxNotionalPerWindowUsd() { return 1_000_000.0; }
+            public long notionalWindowMs() { return 60_000; }
         };
     }
 

@@ -134,6 +134,19 @@ public interface BotConfig {
 
         @WithDefault("3")
         int maxConsecutiveFailures();
+
+        /** PRE-LIVE-PLAN.md P0-2(a): notional BUDGET across a rolling window, distinct from {@link
+         * #maxNotionalUsd()} (bounds one order) and {@link #maxCyclesPerMinute()} (bounds a COUNT,
+         * not a dollar sum). Neither existing gate binds a rapid sequence of full-sized fires — the
+         * 2026-09-11 burst put 43 fires x $2,010 = $86,430 of notional through in 19s against $2,500
+         * of equity. A non-positive value FAILS THE BOOT (S6), same as every other risk limit. */
+        @WithDefault("5000")
+        double maxNotionalPerWindowUsd();
+
+        /** Width of the rolling window {@link #maxNotionalPerWindowUsd()} is measured over. A
+         * non-positive value FAILS THE BOOT (S6). */
+        @WithDefault("60000")
+        long notionalWindowMs();
     }
 
     interface ExecConfig {

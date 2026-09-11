@@ -180,6 +180,11 @@ public final class OpportunityDetector {
         long eligibleBalance = compound ? portfolio.equity() : seedFixed;
         long candidateNotional = Math.min(eligibleBalance, triangles.maxNotionalFixed(triangleIndex));
         if (!riskGates.canFire(triangleIndex, candidateNotional, nowNanos)) {
+            // PRE-LIVE-PLAN.md P0-2(a): attribute the block to the window budget specifically, for
+            // telemetry only -- canFire() already made the actual (fail-closed) decision above.
+            if (riskGates.windowBudgetWouldBlock(triangleIndex, candidateNotional, nowNanos)) {
+                metrics.recordWindowBudgetBlock(triangleIndex);
+            }
             return;
         }
 
@@ -239,7 +244,7 @@ public final class OpportunityDetector {
         // Claim the fire slot NOW, immediately before handing off -- canFire() above is a
         // non-claiming pre-check so a candidate that fails EdgeCalculator never burns real
         // cooldown/rate-limit budget (see RiskGates.canFire's javadoc).
-        riskGates.claim(triangleIndex, nowNanos);
+        riskGates.claim(triangleIndex, chosenNotional, nowNanos);
         long[] legPrices = java.util.Arrays.copyOf(edgeResult.legWorstPriceFixed, 3);
         long[] legBaseQty = java.util.Arrays.copyOf(edgeResult.legBaseQtyFixed, 3);
         OrderIntent intent = new OrderIntent(nowNanos, triangleIndex, chosenNotional, edgeResult.netBps,
