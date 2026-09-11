@@ -59,6 +59,23 @@ class OpportunityDetectorTest {
         book.apply(f, nowNanos);
     }
 
+    /** Genuinely moves the ask top by DELETING the old level and inserting the new one in the same
+     * frame, matching MEXC's real differential-update semantics -- unlike calling {@link #seedBook}
+     * again with a different askPx (which INSERTS a second level, leaving the old, still-better
+     * price as the real top and silently defeating any test that means to change it). */
+    private static void replaceAsk(L2Book book, double oldAskPx, double newAskPx, double qty, long nowNanos) {
+        MexcDepthDecoder.DepthFrame f = new MexcDepthDecoder.DepthFrame();
+        f.fromVersion = -1;
+        f.toVersion = -1;
+        f.sendTimeMs = 0;
+        f.askCount = 2;
+        f.askPx[0] = FixedPoint.fromDouble(oldAskPx);
+        f.askQty[0] = 0; // delete
+        f.askPx[1] = FixedPoint.fromDouble(newAskPx);
+        f.askQty[1] = FixedPoint.fromDouble(qty);
+        book.apply(f, nowNanos);
+    }
+
     private static SymbolFilter filter(String symbol, String base, String quote, double takerBps) {
         long feeMul = FixedPoint.fromDouble(1.0 - takerBps / 10_000.0);
         return new SymbolFilter(symbol, base, quote, 1L, 8, 0L, 0L, 8, takerBps, feeMul,
@@ -650,6 +667,94 @@ class OpportunityDetectorTest {
         assertEquals(1, drain(queue), "the fire after a failed offer must go through -- signature was not stored");
     }
 
+    // --- PRE-LIVE-PLAN.md P0-2(b): duplicate suppression survives one churning leg -------------
+    // Note: seedProfitable's books are deliberately 5,000,000 deep against a ~$1000 trade, so NO
+    // leg is ever "material" (baseQty/touchQty << the 0.10 default) -- that is why every existing
+    // Fix-A test above (built on seedProfitable/firingRig) keeps passing unchanged: the new
+    // any-material-leg rule never independently fires on those fixtures, and behaviour reduces
+    // exactly to Fix A's original all-three-legs-including-write-stamp rule. The tests below use
+    // shallower, genuinely material depth on the frozen legs to exercise the new rule itself.
+
+    @Test
+    void materialFrozenLegsSuppressRepeatedFiresEvenAsAnotherLegMoves() throws Exception {
+        // Mirrors the usdt-sol-btc-rev / usdt-btc-usdc-rev incidents (PRE-LIVE-PLAN.md Review §2):
+        // legs 1-2 sit at a genuinely frozen price with modest (material) depth while leg 0 drifts
+        // -- Fix A's original all-three-legs rule fails to suppress (leg 0's worst price differs
+        // every time), but the new any-material-leg rule catches legs 1-2 being unchanged.
+        SpscArrayQueue<OrderIntent> queue = new SpscArrayQueue<>(16);
+        Rig rig = firingRig(queue);
+        int xrpusdt = rig.books().indexOf("XRPUSDT");
+        long t0 = 10_000_000_000L;
+
+        seedBook(rig.books().book(1), 1.2999, 5_000, 1.3000, 5_000, t0);   // XRPUSDC -- frozen, material
+        seedBook(rig.books().book(2), 1.3100, 5_000, 1.3200, 5_000, t0);   // XRPUSDT -- frozen, material
+        seedBook(rig.books().book(0), 0.9999, 5_000_000, 1.0000, 5_000_000, t0); // USDCUSDT -- deep, moves
+        rig.detector().onBookUpdated(xrpusdt, t0);
+
+        long t1 = t0 + 5 * NS;
+        replaceAsk(rig.books().book(0), 1.0000, 1.00002, 5_000_000, t1);
+        rig.detector().onBookUpdated(xrpusdt, t1);
+        long t2 = t0 + 10 * NS;
+        replaceAsk(rig.books().book(0), 1.00002, 0.99998, 5_000_000, t2);
+        rig.detector().onBookUpdated(xrpusdt, t2);
+
+        List<JsonNode> opps = awaitOpportunities(3);
+        rig.journal().stop();
+
+        assertEquals(1, drain(queue), "legs 1-2 frozen and material -> only the first candidate fires");
+        assertEquals(1, opps.stream().filter(n -> n.get("fired").asBoolean()).count());
+        assertEquals(2, countDuplicateRejects(opps), "the next two candidates are suppressed as duplicates");
+    }
+
+    @Test
+    void aLegThatIsNotMaterialCannotByItselfSuppressAFire() throws Exception {
+        // The materiality gate's whole purpose: a deep, effectively-constant leg (this order barely
+        // touches its depth) must not veto suppression on its own. seedProfitable's 5,000,000 depth
+        // is deliberately too deep for the ~$1000 trade to ever be material on any leg -- if
+        // materiality worked backwards (deep legs counting as "unchanging" and material), this
+        // would wrongly suppress the second fire even though nothing here is genuinely frozen AND
+        // material at once.
+        SpscArrayQueue<OrderIntent> queue = new SpscArrayQueue<>(16);
+        Rig rig = firingRig(queue);
+        int xrpusdt = rig.books().indexOf("XRPUSDT");
+        long t0 = 10_000_000_000L;
+        seedProfitable(rig.books(), t0);
+        rig.detector().onBookUpdated(xrpusdt, t0);
+
+        long t1 = t0 + 5 * NS;
+        replaceAsk(rig.books().book(0), 1.0000, 1.00002, 5_000_000, t1);
+        rig.detector().onBookUpdated(xrpusdt, t1);
+
+        awaitOpportunities(2);
+        rig.journal().stop();
+        assertEquals(2, drain(queue), "no leg is both frozen and material -- both candidates must fire");
+    }
+
+    @Test
+    void aReplenishedTouchOnAFrozenMaterialLegDoesNotSuppress() throws Exception {
+        // Negative control (PRE-LIVE-PLAN.md P0-2(b) verify list): same price, touch INCREASED ->
+        // "nobody replenished it" no longer holds, so this must still fire twice even though the
+        // price is identical and the leg is material.
+        SpscArrayQueue<OrderIntent> queue = new SpscArrayQueue<>(16);
+        Rig rig = firingRig(queue);
+        int xrpusdt = rig.books().indexOf("XRPUSDT");
+        long t0 = 10_000_000_000L;
+        seedBook(rig.books().book(1), 1.2999, 5_000, 1.3000, 5_000, t0);
+        seedBook(rig.books().book(2), 1.3100, 5_000, 1.3200, 5_000, t0);
+        seedBook(rig.books().book(0), 0.9999, 5_000_000, 1.0000, 5_000_000, t0);
+        rig.detector().onBookUpdated(xrpusdt, t0);
+
+        // Same prices everywhere, but legs 1-2's touch quantity is REPLENISHED (increased).
+        long t1 = t0 + 5 * NS;
+        seedBook(rig.books().book(1), 1.2999, 20_000, 1.3000, 20_000, t1);
+        seedBook(rig.books().book(2), 1.3100, 20_000, 1.3200, 20_000, t1);
+        rig.detector().onBookUpdated(xrpusdt, t1);
+
+        awaitOpportunities(2);
+        rig.journal().stop();
+        assertEquals(2, drain(queue), "a replenished (increased) touch must still fire, even at an identical price");
+    }
+
     // --- PRE-LIVE-PLAN.md P0-2(c): post-reset quarantine --------------------------------------
 
     @Test
@@ -710,6 +815,37 @@ class OpportunityDetectorTest {
         awaitOpportunities(1);
         rig.journal().stop();
         assertEquals(1, drain(queue), "quarantine disabled (0) must never skip a fire");
+    }
+
+    @Test
+    void materialFractionOutsideZeroToOneRefusesToBoot() throws Exception {
+        // PRE-LIVE-PLAN.md P0-2(b): S6 -- a misconfigured materiality gate is loud and fatal.
+        BookRegistry books = new BookRegistry(FIRING_SYMBOLS, 1, 0);
+        Map<String, SymbolFilter> filters = Map.of(
+                "USDCUSDT", filter("USDCUSDT", "USDC", "USDT", 0.0),
+                "XRPUSDC", filter("XRPUSDC", "XRP", "USDC", 0.0),
+                "XRPUSDT", filter("XRPUSDT", "XRP", "USDT", 0.0));
+        Map<String, BotConfig.TriangleConfig> triangleConfigs = Map.of(
+                "usdt-usdc-xrp-fwd", triangleConfig(List.of("USDCUSDT:ASK", "XRPUSDC:ASK", "XRPUSDT:BID")));
+        TriangleRegistry triangles = new TriangleRegistry(triangleConfigs, "USDT", books, filters);
+        Portfolio portfolio = new Portfolio(FixedPoint.fromDouble(1_000.0));
+        KillSwitch ks = new KillSwitch(portfolio, FixedPoint.fromDouble(1.0), 3);
+        RiskGates gates = new RiskGates(firingRisk(), strategy(), exec(), triangles.triangleCount(), ks, true);
+        BotMetrics metrics = new BotMetrics(new SimpleMeterRegistry());
+        EventJournal journal = new EventJournal(tempDir, metrics, false);
+        journal.start();
+        SpscArrayQueue<OrderIntent> queue = new SpscArrayQueue<>(16);
+
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () ->
+                new OpportunityDetector(books, triangles, gates, portfolio, metrics, journal, queue,
+                        5.0, 1.0, true, 0L, 0L, 0.0, 30_000L));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () ->
+                new OpportunityDetector(books, triangles, gates, portfolio, metrics, journal, queue,
+                        5.0, 1.0, true, 0L, 0L, -0.5, 30_000L));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () ->
+                new OpportunityDetector(books, triangles, gates, portfolio, metrics, journal, queue,
+                        5.0, 1.0, true, 0L, 0L, 1.5, 30_000L));
+        journal.stop();
     }
 
     private List<JsonNode> awaitOpportunities(int expected) throws IOException, InterruptedException {

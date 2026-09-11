@@ -39,6 +39,11 @@ public final class OpportunityDetector {
      * walk DID run and failed. Must not increment {@code recordOpportunityRejectedUnfillable()}. */
     private static final int REASON_GROSS_BAIL = 3;
 
+    // PRE-LIVE-PLAN.md P0-2(b): defaults for the convenience constructors below, matching
+    // BotConfig.DetectorConfig's own @WithDefault values.
+    private static final double DEFAULT_DUPLICATE_MATERIAL_FRACTION = 0.10;
+    private static final long DEFAULT_DUPLICATE_WINDOW_MS = 30_000;
+
     private final BookRegistry books;
     private final TriangleRegistry triangles;
     private final RiskGates riskGates;
@@ -110,6 +115,15 @@ public final class OpportunityDetector {
     private final long[] lastFiredBaseQty;
     private final long[] lastFiredWriteSeq;
     private final boolean[] hasFiredSignature;
+    // PRE-LIVE-PLAN.md P0-2(b): extends the signature above so a triangle can also be suppressed
+    // when only SOME legs are unchanged -- see anyMaterialLegUnchanged's javadoc. Same flat
+    // [triangleIndex*3 + leg] layout; lastFiredNanos backs the (separate, only-for-the-new-rule)
+    // suppression window.
+    private final long[] lastFiredTopPx;
+    private final long[] lastFiredTouchQty;
+    private final long[] lastFiredNanos;
+    private final double duplicateMaterialFraction;
+    private final long duplicateWindowNanos;
 
     public OpportunityDetector(BookRegistry books, TriangleRegistry triangles, RiskGates riskGates,
                                 Portfolio portfolio, BotMetrics metrics, EventJournal journal,
@@ -125,6 +139,26 @@ public final class OpportunityDetector {
                                 SpscArrayQueue<OrderIntent> orderQueue,
                                 double minNetBps, double slippageBufferBps, boolean compound,
                                 long rejectJournalIntervalMs, long postResetQuarantineMs) {
+        this(books, triangles, riskGates, portfolio, metrics, journal, orderQueue, minNetBps,
+                slippageBufferBps, compound, rejectJournalIntervalMs, postResetQuarantineMs,
+                DEFAULT_DUPLICATE_MATERIAL_FRACTION, DEFAULT_DUPLICATE_WINDOW_MS);
+    }
+
+    public OpportunityDetector(BookRegistry books, TriangleRegistry triangles, RiskGates riskGates,
+                                Portfolio portfolio, BotMetrics metrics, EventJournal journal,
+                                SpscArrayQueue<OrderIntent> orderQueue,
+                                double minNetBps, double slippageBufferBps, boolean compound,
+                                long rejectJournalIntervalMs, long postResetQuarantineMs,
+                                double duplicateMaterialFraction, long duplicateWindowMs) {
+        // PRE-LIVE-PLAN.md P0-2(b): S6 -- a misconfigured materiality gate is loud and fatal, same
+        // as every other risk-bearing config key.
+        if (duplicateMaterialFraction <= 0 || duplicateMaterialFraction > 1.0) {
+            throw new IllegalStateException(
+                    "cf-bot.detector.duplicate-material-fraction must be in (0, 1], got "
+                            + duplicateMaterialFraction);
+        }
+        this.duplicateMaterialFraction = duplicateMaterialFraction;
+        this.duplicateWindowNanos = duplicateWindowMs * 1_000_000L;
         this.books = books;
         this.triangles = triangles;
         this.riskGates = riskGates;
@@ -158,12 +192,16 @@ public final class OpportunityDetector {
         this.lastFiredWriteSeq = new long[n * 3];
         this.hasFiredSignature = new boolean[n];
         this.lastFullEvalNanos = new long[n];
+        this.lastFiredTopPx = new long[n * 3];
+        this.lastFiredTouchQty = new long[n * 3];
+        this.lastFiredNanos = new long[n];
         // Same "0 is not a safe never-happened sentinel" reasoning as RiskGates' cooldown array:
         // nanoTime's origin is arbitrary per JVM. pendingSampledFrom==0 already means "no window
         // open", so windowStartNanos only matters once a window is open -- but seed it clear of
         // subtraction overflow anyway.
         java.util.Arrays.fill(windowStartNanos, Long.MIN_VALUE / 2);
         java.util.Arrays.fill(lastFullEvalNanos, Long.MIN_VALUE / 2);
+        java.util.Arrays.fill(lastFiredNanos, Long.MIN_VALUE / 2);
     }
 
     /** Called after {@code symbolIndex}'s book has just been updated. {@code nowNanos} must be
@@ -250,16 +288,25 @@ public final class OpportunityDetector {
             return; // real edge doesn't clear threshold + slippage buffer
         }
 
-        // DUPLICATE-FIRE-TASK.md ("Fix A"): refuse to re-fire a triangle while the liquidity this
-        // order would consume is the liquidity the last fire consumed -- same per-leg worst price,
-        // base qty, AND book write stamp. Placed AFTER the threshold test and BEFORE
-        // riskGates.claim(), matching canFire()'s non-claiming pre-check contract: a suppressed
-        // duplicate must not burn cooldown or rate-limit budget. In dry-run the paper fill never
-        // consumes depth, so the book keeps offering the identical edge; in live mode the venue's
-        // depth push lags a fill by 14-41ms, so a re-fire on the same signature prices leg 0 at a
-        // boundary that no longer exists and tends to break -- and a broken cycle costs ~13x a
-        // winning one (JOURNAL-BPS-ANALYSIS.md §12-15).
-        if (hasFiredSignature[triangleIndex] && fireSignatureUnchanged(triangleIndex)) {
+        // DUPLICATE-FIRE-TASK.md ("Fix A") + PRE-LIVE-PLAN.md P0-2(b): refuse to re-fire a triangle
+        // while the liquidity this order would consume is the liquidity the last fire consumed.
+        // Placed AFTER the threshold test and BEFORE riskGates.claim(), matching canFire()'s
+        // non-claiming pre-check contract: a suppressed duplicate must not burn cooldown or
+        // rate-limit budget. In dry-run the paper fill never consumes depth, so the book keeps
+        // offering the identical edge; in live mode the venue's depth push lags a fill by 14-41ms,
+        // so a re-fire on the same signature prices leg 0 at a boundary that no longer exists and
+        // tends to break -- and a broken cycle costs ~13x a winning one (JOURNAL-BPS-ANALYSIS.md
+        // §12-15). Two independent triggers, either one suppresses:
+        //   - fireSignatureUnchanged: ALL three legs identical, including the book write stamp --
+        //     Fix A's original rule, with no time bound (a truly static book stays suppressed).
+        //   - anyMaterialLegUnchanged: P0-2(b) -- BTCUSDT resets ~79x/h, so its write stamp keeps
+        //     advancing even when nothing material changed, and "one churning leg unlocks re-fires
+        //     against two frozen ones" defeated the rule above almost entirely (10 suppressions in
+        //     11h, on one triangle). Catches a MATERIALLY-sized leg whose price/depth genuinely
+        //     didn't move, bounded by duplicateWindowNanos so an old fire can't veto forever.
+        if (hasFiredSignature[triangleIndex]
+                && (fireSignatureUnchanged(triangleIndex)
+                    || (withinDuplicateWindow(triangleIndex, nowNanos) && anyMaterialLegUnchanged(triangleIndex)))) {
             metrics.recordDuplicateFireSuppressed(triangleIndex);
             journalReject(triangleIndex, tri.name(), true, edgeResult.netBps, edgeResult.grossBps,
                     chosenNotional, REASON_DUPLICATE, nowNanos);
@@ -287,7 +334,7 @@ public final class OpportunityDetector {
         metrics.recordOpportunityFired();
         // DUPLICATE-FIRE-TASK.md: store the signature ONLY now that the intent is actually enqueued
         // -- the queue-full branch above rolled the claim back and must stay re-fireable.
-        storeFireSignature(triangleIndex);
+        storeFireSignature(triangleIndex, nowNanos);
         journal.write(JournalEvents.opportunity(tri.name(), edgeResult.netBps, edgeResult.grossBps,
                 chosenNotional, true, null, 0,
                 edgeResult.legTopPriceFixed, edgeResult.legTouchQtyFixed,
@@ -310,13 +357,50 @@ public final class OpportunityDetector {
         return true;
     }
 
-    private void storeFireSignature(int triangleIndex) {
+    /** PRE-LIVE-PLAN.md P0-2(b): true iff at least one MATERIAL leg (this order's base quantity is
+     * at least {@link #duplicateMaterialFraction} of that leg's available touch quantity) has the
+     * same top price, the same worst (VWAP-walked) price, and a touch quantity that has NOT
+     * increased since the last fire -- i.e. nobody replenished it. The materiality gate excludes a
+     * deep, effectively-constant leg (USDCUSDT's top) from vetoing suppression on its own; without
+     * it, a naive "any leg matches" rule over-suppresses. Caller must have checked
+     * {@link #hasFiredSignature} first. */
+    private boolean anyMaterialLegUnchanged(int triangleIndex) {
+        int base = triangleIndex * 3;
+        for (int leg = 0; leg < 3; leg++) {
+            long touchQty = edgeResult.legTouchQtyFixed[leg];
+            if (touchQty <= 0) {
+                continue; // nothing recorded for this leg -- can't judge materiality
+            }
+            double materialRatio = (double) edgeResult.legBaseQtyFixed[leg] / (double) touchQty;
+            if (materialRatio < duplicateMaterialFraction) {
+                continue; // this leg's own share of the touch is too small to be decisive
+            }
+            if (lastFiredTopPx[base + leg] == edgeResult.legTopPriceFixed[leg]
+                    && lastFiredWorstPx[base + leg] == edgeResult.legWorstPriceFixed[leg]
+                    && edgeResult.legTouchQtyFixed[leg] <= lastFiredTouchQty[base + leg]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** PRE-LIVE-PLAN.md P0-2(b): the new any-material-leg rule, unlike Fix A's original all-legs
+     * rule, is bounded by a suppression window so a fire from long ago can't veto a fresh one
+     * forever. */
+    private boolean withinDuplicateWindow(int triangleIndex, long nowNanos) {
+        return nowNanos - lastFiredNanos[triangleIndex] <= duplicateWindowNanos;
+    }
+
+    private void storeFireSignature(int triangleIndex, long nowNanos) {
         int base = triangleIndex * 3;
         for (int leg = 0; leg < 3; leg++) {
             lastFiredWorstPx[base + leg] = edgeResult.legWorstPriceFixed[leg];
             lastFiredBaseQty[base + leg] = edgeResult.legBaseQtyFixed[leg];
             lastFiredWriteSeq[base + leg] = edgeResult.legWriteSeq[leg];
+            lastFiredTopPx[base + leg] = edgeResult.legTopPriceFixed[leg];
+            lastFiredTouchQty[base + leg] = edgeResult.legTouchQtyFixed[leg];
         }
+        lastFiredNanos[triangleIndex] = nowNanos;
         hasFiredSignature[triangleIndex] = true;
     }
 

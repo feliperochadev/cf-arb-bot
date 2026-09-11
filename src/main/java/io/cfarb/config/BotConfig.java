@@ -52,6 +52,8 @@ public interface BotConfig {
 
     FeesConfig fees();
 
+    DetectorConfig detector();
+
     interface VenueConfig {
         @WithDefault("wss://wbs-api.mexc.com/ws")
         String wsUrl();
@@ -294,5 +296,27 @@ public interface BotConfig {
          * appended. Chatty, but never on the tick path. */
         @WithDefault("false")
         boolean echoEvents();
+    }
+
+    /**
+     * PRE-LIVE-PLAN.md P0-2(b): tuning for {@code OpportunityDetector}'s per-triangle duplicate-fire
+     * suppression (DUPLICATE-FIRE-TASK.md "Fix A"). Fix A suppresses only when all three legs' fire
+     * signatures are unchanged, but a resetting-often leg (BTCUSDT resets ~79/h) keeps ONE leg's
+     * write stamp advancing continuously — "one churning leg unlocks re-fires against two frozen
+     * ones" — so the all-three rule almost never actually fires
+     * (cfarb_detector_duplicate_fire_total: 10 suppressions across 11h, on one triangle).
+     */
+    interface DetectorConfig {
+        /** A leg counts toward duplicate suppression only when its base quantity is at least this
+         * fraction of its touch quantity — stops a deep, effectively-constant leg (USDCUSDT's top)
+         * from vetoing suppression on its own. Outside {@code (0, 1]} FAILS THE BOOT (S6). */
+        @WithDefault("0.10")
+        double duplicateMaterialFraction();
+
+        /** A candidate identical to the last fire on every MATERIAL leg is suppressed only while the
+         * last fire is within this many ms — an old fire's signature does not veto a fresh one
+         * forever. */
+        @WithDefault("30000")
+        long duplicateWindowMs();
     }
 }
