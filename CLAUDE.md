@@ -215,9 +215,9 @@ ever enters `recorder-service`.
     fails the boot. Flows through `SymbolFilter` into both `EdgeCalculator` (`gross_bps`) and
     `Sizer` (`net_bps`).
   - **Still deferred from the task:** T1e (real book fix), T6 (per-symbol `max-book-age-ms`),
-    T7 (`config_snapshot` event), T8 (`Sizer` solves for size — gated on a plan §5.3 update + a T4
-    capture), T10 (triangle-universe pruning), T11 (`min-net-bps` / `slippage-buffer-bps` — operator,
-    and only after a clean re-capture).
+    T7 (`config_snapshot` event), T10 (triangle-universe pruning), T11 (`min-net-bps` /
+    `slippage-buffer-bps` — operator, and only after a clean re-capture). **T8 landed 2026-09-10** —
+    see `DYNAMIC-SIZING-TASK.md` below.
 - **ADDED 2026-09-10 (`DUPLICATE-FIRE-TASK.md` — "Fix A", `JOURNAL-BPS-ANALYSIS.md` §12–§15):**
   duplicate-fire suppression. The detector fired the same `usdt-btc-usdc-fwd` opportunity 5× in
   1.3 s (identical `detected_net_bps` to 10 dp, spaced at `cycle-cooldown-ms`) because
@@ -240,6 +240,58 @@ ever enters `recorder-service`.
   failure lands on the safe side by construction. **Out of scope:** "Fix B" (a consumption ledger in
   `Sizer` that makes dry-run *fill* behaviour realistic) — needs a plan §5.3 update. This makes the
   fire *count* honest, not the paper-fill *P&L*.
+- **ADDED 2026-09-10 (`DYNAMIC-SIZING-TASK.md`, Phase 1 + Phase 2):** gross early-out and dynamic
+  per-tick sizing.
+  - **Phase 1 — gross early-out.** `net_bps ≤ gross_bps` always (the ladder walk only moves to
+    worse prices, quantization only floors — confirmed empirically, 0 of 41,839 paired samples had
+    `net > gross`), so `grossBps ≤ gate` proves no size can clear the fire gate before the per-leg
+    ladder walk ever runs. Measured over 7.92M evaluations: 99.54% could not possibly have cleared
+    it. `EdgeCalculator.evaluate` gained a 5-arg overload (`bailBelowGrossBps`); the existing 4-arg
+    entry point `EdgeCalculatorTest`'s Python cross-check calls delegates to it with
+    `Double.NEGATIVE_INFINITY` and is byte-for-byte unchanged (non-negotiable #7). A bailed
+    candidate is journaled as `reject_reason: "below-gross-ceiling"` — distinct from `"unfillable"`
+    (the walk ran and failed) — and does **not** increment `cfarb.opportunities.rejected_unfillable`.
+    `OpportunityDetector` forces one full (non-bailed) evaluation per triangle per
+    `reject-sample-ms` window regardless, so `JOURNAL-BPS-ANALYSIS.md`'s paired
+    `(gross_bps, net_bps)` drag diagnostic keeps appearing on the journal even though most ticks now
+    skip the walk entirely; `cfarb_opportunities_detected_total`'s rate falls as a direct, expected
+    consequence (it now counts only fully-evaluated candidates), not a feed regression.
+  - **Phase 2 — dynamic per-tick sizing.** The operator's per-cycle notional cap
+    (`cf-bot.risk.max-notional-usd` / a triangle's own override) was being used as the SIZING
+    decision, not just a risk ceiling — but profit is `N × net(N)/10⁴`, and `N` is in the numerator.
+    `profit(N) = finalAmount(N) − N` is concave in the depth dimension (deeper ladder levels price
+    worse), so its maximiser sits at a ladder-level boundary. New pure helper
+    `Sizer.candidateInputs` enumerates up to 8 candidate sizes at leg 0's ladder boundaries
+    (notional cumulative for an ASK leg 0, quantity cumulative for a BID leg 0 — today every
+    configured triangle's leg 0 is ASK, but `Triangle` does not guarantee it), always clamped to and
+    including the cap itself. New `EdgeCalculator.evaluateBestSize` runs the same size-independent
+    gross pass and early-out, then walks the existing fill-in-full ladder logic once per candidate
+    into a preallocated scratch `Result`, keeping the one maximising absolute profit — **never
+    bps**. `OpportunityDetector` now calls this instead of the fixed-size entry point; the chosen
+    notional (`out.legInputAmount[0]`), not the cap, flows into the `OrderIntent` and the journal's
+    `notional_usd`. **Can only size DOWN** from `min(equity, cap)` — the S6 ceiling is untouched.
+    **Fill-in-full stays** (non-negotiable #10): every candidate is still evaluated through
+    `Sizer.fillLeg`, which still rejects any size the ladder can't absorb in full — this picks among
+    fully-fillable sizes, never partial-fills. **Fails closed:** no fillable candidate anywhere in
+    the search means `fillable = false`, same as before. `opportunity` journal events gained
+    `size_candidates` (how many sizes were walked) and `net_bps_at_cap` (what the OLD fixed-size
+    path would have produced sizing at the cap) — the A/B measurement that makes the "~2.8× more
+    profit per trade by optimising dollars instead of bps" claim (`JOURNAL-BPS-ANALYSIS.md` §14.1)
+    verifiable from a live capture, not just a two-point model fit. Both omitted when the search
+    never ran (a bailed candidate, or a line from the plain fixed-size `evaluate`).
+  - **Cross-check protected structurally, not by convention:** `EdgeCalculator.evaluate(triangle,
+    books, startAmount, out)` (the 4-arg entry point) is untouched; `evaluateBestSize` is additive
+    and calls into the same gross/pass-2 arithmetic. `EdgeCalculatorTest` adds a consistency
+    invariant — a direct `evaluate(...)` call at the notional `evaluateBestSize` chose must produce
+    an identical `Result` field-by-field — proving the search returns a real evaluation, not a
+    differently-computed one. `cf-arb-bot-plan.md` §5.3.1 was amended (a separate PR against
+    `cf-trader`) before this landed, per non-negotiable #7.
+  - **Known interaction, not a defect:** when `cf-bot.journal.reject-sample-ms ≤ 0` (sampling
+    disabled — "only sane for short local captures", per `EventJournal`'s own existing caveat), the
+    per-triangle diagnostic-forcing check (`nowNanos - lastFullEvalNanos ≥ rejectJournalIntervalNanos`
+    with the interval at `0`) is unconditionally true, so every tick fully evaluates and Phase 1's
+    gross early-out never actually bails in that mode. Harmless (strictly more work, never wrong),
+    but worth knowing before using `reject-sample-ms=0` to characterize Phase 1's CPU savings.
 - **Per-stage latency histograms are still blended**: `decisionToLeg1AckNanos` records the FULL
   place→reconcile→(commission-lookup) round trip for every leg into one histogram, not separate
   receipt→decode / decode→decision / queue-wait / leg-ack stages (Tier 3).

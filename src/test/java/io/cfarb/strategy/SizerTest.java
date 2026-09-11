@@ -95,4 +95,88 @@ class SizerTest {
                 FixedPoint.mulDiv(budget, FixedPoint.SCALE, FixedPoint.fromDouble(77850.0)), filter.qtyStep());
         assertEquals(expectedBase, out.baseQtyFixed);
     }
+
+    // --- DYNAMIC-SIZING-TASK.md Phase 2: candidateInputs -------------------------------------------
+
+    private static void seedBids(L2Book book, double[] bidPx, double[] bidQty) {
+        MexcDepthDecoder.DepthFrame f = new MexcDepthDecoder.DepthFrame();
+        f.fromVersion = -1;
+        f.toVersion = -1;
+        f.sendTimeMs = 0;
+        f.askCount = 1;
+        f.askPx[0] = FixedPoint.fromDouble(bidPx[0] + 1.0);
+        f.askQty[0] = FixedPoint.fromDouble(1_000.0);
+        f.bidCount = bidPx.length;
+        for (int i = 0; i < bidPx.length; i++) {
+            f.bidPx[i] = FixedPoint.fromDouble(bidPx[i]);
+            f.bidQty[i] = FixedPoint.fromDouble(bidQty[i]);
+        }
+        book.apply(f, System.nanoTime());
+    }
+
+    @Test
+    void candidateInputsOnAnAskBookReturnsAscendingCumulativeNotionalsClampedDeduped() {
+        L2Book b = book(1, 0);
+        // level0: 100 @ 10.0 -> notional 1000; level1: 100 @ 20.0 -> notional 2000, cumulative 3000.
+        seedAsks(b, new double[]{10.0, 20.0}, new double[]{100.0, 100.0});
+        long maxInput = FixedPoint.fromDouble(2_500.0); // between the two natural boundaries
+        long[] out = new long[8];
+
+        int n = Sizer.candidateInputs(b, Side.ASK, maxInput, out);
+
+        assertEquals(2, n);
+        assertEquals(1_000.0, FixedPoint.toDouble(out[0]), 0.01, "first boundary: level 0's own notional");
+        assertEquals(2_500.0, FixedPoint.toDouble(out[1]), 0.01, "second candidate clamped to maxInput");
+        assertTrue(out[0] < out[1], "ascending");
+    }
+
+    @Test
+    void candidateInputsOnABidBookReturnsCumulativeQuantities() {
+        L2Book b = book(1, 0);
+        seedBids(b, new double[]{10.0, 9.0}, new double[]{50.0, 50.0}); // cumulative qty 50, then 100
+        long maxInput = FixedPoint.fromDouble(1_000.0); // never reached by the book's own depth
+        long[] out = new long[8];
+
+        int n = Sizer.candidateInputs(b, Side.BID, maxInput, out);
+
+        assertEquals(3, n);
+        assertEquals(50.0, FixedPoint.toDouble(out[0]), 1e-6, "first boundary: level 0's own quantity");
+        assertEquals(100.0, FixedPoint.toDouble(out[1]), 1e-6, "second boundary: cumulative through level 1");
+        assertEquals(1_000.0, FixedPoint.toDouble(out[2]), 1e-6, "maxInput always appended, even beyond depth");
+    }
+
+    @Test
+    void candidateInputsRespectsTheEightSlotBoundAndAlwaysIncludesMaxInput() {
+        L2Book b = book(1, 0);
+        double[] px = new double[20];
+        double[] qty = new double[20];
+        for (int i = 0; i < 20; i++) {
+            px[i] = 10.0 + i; // each level's notional is small relative to maxInput
+            qty[i] = 1.0;
+        }
+        seedAsks(b, px, qty);
+        long maxInput = FixedPoint.fromDouble(1_000_000.0); // never reached within 20 shallow levels
+        long[] out = new long[8];
+
+        int n = Sizer.candidateInputs(b, Side.ASK, maxInput, out);
+
+        assertEquals(8, n, "bounded to the 8-slot array");
+        assertEquals(1_000_000.0, FixedPoint.toDouble(out[7]), 0.01, "maxInput occupies the final slot");
+        for (int i = 0; i < 6; i++) {
+            assertTrue(out[i] < out[i + 1], "ascending through the natural boundaries: index " + i);
+        }
+    }
+
+    @Test
+    void candidateInputsOnASingleLevelBookReturnsExactlyOneCandidate() {
+        L2Book b = book(1, 0);
+        seedAsks(b, new double[]{10.0}, new double[]{10_000.0}); // ample depth, well beyond maxInput
+        long maxInput = FixedPoint.fromDouble(500.0);
+        long[] out = new long[8];
+
+        int n = Sizer.candidateInputs(b, Side.ASK, maxInput, out);
+
+        assertEquals(1, n);
+        assertEquals(500.0, FixedPoint.toDouble(out[0]), 0.01);
+    }
 }

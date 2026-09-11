@@ -140,6 +140,55 @@ public final class Sizer {
         out.filled = true;
     }
 
+    /**
+     * DYNAMIC-SIZING-TASK.md Phase 2: cumulative input amounts at each ladder-level boundary of
+     * leg 0's book, best-first, ascending, each clamped to {@code maxInput}, plus {@code maxInput}
+     * itself as the final entry -- the candidate sizes {@code EdgeCalculator#evaluateBestSize}
+     * enumerates. {@code profit(N) = finalAmount(N) - N} is concave in the depth dimension (deeper
+     * levels price worse), so its maximum sits at one of these boundaries.
+     *
+     * <p>{@code ASK} (spending quote, buying base): cumulative {@code Σ askPxAt(i) * askQtyAt(i)} --
+     * a notional. {@code BID} (spending base, selling base): cumulative {@code Σ bidQtyAt(i)} -- a
+     * quantity. Today every configured triangle's leg 0 is ASK (the USDT anchor is the quote of
+     * every leg-0 symbol), but {@code Triangle} does not guarantee it and a USDC-anchored cycle
+     * would break that assumption, so both sides are handled.
+     *
+     * <p>Writes at most {@code out.length} candidates (reserving the final slot for {@code
+     * maxInput} itself, which is ALWAYS included, even when the book's own depth never reaches it —
+     * {@code Sizer#fillLeg} rejects that candidate on its own merits, same as any other unfillable
+     * size). Stops early, without emitting the boundary itself, the moment a level's cumulative
+     * would reach or exceed {@code maxInput} (that boundary is not a distinct candidate from the cap
+     * -- it collapses into the {@code maxInput} entry, which is how duplicates are avoided). Levels
+     * with a non-positive amount are skipped. Returns the count written; {@code 0} if
+     * {@code maxInput <= 0} or {@code out.length == 0}.
+     */
+    public static int candidateInputs(L2Book book, Side side, long maxInput, long[] out) {
+        if (maxInput <= 0 || out.length == 0) {
+            return 0;
+        }
+        int limit = out.length - 1; // reserve the last slot for maxInput itself
+        int n = 0;
+        long cumulative = 0;
+        int levelCount = side == Side.ASK ? book.askLevelCount() : book.bidLevelCount();
+        for (int i = 0; i < levelCount && n < limit; i++) {
+            long levelAmount = side == Side.ASK
+                    ? FixedPoint.mulDiv(book.askPxAt(i), book.askQtyAt(i), FixedPoint.SCALE)
+                    : book.bidQtyAt(i);
+            if (levelAmount <= 0) {
+                continue;
+            }
+            cumulative += levelAmount;
+            if (cumulative >= maxInput) {
+                break; // this boundary collapses into the maxInput entry appended below
+            }
+            out[n++] = cumulative;
+        }
+        if (n == 0 || out[n - 1] != maxInput) {
+            out[n++] = maxInput;
+        }
+        return n;
+    }
+
     /** Selling base for quote: inputAmount is BASE held; walk bids descending (best-first). */
     private static void fillBid(L2Book book, SymbolFilter filter, long baseHeld, Result out) {
         long qtyToSell = FixedPoint.quantizeDown(baseHeld, filter.qtyStep());

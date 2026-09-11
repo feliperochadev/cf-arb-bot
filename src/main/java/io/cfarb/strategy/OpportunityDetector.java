@@ -34,6 +34,10 @@ public final class OpportunityDetector {
      * signature is unchanged since the triangle's last fire — the book has not rewritten the
      * liquidity that fire aimed at, so re-firing would only race depth that is being consumed. */
     private static final int REASON_DUPLICATE = 2;
+    /** DYNAMIC-SIZING-TASK.md Phase 1: {@code grossBps} alone already proved no size could clear the
+     * gate, so the ladder walk never ran — distinct from {@link #REASON_UNFILLABLE}, which means the
+     * walk DID run and failed. Must not increment {@code recordOpportunityRejectedUnfillable()}. */
+    private static final int REASON_GROSS_BAIL = 3;
 
     private final BookRegistry books;
     private final TriangleRegistry triangles;
@@ -71,12 +75,24 @@ public final class OpportunityDetector {
     private final long[] pendingLegTouchQty;
     private final long[] pendingLegWorstPx;
     private final long[] pendingLegBaseQty;
+    // DYNAMIC-SIZING-TASK.md Phase 2: size_candidates / net_bps_at_cap, snapshotted from edgeResult
+    // alongside the rest of the window-best state above.
+    private final int[] pendingSizeCandidates;
+    private final double[] pendingNetBpsAtCap;
     // Reusable length-3 scratch for handing one triangle's leg slice to JournalEvents on emit --
     // allocated once, never on a per-candidate path.
     private final long[] emitLegTopPx = new long[3];
     private final long[] emitLegTouchQty = new long[3];
     private final long[] emitLegWorstPx = new long[3];
     private final long[] emitLegBaseQty = new long[3];
+
+    // --- DYNAMIC-SIZING-TASK.md Phase 1: force one full (non-bailed) evaluation per triangle per
+    // reject-sample window, so JOURNAL-BPS-ANALYSIS.md's paired (gross_bps, net_bps) drag diagnostic
+    // keeps appearing even though most ticks now skip the ladder walk entirely (the gross early-out
+    // makes ~99.5% of ticks provably unable to clear the gate, so their ladder walk is dead code at
+    // runtime -- see EdgeCalculator#evaluate's javadoc). Same "0 is not a safe sentinel" reasoning as
+    // windowStartNanos above.
+    private final long[] lastFullEvalNanos;
 
     // --- DUPLICATE-FIRE-TASK.md ("Fix A"): per-triangle last-fired signature ------------------
     // Detector-thread-only, like every array here -- no synchronization. Flat [triangleIndex*3 + leg]
@@ -121,15 +137,19 @@ public final class OpportunityDetector {
         this.pendingLegTouchQty = new long[n * 3];
         this.pendingLegWorstPx = new long[n * 3];
         this.pendingLegBaseQty = new long[n * 3];
+        this.pendingSizeCandidates = new int[n];
+        this.pendingNetBpsAtCap = new double[n];
         this.lastFiredWorstPx = new long[n * 3];
         this.lastFiredBaseQty = new long[n * 3];
         this.lastFiredWriteSeq = new long[n * 3];
         this.hasFiredSignature = new boolean[n];
+        this.lastFullEvalNanos = new long[n];
         // Same "0 is not a safe never-happened sentinel" reasoning as RiskGates' cooldown array:
         // nanoTime's origin is arbitrary per JVM. pendingSampledFrom==0 already means "no window
         // open", so windowStartNanos only matters once a window is open -- but seed it clear of
         // subtraction overflow anyway.
         java.util.Arrays.fill(windowStartNanos, Long.MIN_VALUE / 2);
+        java.util.Arrays.fill(lastFullEvalNanos, Long.MIN_VALUE / 2);
     }
 
     /** Called after {@code symbolIndex}'s book has just been updated. {@code nowNanos} must be
@@ -163,7 +183,26 @@ public final class OpportunityDetector {
             return;
         }
 
-        edgeCalculator.evaluate(tri, books, candidateNotional, edgeResult);
+        // DYNAMIC-SIZING-TASK.md Phase 1: force one full (non-bailed) evaluation per triangle per
+        // reject-sample window so the drag diagnostic keeps appearing; every other tick bails the
+        // instant grossBps proves no size could clear the fire gate (net <= gross always).
+        boolean wantDiagnostic = nowNanos - lastFullEvalNanos[triangleIndex] >= rejectJournalIntervalNanos;
+        double bail = wantDiagnostic ? Double.NEGATIVE_INFINITY : (minNetBps + slippageBufferBps);
+        // Phase 2: search the ladder-boundary candidate sizes up to candidateNotional (the cap) and
+        // keep the one maximising absolute profit, not bps -- candidateNotional above remains only
+        // the pre-check ceiling handed to riskGates.canFire.
+        edgeCalculator.evaluateBestSize(tri, books, candidateNotional, edgeResult, bail);
+        if (wantDiagnostic) {
+            lastFullEvalNanos[triangleIndex] = nowNanos;
+        }
+
+        if (edgeResult.bailedEarly) {
+            // Not "unfillable" -- grossBps alone already proved no size could clear the gate, so the
+            // ladder walk never ran. Must not count as recordOpportunityRejectedUnfillable().
+            journalReject(triangleIndex, tri.name(), false, Double.NaN, edgeResult.grossBps,
+                    candidateNotional, REASON_GROSS_BAIL, nowNanos);
+            return;
+        }
         if (!edgeResult.fillable) {
             metrics.recordOpportunityRejectedUnfillable();
             journalReject(triangleIndex, tri.name(), false, Double.NaN, edgeResult.grossBps,
@@ -171,9 +210,13 @@ public final class OpportunityDetector {
             return; // top-of-book may have looked good, but the real ladder/lot-size can't fill it
         }
         metrics.recordOpportunityDetected();
+        // DYNAMIC-SIZING-TASK.md Phase 2: the fire decision and every downstream consumer (the
+        // duplicate-fire signature, OrderIntent, journal notional_usd) use the SIZE THE SEARCH
+        // CHOSE, never the operator's cap -- the search can only choose <= candidateNotional (S6).
+        long chosenNotional = edgeResult.legInputAmount[0];
         if (edgeResult.netBps <= minNetBps + slippageBufferBps) {
             journalReject(triangleIndex, tri.name(), true, edgeResult.netBps, edgeResult.grossBps,
-                    candidateNotional, REASON_BELOW_THRESHOLD, nowNanos);
+                    chosenNotional, REASON_BELOW_THRESHOLD, nowNanos);
             return; // real edge doesn't clear threshold + slippage buffer
         }
 
@@ -189,7 +232,7 @@ public final class OpportunityDetector {
         if (hasFiredSignature[triangleIndex] && fireSignatureUnchanged(triangleIndex)) {
             metrics.recordDuplicateFireSuppressed(triangleIndex);
             journalReject(triangleIndex, tri.name(), true, edgeResult.netBps, edgeResult.grossBps,
-                    candidateNotional, REASON_DUPLICATE, nowNanos);
+                    chosenNotional, REASON_DUPLICATE, nowNanos);
             return;
         }
 
@@ -199,15 +242,16 @@ public final class OpportunityDetector {
         riskGates.claim(triangleIndex, nowNanos);
         long[] legPrices = java.util.Arrays.copyOf(edgeResult.legWorstPriceFixed, 3);
         long[] legBaseQty = java.util.Arrays.copyOf(edgeResult.legBaseQtyFixed, 3);
-        OrderIntent intent = new OrderIntent(nowNanos, triangleIndex, candidateNotional, edgeResult.netBps,
+        OrderIntent intent = new OrderIntent(nowNanos, triangleIndex, chosenNotional, edgeResult.netBps,
                 legPrices, legBaseQty);
         if (!orderQueue.offer(intent)) {
             riskGates.onCycleFinished(); // roll back the claim -- we couldn't even enqueue it
             metrics.recordOrderQueueDrop();
             journal.write(JournalEvents.opportunity(tri.name(), edgeResult.netBps, edgeResult.grossBps,
-                    candidateNotional, false, "order-queue-full", 0,
+                    chosenNotional, false, "order-queue-full", 0,
                     edgeResult.legTopPriceFixed, edgeResult.legTouchQtyFixed,
-                    edgeResult.legWorstPriceFixed, edgeResult.legBaseQtyFixed));
+                    edgeResult.legWorstPriceFixed, edgeResult.legBaseQtyFixed,
+                    edgeResult.sizeCandidates, edgeResult.netBpsAtCap));
             return;
         }
         metrics.recordOpportunityFired();
@@ -215,9 +259,10 @@ public final class OpportunityDetector {
         // -- the queue-full branch above rolled the claim back and must stay re-fireable.
         storeFireSignature(triangleIndex);
         journal.write(JournalEvents.opportunity(tri.name(), edgeResult.netBps, edgeResult.grossBps,
-                candidateNotional, true, null, 0,
+                chosenNotional, true, null, 0,
                 edgeResult.legTopPriceFixed, edgeResult.legTouchQtyFixed,
-                edgeResult.legWorstPriceFixed, edgeResult.legBaseQtyFixed));
+                edgeResult.legWorstPriceFixed, edgeResult.legBaseQtyFixed,
+                edgeResult.sizeCandidates, edgeResult.netBpsAtCap));
     }
 
     /** DUPLICATE-FIRE-TASK.md: true iff the current {@link #edgeResult} matches the stored
@@ -288,9 +333,13 @@ public final class OpportunityDetector {
         metrics.recordJournalSuppressed();
     }
 
-    /** A fillable (below-threshold) candidate always beats an unfillable one — it is strictly
-     * closer to firing. Within the same fillability, rank by the metric that matters: {@code netBps}
-     * for a fillable candidate, {@code grossBps} for an unfillable one (which has no {@code netBps}). */
+    /** A fillable (below-threshold) candidate always beats a non-fillable one — it is strictly
+     * closer to firing. "Non-fillable" now covers TWO distinct reasons (DYNAMIC-SIZING-TASK.md
+     * Phase 1): {@code REASON_UNFILLABLE} (the ladder walk ran and failed) and
+     * {@code REASON_GROSS_BAIL} (grossBps alone already proved no size could clear the gate, so the
+     * walk never ran) — both have a real {@code grossBps} and no {@code netBps}, so within the
+     * non-fillable tier they rank the same way, by {@code grossBps}. Within the fillable tier, rank
+     * by the metric that matters: {@code netBps}. */
     private boolean isBetterThanPending(int tri, boolean fillable, double netBps, double grossBps) {
         boolean pf = pendingFillable[tri];
         if (fillable != pf) {
@@ -306,6 +355,8 @@ public final class OpportunityDetector {
         pendingGrossBps[tri] = grossBps;
         pendingNotional[tri] = notional;
         pendingReason[tri] = reason;
+        pendingSizeCandidates[tri] = edgeResult.sizeCandidates;
+        pendingNetBpsAtCap[tri] = edgeResult.netBpsAtCap;
         int base = tri * 3;
         System.arraycopy(edgeResult.legTopPriceFixed, 0, pendingLegTopPx, base, 3);
         System.arraycopy(edgeResult.legTouchQtyFixed, 0, pendingLegTouchQty, base, 3);
@@ -321,7 +372,8 @@ public final class OpportunityDetector {
         System.arraycopy(pendingLegBaseQty, base, emitLegBaseQty, 0, 3);
         journal.write(JournalEvents.opportunity(name, pendingNetBps[tri], pendingGrossBps[tri],
                 pendingNotional[tri], false, reasonString(pendingReason[tri]), pendingSampledFrom[tri],
-                emitLegTopPx, emitLegTouchQty, emitLegWorstPx, emitLegBaseQty));
+                emitLegTopPx, emitLegTouchQty, emitLegWorstPx, emitLegBaseQty,
+                pendingSizeCandidates[tri], pendingNetBpsAtCap[tri]));
         pendingSampledFrom[tri] = 0;
     }
 
@@ -331,13 +383,15 @@ public final class OpportunityDetector {
         journal.write(JournalEvents.opportunity(name, netBps, grossBps, notional, false,
                 reasonString(reason), sampledFrom,
                 edgeResult.legTopPriceFixed, edgeResult.legTouchQtyFixed,
-                edgeResult.legWorstPriceFixed, edgeResult.legBaseQtyFixed));
+                edgeResult.legWorstPriceFixed, edgeResult.legBaseQtyFixed,
+                edgeResult.sizeCandidates, edgeResult.netBpsAtCap));
     }
 
     private static String reasonString(int reason) {
         return switch (reason) {
             case REASON_UNFILLABLE -> "unfillable";
             case REASON_DUPLICATE -> "duplicate-signature";
+            case REASON_GROSS_BAIL -> "below-gross-ceiling";
             default -> "below-threshold";
         };
     }

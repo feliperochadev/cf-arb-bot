@@ -56,7 +56,26 @@ public final class JournalEvents {
                                       boolean fired, String rejectReason, int sampledFrom,
                                       long[] legTopPxFixed, long[] legTouchQtyFixed,
                                       long[] legWorstPxFixed, long[] legBaseQtyFixed) {
-        StringBuilder sb = new StringBuilder(160);
+        return opportunity(triangleName, netBps, grossBps, notionalFixed, fired, rejectReason, sampledFrom,
+                legTopPxFixed, legTouchQtyFixed, legWorstPxFixed, legBaseQtyFixed, 0, Double.NaN);
+    }
+
+    /**
+     * Richest form (DYNAMIC-SIZING-TASK.md Phase 2), adding the dynamic-sizing A/B measurement on
+     * top of the T2/T4 form above: {@code size_candidates} (how many ladder-boundary sizes
+     * {@code EdgeCalculator#evaluateBestSize} walked) and {@code net_bps_at_cap} (what the OLD
+     * fixed-size path would have produced sizing at the operator's cap). Comparing {@code net_bps}
+     * against {@code net_bps_at_cap} on the same line is what makes the "optimising dollars beats
+     * optimising bps" claim (JOURNAL-BPS-ANALYSIS.md §14.1) verifiable from a live capture instead
+     * of a two-point model fit. Both fields are omitted when {@code sizeCandidates <= 0} — a bailed
+     * candidate, or one produced by the plain fixed-size {@code evaluate}, never ran the search.
+     */
+    public static String opportunity(String triangleName, double netBps, double grossBps, long notionalFixed,
+                                      boolean fired, String rejectReason, int sampledFrom,
+                                      long[] legTopPxFixed, long[] legTouchQtyFixed,
+                                      long[] legWorstPxFixed, long[] legBaseQtyFixed,
+                                      int sizeCandidates, double netBpsAtCap) {
+        StringBuilder sb = new StringBuilder(192);
         sb.append("{\"type\":\"opportunity\",\"ts_us\":").append(EpochMicros.now())
                 .append(",\"triangle\":\"").append(esc(triangleName)).append('"')
                 .append(",\"net_bps\":").append(jsonNumber(netBps))
@@ -75,6 +94,10 @@ public final class JournalEvents {
             sb.append(",\"leg_touch_qty\":").append(jsonArr3(legTouchQtyFixed));
             sb.append(",\"leg_worst_px\":").append(jsonArr3(legWorstPxFixed));
             sb.append(",\"leg_base_qty\":").append(jsonArr3(legBaseQtyFixed));
+        }
+        if (sizeCandidates > 0) {
+            sb.append(",\"size_candidates\":").append(sizeCandidates);
+            sb.append(",\"net_bps_at_cap\":").append(jsonNumber(netBpsAtCap));
         }
         return sb.append('}').toString();
     }
