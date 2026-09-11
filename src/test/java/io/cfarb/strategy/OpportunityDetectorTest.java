@@ -650,6 +650,68 @@ class OpportunityDetectorTest {
         assertEquals(1, drain(queue), "the fire after a failed offer must go through -- signature was not stored");
     }
 
+    // --- PRE-LIVE-PLAN.md P0-2(c): post-reset quarantine --------------------------------------
+
+    @Test
+    void quarantinesATriangleWithARecentlyResetLegThenFiresOnceTheWindowElapses() throws Exception {
+        SpscArrayQueue<OrderIntent> queue = new SpscArrayQueue<>(16);
+        BookRegistry books = new BookRegistry(FIRING_SYMBOLS, 1, 0);
+        Map<String, SymbolFilter> filters = Map.of(
+                "USDCUSDT", filter("USDCUSDT", "USDC", "USDT", 0.0),
+                "XRPUSDC", filter("XRPUSDC", "XRP", "USDC", 0.0),
+                "XRPUSDT", filter("XRPUSDT", "XRP", "USDT", 0.0));
+        Map<String, BotConfig.TriangleConfig> triangleConfigs = Map.of(
+                "usdt-usdc-xrp-fwd", triangleConfig(List.of("USDCUSDT:ASK", "XRPUSDC:ASK", "XRPUSDT:BID")));
+        TriangleRegistry triangles = new TriangleRegistry(triangleConfigs, "USDT", books, filters);
+        Portfolio portfolio = new Portfolio(FixedPoint.fromDouble(1_000.0));
+        KillSwitch ks = new KillSwitch(portfolio, FixedPoint.fromDouble(1.0), 3);
+        RiskGates gates = new RiskGates(firingRisk(), strategy(), exec(), triangles.triangleCount(), ks, true);
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        BotMetrics metrics = new BotMetrics(registry);
+        metrics.initRuntimeCounters(triangles.triangleNames(), FIRING_SYMBOLS);
+        EventJournal journal = new EventJournal(tempDir, metrics, false);
+        journal.start();
+        long quarantineMs = 2_000;
+        OpportunityDetector detector = new OpportunityDetector(books, triangles, gates, portfolio,
+                metrics, journal, queue, 5.0, 1.0, true, 0L, quarantineMs);
+
+        int xrpusdt = books.indexOf("XRPUSDT");
+        long t0 = 10_000_000_000L;
+        // Simulate the XRPUSDT leg having just reset (self-heal / gap / reconnect) at t0, then
+        // immediately re-warming with a profitable book -- isTrusted() is true right away
+        // (warmupUpdates=1), but the leg is still within the quarantine window.
+        books.book(xrpusdt).reset(t0);
+        seedProfitable(books, t0);
+
+        long t500 = t0 + 500 * NS;
+        detector.onBookUpdated(xrpusdt, t500);
+        assertEquals(0, drain(queue), "quarantined: must not fire 500ms after the leg reset");
+        assertEquals(1.0, registry.get("cfarb.detector.post_reset_skip").tag("symbol", "XRPUSDT")
+                .counter().count(), 1e-9);
+
+        long t3000 = t0 + 3_000 * NS;
+        detector.onBookUpdated(xrpusdt, t3000);
+        assertEquals(1, drain(queue), "quarantine window elapsed: must fire normally");
+        journal.stop();
+    }
+
+    @Test
+    void quarantineDisabledAtZeroNeverSkips() throws Exception {
+        SpscArrayQueue<OrderIntent> queue = new SpscArrayQueue<>(16);
+        Rig rig = firingRig(queue); // firingRig's 10-arg constructor call defaults quarantine to 0 (disabled)
+        int xrpusdt = rig.books().indexOf("XRPUSDT");
+        long t0 = 10_000_000_000L;
+        rig.books().book(xrpusdt).reset(t0);
+        seedProfitable(rig.books(), t0);
+
+        // Immediately after the reset -- would be quarantined if enabled, but it is not.
+        rig.detector().onBookUpdated(xrpusdt, t0);
+
+        awaitOpportunities(1);
+        rig.journal().stop();
+        assertEquals(1, drain(queue), "quarantine disabled (0) must never skip a fire");
+    }
+
     private List<JsonNode> awaitOpportunities(int expected) throws IOException, InterruptedException {
         for (int i = 0; i < 200; i++) {
             List<JsonNode> opps = readOpportunities();

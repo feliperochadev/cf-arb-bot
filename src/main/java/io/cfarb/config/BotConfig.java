@@ -235,6 +235,16 @@ public interface BotConfig {
          * pre-JOURNAL-TUNING behavior, only sane for a short diagnostic capture. */
         @WithDefault("500")
         long maxCrossedMs();
+
+        /** PRE-LIVE-PLAN.md P0-2(c): a book that just {@code reset()} (crossed-latch self-heal, a
+         * version-chain gap, or reconnect) is {@code isTrusted()} again within roughly 55ms on a
+         * ~900msg/s symbol (see {@code L2Book#lastResetNanos}'s javadoc) — a ladder rebuilt from a
+         * handful of deltas, not a real book. {@code OpportunityDetector} refuses any triangle with
+         * a leg reset more recently than this, regardless of {@code isTrusted()}. {@code 0} DISABLES
+         * the quarantine entirely and logs a startup WARN — only sane for a short diagnostic
+         * capture; a negative value FAILS THE BOOT (S6). */
+        @WithDefault("2000")
+        long postResetQuarantineMs();
     }
 
     /**

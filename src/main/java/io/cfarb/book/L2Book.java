@@ -94,6 +94,17 @@ public final class L2Book {
      * on the hot path. volatile for the same cross-thread-read reason as {@link #crossedSinceNanos}. */
     private volatile long crossedResetCount;
 
+    /** PRE-LIVE-PLAN.md P0-2(c): nanoTime this book was last {@link #reset}, by ANY path -- the
+     * crossed-latch self-heal, a version-chain gap, or an external {@code BookRegistry#resetAll}
+     * (reconnect). {@code maybePromote}'s {@code updateCount >= warmupUpdates || elapsed >=
+     * warmupNanos} OR-promotion means a book back on a ~900msg/s symbol is {@code isTrusted()}
+     * again in roughly 55ms, carrying a ladder rebuilt from a handful of deltas -- nowhere near a
+     * full book (LIVE-REALISATION-ANALYSIS.md: 12% of BTCUSDT resets fired on a book holding fewer
+     * than 50 updates). {@code OpportunityDetector} quarantines a triangle whose leg reset too
+     * recently, regardless of {@code isTrusted()}. volatile for the same cross-thread-read reason as
+     * {@link #crossedSinceNanos}; the detector reads it on this book's own thread, never a race. */
+    private volatile long lastResetNanos = Long.MIN_VALUE / 2;
+
     // cf-arb-bot-review-plan.md (second pass) Tier A4: published top-of-book, read by the executor
     // thread ONLY for pricing an emergency unwind reversal (exec.Unwinder) -- never for a trading
     // DECISION, which stays exclusively on this book-owning Netty event-loop thread via the normal
@@ -117,7 +128,16 @@ public final class L2Book {
         this.maxCrossedNanos = maxCrossedMs > 0 ? maxCrossedMs * 1_000_000L : 0L;
     }
 
+    /** Rare, off-tick-path callers (e.g. {@code BookRegistry#resetAll} on reconnect) that don't
+     * already have {@code nowNanos} in scope. */
     public void reset() {
+        reset(System.nanoTime());
+    }
+
+    /** PRE-LIVE-PLAN.md P0-2(c): callers on the tick path (the crossed-latch self-heal and the
+     * version-chain-gap reset inside {@link #apply}) must pass the SAME {@code nowNanos} they
+     * already have, never a fresh {@code System.nanoTime()} call (rule R1). */
+    public void reset(long nowNanos) {
         bidCount = 0;
         askCount = 0;
         updateCount = 0;
@@ -127,6 +147,7 @@ public final class L2Book {
         topBidFixed = Long.MIN_VALUE;
         topAskFixed = Long.MIN_VALUE;
         crossedSinceNanos = -1;
+        lastResetNanos = nowNanos;
         // DUPLICATE-FIRE-TASK.md: writeSeq is deliberately NOT reset -- see its field javadoc. Levels
         // rebuilt after a reset must carry strictly higher stamps than any signature the detector
         // still holds so a re-warmed book always re-fires.
@@ -146,12 +167,12 @@ public final class L2Book {
         // so isTrusted() re-gates every triangle touching this symbol until it re-warms (rule S5).
         if (maxCrossedNanos > 0 && crossedSinceNanos >= 0
                 && nowNanos - crossedSinceNanos >= maxCrossedNanos) {
-            reset();
+            reset(nowNanos);
             crossedResetCount++;
         }
         boolean gap = lastToVersion >= 0 && f.fromVersion >= 0 && f.fromVersion > lastToVersion + 1;
         if (gap) {
-            reset();
+            reset(nowNanos);
         }
         for (int i = 0; i < f.bidCount; i++) {
             applyLevel(true, f.bidPx[i], f.bidQty[i]);
@@ -356,6 +377,12 @@ public final class L2Book {
      * performed. The feed watchdog diffs this per symbol to journal a {@code book_reset} event. */
     public long crossedResetCount() {
         return crossedResetCount;
+    }
+
+    /** PRE-LIVE-PLAN.md P0-2(c): nanoTime this book was last {@link #reset} by any path, or a
+     * sentinel far in the past if it has never reset. See the field javadoc for why. */
+    public long lastResetNanos() {
+        return lastResetNanos;
     }
 
     /** Published top-of-book, for {@code exec.Unwinder}'s emergency reversal pricing ONLY (Tier

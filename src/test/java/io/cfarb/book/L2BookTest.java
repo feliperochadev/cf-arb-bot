@@ -322,6 +322,67 @@ class L2BookTest {
                 "writeSeq is monotonic across reset() so a re-warmed book always beats a stale signature");
     }
 
+    // --- PRE-LIVE-PLAN.md P0-2(c): lastResetNanos ------------------------------------------------
+
+    @Test
+    void lastResetNanosAdvancesOnACrossedLatchSelfHealReset() {
+        L2Book book = new L2Book(10, 3600, 500L); // heal after 500ms crossed; 10 updates to warm
+        long t = 1_000_000_000L;
+        for (int i = 0; i < 10; i++) {
+            MexcDepthDecoder.DepthFrame warm = frame(-1, -1);
+            addBid(warm, 100L, 10L);
+            addAsk(warm, 101L, 10L);
+            book.apply(warm, t);
+        }
+        long beforeCross = book.lastResetNanos();
+
+        MexcDepthDecoder.DepthFrame cross = frame(-1, -1);
+        addBid(cross, 105L, 5L);
+        book.apply(cross, t + 1_000_000L);
+
+        MexcDepthDecoder.DepthFrame heal = frame(-1, -1);
+        addBid(heal, 200L, 3L);
+        addAsk(heal, 201L, 3L);
+        long healNanos = t + 601_000_000L;
+        book.apply(heal, healNanos);
+
+        assertEquals(1, book.crossedResetCount(), "sanity: the self-heal actually fired");
+        assertEquals(healNanos, book.lastResetNanos(), "lastResetNanos must be the frame's own nowNanos");
+        assertTrue(book.lastResetNanos() > beforeCross);
+    }
+
+    @Test
+    void lastResetNanosAdvancesOnAnExplicitReset() {
+        L2Book book = new L2Book(1, 3600);
+        long beforeReset = book.lastResetNanos();
+        book.reset(5_000_000_000L);
+        assertEquals(5_000_000_000L, book.lastResetNanos());
+        assertTrue(book.lastResetNanos() > beforeReset);
+    }
+
+    @Test
+    void lastResetNanosAdvancesOnAVersionChainGapReset() {
+        L2Book book = new L2Book(1, 3600);
+        MexcDepthDecoder.DepthFrame f1 = frame(1, 5);
+        addBid(f1, 100L, 10L);
+        addAsk(f1, 101L, 10L);
+        book.apply(f1, 1_000_000_000L);
+
+        MexcDepthDecoder.DepthFrame f2 = frame(10, 12); // gap: expected fromVersion 6, got 10
+        addBid(f2, 200L, 20L);
+        long gapNanos = 2_000_000_000L;
+        book.apply(f2, gapNanos);
+
+        assertEquals(gapNanos, book.lastResetNanos(), "a gap-triggered reset must record the frame's nowNanos too");
+    }
+
+    @Test
+    void noArgResetStillAdvancesLastResetNanos() {
+        L2Book book = new L2Book(1, 3600);
+        book.reset(); // rare off-tick-path callers (BookRegistry#resetAll) use the no-arg form
+        assertTrue(book.lastResetNanos() > Long.MIN_VALUE / 2, "no-arg reset() must stamp a real nowNanos");
+    }
+
     @Test
     void applyLevelRemovesAZeroQuantityLevel() {
         L2Book book = new L2Book(1, 3600);

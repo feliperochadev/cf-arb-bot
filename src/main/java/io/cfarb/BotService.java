@@ -152,9 +152,10 @@ public class BotService {
         killSwitch.checkEquityFloor();
 
         SpscArrayQueue<OrderIntent> orderQueue = new SpscArrayQueue<>(256);
+        long postResetQuarantineMs = resolvePostResetQuarantineMs();
         OpportunityDetector detector = new OpportunityDetector(books, triangles, riskGates, portfolio,
                 metrics, journal, orderQueue, config.strategy().minNetBps(), config.strategy().slippageBufferBps(),
-                config.capital().compound(), config.journal().rejectSampleMs());
+                config.capital().compound(), config.journal().rejectSampleMs(), postResetQuarantineMs);
 
         // cf-arb-bot-review-plan.md Tier 1 step 1.9: MexcRestClient (and therefore the signer) is
         // now constructed in BOTH modes, so dry-run can build and sign every request through the
@@ -582,6 +583,28 @@ public class BotService {
             return 0;
         }
         LOG.infof("L2 book crossed-latch self-heal: reset after %dms crossed (cf-bot.book.max-crossed-ms)", ms);
+        return ms;
+    }
+
+    /** PRE-LIVE-PLAN.md P0-2(c): {@code cf-bot.book.post-reset-quarantine-ms}. {@code 0} is an
+     * explicit opt-out (loud WARN, same shape as {@link #resolveMaxCrossedMs}); a negative value is
+     * a misconfiguration and FAILS THE BOOT (S6) rather than silently behaving like 0. */
+    private long resolvePostResetQuarantineMs() {
+        long ms = config.book().postResetQuarantineMs();
+        if (ms < 0) {
+            throw new IllegalStateException(
+                    "cf-bot.book.post-reset-quarantine-ms must be >= 0, got " + ms);
+        }
+        if (ms == 0) {
+            LOG.warnf("*** cf-bot.book.post-reset-quarantine-ms=0 -- the post-reset quarantine is "
+                    + "DISABLED. A book that just reset can be isTrusted() again within ~55ms on a "
+                    + "busy symbol, carrying a ladder rebuilt from a handful of deltas "
+                    + "(LIVE-REALISATION-ANALYSIS.md: 12% of BTCUSDT resets fired on a book holding "
+                    + "fewer than 50 updates).");
+            return 0;
+        }
+        LOG.infof("post-reset quarantine: refuse a triangle with a leg reset within %dms "
+                + "(cf-bot.book.post-reset-quarantine-ms)", ms);
         return ms;
     }
 

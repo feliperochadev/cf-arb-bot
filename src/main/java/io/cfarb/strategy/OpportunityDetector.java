@@ -56,6 +56,10 @@ public final class OpportunityDetector {
     private final EdgeCalculator.Result edgeResult = new EdgeCalculator.Result();
 
     private final long rejectJournalIntervalNanos;
+    // PRE-LIVE-PLAN.md P0-2(c): refuse a triangle with a leg that reset (crossed-latch self-heal, a
+    // version-chain gap, or reconnect) more recently than this, regardless of isTrusted() -- see
+    // L2Book#lastResetNanos's javadoc. 0 disables the quarantine (BotService logs a startup WARN).
+    private final long postResetQuarantineNanos;
 
     // --- JOURNAL-TUNING-TASK.md T2: per-triangle running-best reject inside each sample window ---
     // Detector-thread-only, like every counter here -- no synchronization. Emitted (one NDJSON line
@@ -112,6 +116,15 @@ public final class OpportunityDetector {
                                 SpscArrayQueue<OrderIntent> orderQueue,
                                 double minNetBps, double slippageBufferBps, boolean compound,
                                 long rejectJournalIntervalMs) {
+        this(books, triangles, riskGates, portfolio, metrics, journal, orderQueue, minNetBps,
+                slippageBufferBps, compound, rejectJournalIntervalMs, 0L);
+    }
+
+    public OpportunityDetector(BookRegistry books, TriangleRegistry triangles, RiskGates riskGates,
+                                Portfolio portfolio, BotMetrics metrics, EventJournal journal,
+                                SpscArrayQueue<OrderIntent> orderQueue,
+                                double minNetBps, double slippageBufferBps, boolean compound,
+                                long rejectJournalIntervalMs, long postResetQuarantineMs) {
         this.books = books;
         this.triangles = triangles;
         this.riskGates = riskGates;
@@ -124,6 +137,7 @@ public final class OpportunityDetector {
         this.compound = compound;
         this.seedFixed = portfolio.seed();
         this.rejectJournalIntervalNanos = rejectJournalIntervalMs * 1_000_000L;
+        this.postResetQuarantineNanos = postResetQuarantineMs * 1_000_000L;
 
         int n = Math.max(1, triangles.triangleCount());
         this.windowStartNanos = new long[n];
@@ -170,6 +184,17 @@ public final class OpportunityDetector {
             metrics.recordDetectorStaleSkip(triangleIndex);
             metrics.recordDetectorStaleSkipLeg(tri.symbolIndex()[staleLeg]);
             return; // fail closed: a stale/crossed/untrusted leg never reaches EdgeCalculator (S5)
+        }
+        if (postResetQuarantineNanos > 0) {
+            int quarantinedLeg = firstQuarantinedLeg(tri, nowNanos);
+            if (quarantinedLeg >= 0) {
+                // PRE-LIVE-PLAN.md P0-2(c): a leg that JUST reset can already be isTrusted() (the
+                // stale-leg check above already passed) on a ladder rebuilt from a handful of
+                // deltas -- nowhere near a full book. Same shape as the stale-skip branch above,
+                // its own counter so an operator can tell "quarantined" from "genuinely stale".
+                metrics.recordPostResetSkip(tri.symbolIndex()[quarantinedLeg]);
+                return;
+            }
         }
 
         // cf-arb-bot-review-plan.md Tier 2 step 2.7: size at min(eligible anchor balance, cap);
@@ -411,6 +436,20 @@ public final class OpportunityDetector {
                 return leg;
             }
             if (!riskGates.isBookFresh(book.ageNanos(nowNanos))) {
+                return leg;
+            }
+        }
+        return -1;
+    }
+
+    /** PRE-LIVE-PLAN.md P0-2(c): returns the index (0..2) of the first leg whose book reset more
+     * recently than {@link #postResetQuarantineNanos}, or -1 if every leg is clear. Only called
+     * when the quarantine is enabled ({@code postResetQuarantineNanos > 0}). */
+    private int firstQuarantinedLeg(Triangle tri, long nowNanos) {
+        int[] symbolIndex = tri.symbolIndex();
+        for (int leg = 0; leg < 3; leg++) {
+            L2Book book = books.book(symbolIndex[leg]);
+            if (nowNanos - book.lastResetNanos() < postResetQuarantineNanos) {
                 return leg;
             }
         }

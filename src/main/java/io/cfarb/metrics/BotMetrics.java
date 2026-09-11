@@ -42,6 +42,10 @@ public class BotMetrics {
     // (unit tests that construct BotMetrics directly): the record* methods no-op in that case.
     private Counter[] detectorStaleSkipByTriangle;
     private Counter[] detectorStaleSkipLegBySymbol;
+    // PRE-LIVE-PLAN.md P0-2(c): per-symbol count of triangles refused because a leg reset too
+    // recently (post-reset quarantine) -- distinct from detectorStaleSkipLegBySymbol so an operator
+    // can tell "quarantined" from "genuinely stale/untrusted/crossed".
+    private Counter[] postResetSkipBySymbol;
     // DUPLICATE-FIRE-TASK.md ("Fix A"): per-triangle count of fires suppressed because the book
     // levels the order would consume are unchanged (same worst price, base qty, and write stamp) at
     // the last fire. Same flat-array pattern as the T3 counters -- lock-free array increment on the
@@ -135,10 +139,13 @@ public class BotMetrics {
         }
         detectorStaleSkipLegBySymbol = new Counter[symbolNames.size()];
         bookCrossedBySymbol = new Counter[symbolNames.size()];
+        postResetSkipBySymbol = new Counter[symbolNames.size()];
         for (int i = 0; i < symbolNames.size(); i++) {
             detectorStaleSkipLegBySymbol[i] = registry.counter("cfarb.detector.stale_skip_leg",
                     "symbol", symbolNames.get(i));
             bookCrossedBySymbol[i] = registry.counter("cfarb.book.crossed", "symbol", symbolNames.get(i));
+            postResetSkipBySymbol[i] = registry.counter("cfarb.detector.post_reset_skip",
+                    "symbol", symbolNames.get(i));
         }
     }
 
@@ -151,6 +158,12 @@ public class BotMetrics {
     /** JOURNAL-TUNING-TASK.md T3: attributes a stale-skip to the FIRST failing leg's symbol. */
     public void recordDetectorStaleSkipLeg(int symbolIndex) {
         if (detectorStaleSkipLegBySymbol != null) detectorStaleSkipLegBySymbol[symbolIndex].increment();
+    }
+
+    /** PRE-LIVE-PLAN.md P0-2(c): a triangle was refused because {@code symbolIndex}'s leg reset more
+     * recently than {@code cf-bot.book.post-reset-quarantine-ms}. */
+    public void recordPostResetSkip(int symbolIndex) {
+        if (postResetSkipBySymbol != null) postResetSkipBySymbol[symbolIndex].increment();
     }
 
     /** DUPLICATE-FIRE-TASK.md ("Fix A"): a fire was suppressed because the triangle's fire signature
