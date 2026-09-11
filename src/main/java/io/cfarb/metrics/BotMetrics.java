@@ -55,6 +55,9 @@ public class BotMetrics {
     // budget (RiskGates#windowBudgetWouldBlock) -- same flat-array pattern as the other per-triangle
     // counters here.
     private Counter[] windowBudgetBlockByTriangle;
+    // PRE-LIVE-PLAN.md P0-2(d): per-triangle count of candidates refused because one leg was frozen
+    // while another was actively moving (the stale-leg guard).
+    private Counter[] staleLegByTriangle;
     // JOURNAL-TUNING-TASK.md T1b: crossed-book episode counter, pre-resolved by symbol index.
     private Counter[] bookCrossedBySymbol;
     // JOURNAL-TUNING-TASK.md T1c: crossed-latch self-heal resets, keyed by "symbol|reason". Lazily
@@ -129,12 +132,15 @@ public class BotMetrics {
         detectorStaleSkipByTriangle = new Counter[triangleNames.size()];
         duplicateFireByTriangle = new Counter[triangleNames.size()];
         windowBudgetBlockByTriangle = new Counter[triangleNames.size()];
+        staleLegByTriangle = new Counter[triangleNames.size()];
         for (int i = 0; i < triangleNames.size(); i++) {
             detectorStaleSkipByTriangle[i] = registry.counter("cfarb.detector.stale_skip",
                     "triangle", triangleNames.get(i));
             duplicateFireByTriangle[i] = registry.counter("cfarb.detector.duplicate_fire",
                     "triangle", triangleNames.get(i));
             windowBudgetBlockByTriangle[i] = registry.counter("cfarb.risk.window_budget_block",
+                    "triangle", triangleNames.get(i));
+            staleLegByTriangle[i] = registry.counter("cfarb.detector.stale_leg",
                     "triangle", triangleNames.get(i));
         }
         detectorStaleSkipLegBySymbol = new Counter[symbolNames.size()];
@@ -175,6 +181,12 @@ public class BotMetrics {
     /** PRE-LIVE-PLAN.md P0-2(a): a fire was blocked by the rolling-window notional budget. */
     public void recordWindowBudgetBlock(int triangleIndex) {
         if (windowBudgetBlockByTriangle != null) windowBudgetBlockByTriangle[triangleIndex].increment();
+    }
+
+    /** PRE-LIVE-PLAN.md P0-2(d): a candidate was refused because one leg was frozen while another
+     * was actively moving (the stale-leg guard). */
+    public void recordStaleLeg(int triangleIndex) {
+        if (staleLegByTriangle != null) staleLegByTriangle[triangleIndex].increment();
     }
 
     /** JOURNAL-TUNING-TASK.md T1b: a book first went crossed (one increment per crossed episode,

@@ -568,6 +568,32 @@ class OpportunityDetectorTest {
         return new Rig(books, detector, journal, registry);
     }
 
+    /** Same rig as {@link #firingRig}, but with an EXPLICIT stale-leg guard configuration (PRE-LIVE-PLAN.md
+     * P0-2(d)) instead of the constructor's own defaults. */
+    private Rig firingRigWithStaleLeg(SpscArrayQueue<OrderIntent> queue, long staleLegFrozenMs,
+                                       long staleLegActiveMs) throws IOException {
+        BookRegistry books = new BookRegistry(FIRING_SYMBOLS, 1, 0);
+        Map<String, SymbolFilter> filters = Map.of(
+                "USDCUSDT", filter("USDCUSDT", "USDC", "USDT", 0.0),
+                "XRPUSDC", filter("XRPUSDC", "XRP", "USDC", 0.0),
+                "XRPUSDT", filter("XRPUSDT", "XRP", "USDT", 0.0));
+        Map<String, BotConfig.TriangleConfig> triangleConfigs = Map.of(
+                "usdt-usdc-xrp-fwd", triangleConfig(List.of("USDCUSDT:ASK", "XRPUSDC:ASK", "XRPUSDT:BID")));
+        TriangleRegistry triangles = new TriangleRegistry(triangleConfigs, "USDT", books, filters);
+        Portfolio portfolio = new Portfolio(FixedPoint.fromDouble(1_000.0));
+        KillSwitch ks = new KillSwitch(portfolio, FixedPoint.fromDouble(1.0), 3);
+        RiskGates gates = new RiskGates(firingRisk(), strategy(), exec(), triangles.triangleCount(), ks, true);
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        BotMetrics metrics = new BotMetrics(registry);
+        metrics.initRuntimeCounters(triangles.triangleNames(), FIRING_SYMBOLS);
+        EventJournal journal = new EventJournal(tempDir, metrics, false);
+        journal.start();
+        OpportunityDetector detector = new OpportunityDetector(books, triangles, gates, portfolio,
+                metrics, journal, queue, 5.0, 1.0, true, 0L, 0L,
+                0.10, 30_000L, staleLegFrozenMs, staleLegActiveMs);
+        return new Rig(books, detector, journal, registry);
+    }
+
     private static int drain(SpscArrayQueue<OrderIntent> q) {
         int c = 0;
         while (q.poll() != null) {
@@ -846,6 +872,64 @@ class OpportunityDetectorTest {
                 new OpportunityDetector(books, triangles, gates, portfolio, metrics, journal, queue,
                         5.0, 1.0, true, 0L, 0L, 1.5, 30_000L));
         journal.stop();
+    }
+
+    // --- PRE-LIVE-PLAN.md P0-2(d): stale-leg guard ---------------------------------------------
+
+    @Test
+    void oneFrozenLegPlusOneActiveLegIsRefused() throws Exception {
+        SpscArrayQueue<OrderIntent> queue = new SpscArrayQueue<>(16);
+        long frozenMs = 1_000;
+        long activeMs = 200;
+        Rig rig = firingRigWithStaleLeg(queue, frozenMs, activeMs);
+        int xrpusdt = rig.books().indexOf("XRPUSDT");
+        long t0 = 10_000_000_000L;
+        seedProfitable(rig.books(), t0); // all three legs' tops stamped at t0
+
+        // Legs 0-1 (USDCUSDT, XRPUSDC) are never touched again -- by the time we evaluate they are
+        // frozen. Leg 2 (XRPUSDT) gets a fresh top-level touch just before evaluating (same price,
+        // different qty still counts -- see L2BookTest).
+        long tTouch = t0 + (frozenMs + 50) * NS - (activeMs - 50) * NS;
+        seedBook(rig.books().book(2), 1.3100, 6_000_000, 1.3200, 5_000_000, tTouch);
+        long tEval = t0 + (frozenMs + 50) * NS;
+        rig.detector().onBookUpdated(xrpusdt, tEval);
+
+        assertEquals(0, drain(queue), "leg 2 active while legs 0-1 are frozen -- must be refused as lag");
+        assertEquals(1.0, rig.registry().get("cfarb.detector.stale_leg").counter().count(), 1e-9);
+    }
+
+    @Test
+    void allLegsActiveFiresNormally() throws Exception {
+        SpscArrayQueue<OrderIntent> queue = new SpscArrayQueue<>(16);
+        Rig rig = firingRigWithStaleLeg(queue, 1_000, 200);
+        int xrpusdt = rig.books().indexOf("XRPUSDT");
+        long t0 = 10_000_000_000L;
+        seedProfitable(rig.books(), t0); // every leg's top is fresh (age 0 at evaluation time)
+        rig.detector().onBookUpdated(xrpusdt, t0);
+
+        awaitOpportunities(1);
+        rig.journal().stop();
+        assertEquals(1, drain(queue), "every leg active -- must fire normally");
+    }
+
+    @Test
+    void allLegsFrozenFiresNormallyAQuietBookIsNotADefect() throws Exception {
+        SpscArrayQueue<OrderIntent> queue = new SpscArrayQueue<>(16);
+        long frozenMs = 1_000;
+        long activeMs = 200;
+        Rig rig = firingRigWithStaleLeg(queue, frozenMs, activeMs);
+        int xrpusdt = rig.books().indexOf("XRPUSDT");
+        long t0 = 10_000_000_000L;
+        seedProfitable(rig.books(), t0);
+
+        // Evaluate long after every leg's last (and only) top change -- ALL three are frozen, NONE
+        // is active. The guard requires both conditions, so this must fire, not be refused.
+        long tEval = t0 + (frozenMs + 5_000) * NS;
+        rig.detector().onBookUpdated(xrpusdt, tEval);
+
+        awaitOpportunities(1);
+        rig.journal().stop();
+        assertEquals(1, drain(queue), "a uniformly quiet book (all legs frozen) is not a defect");
     }
 
     private List<JsonNode> awaitOpportunities(int expected) throws IOException, InterruptedException {

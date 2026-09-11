@@ -318,5 +318,19 @@ public interface BotConfig {
          * forever. */
         @WithDefault("30000")
         long duplicateWindowMs();
+
+        /** PRE-LIVE-PLAN.md P0-2(d): stale-leg guard. If one leg's top ({@code L2Book
+         * #lastTopChangeNanos}) has not changed in at least this many ms while another leg's top
+         * changed within {@link #staleLegActiveMs()}, the edge is refused as lag, not a real
+         * opportunity — the 12:30:16 signature (BTCUSDC's bid sitting 161.58 above BTCUSDT's ask
+         * while every other sample that window ran -0.69 to -6.61 bps). Either this or {@link
+         * #staleLegActiveMs()} {@code <= 0} DISABLES the guard entirely (startup WARN, not a boot
+         * failure — this is a tuning knob, not a safety limit). */
+        @WithDefault("1000")
+        long staleLegFrozenMs();
+
+        /** See {@link #staleLegFrozenMs()}. */
+        @WithDefault("200")
+        long staleLegActiveMs();
     }
 }

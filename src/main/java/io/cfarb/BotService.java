@@ -153,10 +153,12 @@ public class BotService {
 
         SpscArrayQueue<OrderIntent> orderQueue = new SpscArrayQueue<>(256);
         long postResetQuarantineMs = resolvePostResetQuarantineMs();
+        long[] staleLeg = resolveStaleLegConfig();
         OpportunityDetector detector = new OpportunityDetector(books, triangles, riskGates, portfolio,
                 metrics, journal, orderQueue, config.strategy().minNetBps(), config.strategy().slippageBufferBps(),
                 config.capital().compound(), config.journal().rejectSampleMs(), postResetQuarantineMs,
-                config.detector().duplicateMaterialFraction(), config.detector().duplicateWindowMs());
+                config.detector().duplicateMaterialFraction(), config.detector().duplicateWindowMs(),
+                staleLeg[0], staleLeg[1]);
 
         // cf-arb-bot-review-plan.md Tier 1 step 1.9: MexcRestClient (and therefore the signer) is
         // now constructed in BOTH modes, so dry-run can build and sign every request through the
@@ -607,6 +609,25 @@ public class BotService {
         LOG.infof("post-reset quarantine: refuse a triangle with a leg reset within %dms "
                 + "(cf-bot.book.post-reset-quarantine-ms)", ms);
         return ms;
+    }
+
+    /** PRE-LIVE-PLAN.md P0-2(d): {@code cf-bot.detector.stale-leg-frozen-ms} /
+     * {@code cf-bot.detector.stale-leg-active-ms}. Either non-positive DISABLES the whole guard --
+     * a tuning knob, not a safety limit, so this WARNs rather than failing the boot (contrast
+     * {@link #resolvePostResetQuarantineMs} and every S6 risk-config check). Returns
+     * {@code [frozenMs, activeMs]}, both 0 when disabled. */
+    private long[] resolveStaleLegConfig() {
+        long frozenMs = config.detector().staleLegFrozenMs();
+        long activeMs = config.detector().staleLegActiveMs();
+        if (frozenMs <= 0 || activeMs <= 0) {
+            LOG.warnf("*** cf-bot.detector.stale-leg-frozen-ms=%d / stale-leg-active-ms=%d -- the "
+                    + "stale-leg guard is DISABLED. A candidate whose edge comes from one frozen leg "
+                    + "against another genuinely moving one will not be refused.", frozenMs, activeMs);
+            return new long[] {0L, 0L};
+        }
+        LOG.infof("stale-leg guard: refuse a candidate with a leg frozen >= %dms while another "
+                + "changed within %dms", frozenMs, activeMs);
+        return new long[] {frozenMs, activeMs};
     }
 
     // Accessors for BotApiResource/ReadinessCheck (read-only).

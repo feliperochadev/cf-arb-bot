@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.cfarb.feed.MexcDepthDecoder;
+import io.cfarb.model.Side;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -381,6 +382,83 @@ class L2BookTest {
         L2Book book = new L2Book(1, 3600);
         book.reset(); // rare off-tick-path callers (BookRegistry#resetAll) use the no-arg form
         assertTrue(book.lastResetNanos() > Long.MIN_VALUE / 2, "no-arg reset() must stamp a real nowNanos");
+    }
+
+    // --- PRE-LIVE-PLAN.md P0-2(d): per-side top-change stamps --------------------------------
+
+    @Test
+    void topChangeStampAdvancesWhenTheBestAskPriceChanges() {
+        L2Book book = new L2Book(1, 3600);
+        MexcDepthDecoder.DepthFrame f1 = frame(-1, -1);
+        addBid(f1, 100L, 10L);
+        addAsk(f1, 101L, 10L);
+        book.apply(f1, 1_000_000_000L);
+        long stampAfterFirst = book.lastTopChangeNanos(Side.ASK);
+        assertTrue(stampAfterFirst > Long.MIN_VALUE / 2);
+
+        // A genuinely better ask arrives -- delete the old top, insert a new one, same shape as a
+        // real differential update.
+        MexcDepthDecoder.DepthFrame f2 = frame(-1, -1);
+        addAsk(f2, 101L, 0L); // delete the old top
+        addAsk(f2, 99L, 5L);  // insert a new, better top
+        book.apply(f2, 2_000_000_000L);
+
+        assertEquals(99L, book.askPxAt(0));
+        assertEquals(2_000_000_000L, book.lastTopChangeNanos(Side.ASK));
+        assertEquals(stampAfterFirst, book.lastTopChangeNanos(Side.BID), "the untouched bid side must not advance");
+    }
+
+    @Test
+    void topChangeStampAdvancesWhenTheBestLevelsQuantityIsUpdatedInPlace() {
+        L2Book book = new L2Book(1, 3600);
+        MexcDepthDecoder.DepthFrame f1 = frame(-1, -1);
+        addBid(f1, 100L, 10L);
+        addAsk(f1, 101L, 10L);
+        book.apply(f1, 1_000_000_000L);
+
+        // Same price, different quantity, still index 0 -- the plan is explicit this counts too
+        // ("index 0's price OR quantity actually changed").
+        MexcDepthDecoder.DepthFrame f2 = frame(-1, -1);
+        addAsk(f2, 101L, 3L);
+        book.apply(f2, 2_000_000_000L);
+
+        assertEquals(2_000_000_000L, book.lastTopChangeNanos(Side.ASK));
+    }
+
+    @Test
+    void topChangeStampDoesNotAdvanceWhenOnlyADeeperLevelIsRewritten() {
+        L2Book book = new L2Book(1, 3600);
+        MexcDepthDecoder.DepthFrame f1 = frame(-1, -1);
+        addBid(f1, 100L, 10L);
+        addAsk(f1, 101L, 10L);
+        addAsk(f1, 102L, 10L);
+        book.apply(f1, 1_000_000_000L);
+        long stampAfterFirst = book.lastTopChangeNanos(Side.ASK);
+
+        // Update the SECOND level only -- index 0 (101) is untouched.
+        MexcDepthDecoder.DepthFrame f2 = frame(-1, -1);
+        addAsk(f2, 102L, 4L);
+        book.apply(f2, 2_000_000_000L);
+
+        assertEquals(101L, book.askPxAt(0), "sanity: the top level itself is still 101");
+        assertEquals(stampAfterFirst, book.lastTopChangeNanos(Side.ASK),
+                "a deeper-level rewrite must not advance the top-change stamp");
+    }
+
+    @Test
+    void topChangeStampAdvancesWhenTheTopLevelIsDeletedAndNoneReplacesIt() {
+        L2Book book = new L2Book(1, 3600);
+        MexcDepthDecoder.DepthFrame f1 = frame(-1, -1);
+        addBid(f1, 100L, 10L);
+        addAsk(f1, 101L, 10L);
+        book.apply(f1, 1_000_000_000L);
+
+        MexcDepthDecoder.DepthFrame f2 = frame(-1, -1);
+        addAsk(f2, 101L, 0L); // delete the only ask level -- book goes empty on that side
+        book.apply(f2, 2_000_000_000L);
+
+        assertEquals(0, book.askLevelCount());
+        assertEquals(2_000_000_000L, book.lastTopChangeNanos(Side.ASK));
     }
 
     @Test

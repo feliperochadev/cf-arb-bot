@@ -8,6 +8,7 @@ import io.cfarb.journal.EventJournal;
 import io.cfarb.journal.JournalEvents;
 import io.cfarb.metrics.BotMetrics;
 import io.cfarb.model.OrderIntent;
+import io.cfarb.model.Side;
 import io.cfarb.risk.RiskGates;
 import io.cfarb.state.Portfolio;
 import org.jctools.queues.SpscArrayQueue;
@@ -43,6 +44,9 @@ public final class OpportunityDetector {
     // BotConfig.DetectorConfig's own @WithDefault values.
     private static final double DEFAULT_DUPLICATE_MATERIAL_FRACTION = 0.10;
     private static final long DEFAULT_DUPLICATE_WINDOW_MS = 30_000;
+    // PRE-LIVE-PLAN.md P0-2(d): ditto, for the stale-leg guard.
+    private static final long DEFAULT_STALE_LEG_FROZEN_MS = 1_000;
+    private static final long DEFAULT_STALE_LEG_ACTIVE_MS = 200;
 
     private final BookRegistry books;
     private final TriangleRegistry triangles;
@@ -125,6 +129,12 @@ public final class OpportunityDetector {
     private final double duplicateMaterialFraction;
     private final long duplicateWindowNanos;
 
+    // PRE-LIVE-PLAN.md P0-2(d): stale-leg guard -- refuse a candidate where one leg's top has been
+    // frozen for staleLegFrozenNanos while another's changed within staleLegActiveNanos. Either
+    // <= 0 disables the guard entirely (BotService logs a startup WARN, not a boot failure).
+    private final long staleLegFrozenNanos;
+    private final long staleLegActiveNanos;
+
     public OpportunityDetector(BookRegistry books, TriangleRegistry triangles, RiskGates riskGates,
                                 Portfolio portfolio, BotMetrics metrics, EventJournal journal,
                                 SpscArrayQueue<OrderIntent> orderQueue,
@@ -150,6 +160,19 @@ public final class OpportunityDetector {
                                 double minNetBps, double slippageBufferBps, boolean compound,
                                 long rejectJournalIntervalMs, long postResetQuarantineMs,
                                 double duplicateMaterialFraction, long duplicateWindowMs) {
+        this(books, triangles, riskGates, portfolio, metrics, journal, orderQueue, minNetBps,
+                slippageBufferBps, compound, rejectJournalIntervalMs, postResetQuarantineMs,
+                duplicateMaterialFraction, duplicateWindowMs,
+                DEFAULT_STALE_LEG_FROZEN_MS, DEFAULT_STALE_LEG_ACTIVE_MS);
+    }
+
+    public OpportunityDetector(BookRegistry books, TriangleRegistry triangles, RiskGates riskGates,
+                                Portfolio portfolio, BotMetrics metrics, EventJournal journal,
+                                SpscArrayQueue<OrderIntent> orderQueue,
+                                double minNetBps, double slippageBufferBps, boolean compound,
+                                long rejectJournalIntervalMs, long postResetQuarantineMs,
+                                double duplicateMaterialFraction, long duplicateWindowMs,
+                                long staleLegFrozenMs, long staleLegActiveMs) {
         // PRE-LIVE-PLAN.md P0-2(b): S6 -- a misconfigured materiality gate is loud and fatal, same
         // as every other risk-bearing config key.
         if (duplicateMaterialFraction <= 0 || duplicateMaterialFraction > 1.0) {
@@ -159,6 +182,11 @@ public final class OpportunityDetector {
         }
         this.duplicateMaterialFraction = duplicateMaterialFraction;
         this.duplicateWindowNanos = duplicateWindowMs * 1_000_000L;
+        // PRE-LIVE-PLAN.md P0-2(d): unlike the materiality gate above, an out-of-range value here is
+        // a tuning knob, not a safety limit -- disable with a WARN (logged by BotService, which owns
+        // the config resolution), never fail the boot.
+        this.staleLegFrozenNanos = staleLegFrozenMs > 0 ? staleLegFrozenMs * 1_000_000L : 0L;
+        this.staleLegActiveNanos = staleLegActiveMs > 0 ? staleLegActiveMs * 1_000_000L : 0L;
         this.books = books;
         this.triangles = triangles;
         this.riskGates = riskGates;
@@ -233,6 +261,15 @@ public final class OpportunityDetector {
                 metrics.recordPostResetSkip(tri.symbolIndex()[quarantinedLeg]);
                 return;
             }
+        }
+        if (staleLegFrozenNanos > 0 && staleLegActiveNanos > 0 && hasStaleLegLag(tri, nowNanos)) {
+            // PRE-LIVE-PLAN.md P0-2(d): one leg's top has been frozen while another genuinely
+            // moved -- the edge is lag, not a real opportunity (the 12:30:16 BTCUSDC-bid-161.58-
+            // above-BTCUSDT-ask signature). Silent (counter-only), same shape as the checks above --
+            // this runs before EdgeCalculator ever evaluates, so there is no per-leg depth to
+            // journal yet.
+            metrics.recordStaleLeg(triangleIndex);
+            return;
         }
 
         // cf-arb-bot-review-plan.md Tier 2 step 2.7: size at min(eligible anchor balance, cap);
@@ -538,5 +575,28 @@ public final class OpportunityDetector {
             }
         }
         return -1;
+    }
+
+    /** PRE-LIVE-PLAN.md P0-2(d): true iff at least one leg's top has been frozen for at least
+     * {@link #staleLegFrozenNanos} while at least one (necessarily different, since the two
+     * thresholds don't overlap under any sane config) leg's top changed within {@link
+     * #staleLegActiveNanos} -- needs no price history, just each leg's own top-change age. Only
+     * called when the guard is enabled. */
+    private boolean hasStaleLegLag(Triangle tri, long nowNanos) {
+        int[] symbolIndex = tri.symbolIndex();
+        Side[] sides = tri.side();
+        boolean anyFrozen = false;
+        boolean anyActive = false;
+        for (int leg = 0; leg < 3; leg++) {
+            L2Book book = books.book(symbolIndex[leg]);
+            long age = nowNanos - book.lastTopChangeNanos(sides[leg]);
+            if (age >= staleLegFrozenNanos) {
+                anyFrozen = true;
+            }
+            if (age <= staleLegActiveNanos) {
+                anyActive = true;
+            }
+        }
+        return anyFrozen && anyActive;
     }
 }
