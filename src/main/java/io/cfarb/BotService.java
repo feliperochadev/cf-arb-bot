@@ -20,6 +20,7 @@ import io.cfarb.model.SymbolFilter;
 import io.cfarb.observability.ActivityReport;
 import io.cfarb.risk.KillSwitch;
 import io.cfarb.risk.RiskGates;
+import io.cfarb.state.BalanceReconciler;
 import io.cfarb.state.Portfolio;
 import io.cfarb.strategy.OpportunityDetector;
 import io.cfarb.util.FixedPoint;
@@ -68,6 +69,11 @@ public class BotService {
      * last resort -- "reconnection failing repeatedly," not "the connection was briefly quiet." */
     private static final int FEED_DEAD_TRIP_THRESHOLD = 3;
     private static final long LATENCY_SNAPSHOT_PERIOD_MS = 60_000;
+    /** PRE-LIVE-PLAN.md P1-4(b): the one blocking boot-time call {@code state.BalanceReconciler}
+     * makes -- generous relative to {@code cf-bot.exec.leg-timeout-ms} (a hot-path budget) since
+     * this runs once, before the feed connects, and a slow-but-eventually-successful response is
+     * still strictly better here than aborting the boot on a false timeout. */
+    private static final long BALANCE_RECONCILE_TIMEOUT_MS = 10_000;
     /** Dry-run never opens a socket or sends a request, but MexcSigner requires a non-empty secret
      * to construct -- cf-arb-bot-review-plan.md Tier 1 step 1.9. This is not a real credential and
      * is never used to sign anything that leaves the process. */
@@ -117,6 +123,23 @@ public class BotService {
             validateOrderType(filters);
         }
 
+        // cf-arb-bot-review-plan.md Tier 1 step 1.9: MexcRestClient (and therefore the signer) is
+        // now constructed in BOTH modes, so dry-run can build and sign every request through the
+        // real code path and discard it (realistic latency histogram) without ever opening a
+        // socket for it. Only live mode reads real credentials from the environment. Moved ahead of
+        // Portfolio construction (PRE-LIVE-PLAN.md P1-4(b)) so live mode can reconcile real balances
+        // and seed Portfolio from them before anything else touches it.
+        String apiKey;
+        MexcSigner signer;
+        if (dryRun) {
+            apiKey = "dry-run";
+            signer = new MexcSigner(DRY_RUN_DUMMY_SECRET);
+        } else {
+            apiKey = requireEnv("MEXC_API_KEY");
+            signer = new MexcSigner(requireEnv("MEXC_API_SECRET"));
+        }
+        this.restClient = new MexcRestClient(vertx, config.venue().restUrl(), apiKey, signer, config.exec().recvWindowMs());
+
         // cf-arb-bot-review-plan.md Tier 2 step 2.5: fail closed on a non-positive capital
         // configuration instead of silently trading on a nonsensical value.
         double seedUsd = config.capital().seedUsd();
@@ -129,6 +152,9 @@ public class BotService {
         }
 
         long seedFixed = FixedPoint.fromDouble(seedUsd);
+        if (!dryRun && config.capital().reconcileOnBoot()) {
+            seedFixed = reconcileBalancesOrFailBoot();
+        }
         this.portfolio = new Portfolio(seedFixed);
         this.killSwitch = new KillSwitch(portfolio, FixedPoint.fromDouble(equityFloorUsd),
                 config.risk().maxConsecutiveFailures(), config.risk().maxConsecutiveNoFill());
@@ -159,21 +185,6 @@ public class BotService {
                 config.capital().compound(), config.journal().rejectSampleMs(), postResetQuarantineMs,
                 config.detector().duplicateMaterialFraction(), config.detector().duplicateWindowMs(),
                 staleLeg[0], staleLeg[1]);
-
-        // cf-arb-bot-review-plan.md Tier 1 step 1.9: MexcRestClient (and therefore the signer) is
-        // now constructed in BOTH modes, so dry-run can build and sign every request through the
-        // real code path and discard it (realistic latency histogram) without ever opening a
-        // socket for it. Only live mode reads real credentials from the environment.
-        String apiKey;
-        MexcSigner signer;
-        if (dryRun) {
-            apiKey = "dry-run";
-            signer = new MexcSigner(DRY_RUN_DUMMY_SECRET);
-        } else {
-            apiKey = requireEnv("MEXC_API_KEY");
-            signer = new MexcSigner(requireEnv("MEXC_API_SECRET"));
-        }
-        this.restClient = new MexcRestClient(vertx, config.venue().restUrl(), apiKey, signer, config.exec().recvWindowMs());
 
         Unwinder unwinder = null;
         if (!dryRun) {
@@ -609,6 +620,38 @@ public class BotService {
         LOG.infof("post-reset quarantine: refuse a triangle with a leg reset within %dms "
                 + "(cf-bot.book.post-reset-quarantine-ms)", ms);
         return ms;
+    }
+
+    /** PRE-LIVE-PLAN.md P1-4(b): fetches real account balances (live mode, {@code
+     * cf-bot.capital.reconcile-on-boot=true} only) and returns the anchor asset's real balance,
+     * fixed-point, to seed {@link #portfolio} from instead of {@code cf-bot.capital.seed-usd}.
+     * FAILS THE BOOT (S5) if any non-anchor asset in the account holds more than a dust allowance —
+     * see {@code state.BalanceReconciler}'s javadoc for exactly what "dust" means here — or if the
+     * reconciliation call itself fails for any reason (network, auth, malformed response): starting
+     * live trading blind, with no idea what the account actually holds, is worse than not starting. */
+    private long reconcileBalancesOrFailBoot() {
+        BalanceReconciler reconciler = new BalanceReconciler(restClient, config.capital().anchorAsset(),
+                config.capital().nonAnchorDustUsd());
+        BalanceReconciler.Result result;
+        try {
+            result = reconciler.reconcile(BALANCE_RECONCILE_TIMEOUT_MS);
+        } catch (Exception e) {
+            throw new IllegalStateException("cf-bot.capital.reconcile-on-boot=true but balance reconciliation "
+                    + "failed -- refusing to start live trading blind (security rule S5)", e);
+        }
+        if (!result.clean()) {
+            StringBuilder sb = new StringBuilder("stranded non-anchor inventory found on boot, operator review "
+                    + "required before live trading (security rule S5): ");
+            for (BalanceReconciler.StrandedAsset s : result.stranded()) {
+                sb.append(s.asset()).append('=').append(s.balance()).append(' ');
+            }
+            throw new IllegalStateException(sb.toString().strip());
+        }
+        LOG.infof("balance reconciliation: seeded Portfolio from the real %s balance = %.8f "
+                        + "(cf-bot.capital.seed-usd=%.2f ignored)",
+                config.capital().anchorAsset(), FixedPoint.toDouble(result.anchorBalanceFixed()),
+                config.capital().seedUsd());
+        return result.anchorBalanceFixed();
     }
 
     /** PRE-LIVE-PLAN.md P0-2(d): {@code cf-bot.detector.stale-leg-frozen-ms} /

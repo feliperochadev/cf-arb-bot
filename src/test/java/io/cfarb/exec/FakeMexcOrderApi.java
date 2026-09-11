@@ -172,6 +172,11 @@ final class FakeMexcOrderApi implements MexcOrderApi {
         return queryString + "&signature=fake";
     }
 
+    @Override
+    public CompletableFuture<String> account(long timeoutMs) {
+        return CompletableFuture.completedFuture("{\"balances\":[]}");
+    }
+
     private static String toPlain(long fixed1e8) {
         return io.cfarb.util.FixedPoint.toPlainString(fixed1e8, 8);
     }

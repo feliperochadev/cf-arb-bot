@@ -109,6 +109,22 @@ public interface BotConfig {
 
         @WithDefault("true")
         boolean compound();
+
+        /** PRE-LIVE-PLAN.md P1-4(b): fetch real account balances on boot and seed {@code
+         * state.Portfolio} from the anchor balance instead of {@link #seedUsd()} -- {@code
+         * state.Portfolio} is otherwise a single in-memory number with no idea what a restart's
+         * account actually holds. LIVE MODE ONLY; ignored (and never contacts the venue) in
+         * dry-run, where {@link #seedUsd()} is always the seed. */
+        @WithDefault("true")
+        boolean reconcileOnBoot();
+
+        /** A non-anchor asset balance above this (in that asset's OWN units for a recognized
+         * ~1:1-USD stablecoin peer of the anchor; ANY nonzero balance for every other asset, since
+         * no live price exists yet at boot to convert it — see {@code state.BalanceReconciler}'s
+         * javadoc) FAILS THE BOOT (S5) as stranded inventory needing operator review, rather than
+         * something the bot silently trades around. */
+        @WithDefault("1.0")
+        double nonAnchorDustUsd();
     }
 
     interface RiskConfig {
