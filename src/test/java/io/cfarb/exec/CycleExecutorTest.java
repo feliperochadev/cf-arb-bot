@@ -73,6 +73,7 @@ class CycleExecutorTest {
             public int maxConsecutiveFailures() { return 3; }
             public double maxNotionalPerWindowUsd() { return 1_000_000.0; }
             public long notionalWindowMs() { return 60_000; }
+            public int maxConsecutiveNoFill() { return 25; }
         };
     }
 
@@ -252,6 +253,101 @@ class CycleExecutorTest {
         // a second cycle must be claimable immediately -- would fail if the count had gone negative
         // and canFire's >= comparison were somehow defeated, or positive and never released
         assertTrue(riskGates.canFire(0, FixedPoint.fromDouble(50.0), System.nanoTime()));
+    }
+
+    // --- PRE-LIVE-PLAN.md P1-4(a): a zero-fill break takes the no-fill path, a partial-fill break
+    //     takes the failure path -------------------------------------------------------------
+    // Both new tests build their OWN executor around a KillSwitch with maxConsecutiveFailures=1 (a
+    // SINGLE wrongly-classified recordFailure() call would trip immediately) and the default
+    // maxConsecutiveNoFill=25 -- so "did not trip" proves recordNoFill() was called, and "did trip"
+    // proves recordFailure() was.
+
+    private record ExecRig(FakeMexcOrderApi api, CycleExecutor executor, SpscArrayQueue<OrderIntent> queue,
+                            EventJournal journal, KillSwitch killSwitch, SimpleMeterRegistry registry) {
+    }
+
+    private ExecRig buildRig(int maxConsecutiveFailures) {
+        FakeMexcOrderApi rigApi = new FakeMexcOrderApi();
+        KillSwitch rigKillSwitch = new KillSwitch(portfolio, FixedPoint.fromDouble(10.0), maxConsecutiveFailures);
+        RiskGates rigRiskGates = new RiskGates(riskConfig(), strategyConfig(), execConfig(), 1, rigKillSwitch, true);
+        SimpleMeterRegistry rigRegistry = new SimpleMeterRegistry();
+        BotMetrics rigMetrics = new BotMetrics(rigRegistry);
+        EventJournal rigJournal = new EventJournal(tempDir.resolve("journal-" + System.nanoTime()), rigMetrics, false);
+        rigJournal.start();
+        SpscArrayQueue<OrderIntent> rigQueue = new SpscArrayQueue<>(8);
+
+        Triangle tri = triangle();
+        Map<String, BotConfig.TriangleConfig> triangleConfigs = Map.of("usdt-btc-xrp-fwd",
+                new BotConfig.TriangleConfig() {
+                    public boolean enabled() { return true; }
+                    public List<String> legs() { return List.of("BTCUSDT:ASK", "XRPBTC:ASK", "XRPUSDT:BID"); }
+                    public java.util.OptionalDouble maxNotionalUsd() { return java.util.OptionalDouble.empty(); }
+                });
+        io.cfarb.book.BookRegistry books = new io.cfarb.book.BookRegistry(
+                List.of("BTCUSDT", "XRPBTC", "XRPUSDT"), 1, 0);
+        Map<String, SymbolFilter> filters = Map.of("BTCUSDT", BTCUSDT, "XRPBTC", XRPBTC, "XRPUSDT", XRPUSDT);
+        TriangleRegistry rigTriangles = new TriangleRegistry(triangleConfigs, "USDT", books, filters);
+
+        Unwinder unwinder = new Unwinder(rigApi, "IOC", 1500, books, 40);
+        CycleExecutor rigExecutor = new CycleExecutor(rigQueue, rigTriangles, rigRiskGates, rigKillSwitch, portfolio,
+                rigMetrics, rigJournal, false, rigApi, unwinder, "IOC", 1500, 150);
+        rigExecutor.start();
+        rigRiskGates.claim(0, FixedPoint.fromDouble(100.0), System.nanoTime());
+        return new ExecRig(rigApi, rigExecutor, rigQueue, rigJournal, rigKillSwitch, rigRegistry);
+    }
+
+    private static double counterCount(SimpleMeterRegistry registry, String name) {
+        io.micrometer.core.instrument.Counter c = registry.find(name).counter();
+        return c == null ? 0.0 : c.count();
+    }
+
+    @Test
+    void leg0ZeroFillTakesTheNoFillPathAndDoesNotTripAtAStrictFailureThreshold() throws InterruptedException {
+        // Nothing is ever spent (leg 0 itself zero-fills) -- Unwinder.unwind finds nothing to
+        // reverse (heldLegIndex stays -1) and returns recoveredAnchorFixed=0, so loss == 0 - 0 == 0.
+        // handleBrokenCycle never calls Portfolio#applyBrokenCyclePnl for a zero loss, so
+        // brokenCycleCount() itself stays 0 -- cfarb.cycles.no_fill is the precise signal here.
+        ExecRig rig = buildRig(1);
+        rig.api().scriptQuery("BTCUSDT", 0, 0, "CANCELED", "o0");
+
+        assertTrue(rig.queue().offer(intent()));
+        waitUntil(() -> counterCount(rig.registry(), "cfarb.cycles.no_fill") >= 1.0);
+
+        assertEquals(0, portfolio.brokenCycleCount(), "a zero-loss break never calls applyBrokenCyclePnl");
+        assertEquals(1.0, counterCount(rig.registry(), "cfarb.cycles.broken"), "metrics.recordCycleBroken() still fires");
+        assertTrue(!rig.killSwitch().tripped(),
+                "a zero-loss (leg-0 zero-fill) break must call recordNoFill, not recordFailure -- "
+                        + "a real recordFailure would have tripped immediately at max-consecutive-failures=1");
+
+        rig.executor().stop();
+        rig.journal().stop();
+    }
+
+    @Test
+    void partialFillTakesTheFailurePathAndTripsAtAStrictFailureThreshold() throws InterruptedException {
+        // Same scenario as partialFillOnLeg0AbortsAndUnwindsRatherThanContinuing, but with
+        // max-consecutive-failures=1 to prove which counter handleBrokenCycle actually drove: the
+        // unwind reversal recovers slightly LESS than was spent (0.999 factor), a real non-zero loss.
+        ExecRig rig = buildRig(1);
+        long partial = FixedPoint.fromDouble(0.0007);
+        long partialQuote = FixedPoint.fromDouble(0.0007 * 77850.0);
+        rig.api().scriptQuerySequence("BTCUSDT",
+                FakeMexcOrderApi.response(partial, partialQuote, "PARTIALLY_FILLED", "o0"),
+                FakeMexcOrderApi.response(partial, partialQuote, "CANCELED", "o0"));
+        rig.api().scriptQuery("BTCUSDT", partial, FixedPoint.fromDouble(0.0007 * 77850.0 * 0.999), "FILLED", "rev0");
+
+        assertTrue(rig.queue().offer(intent()));
+        waitUntil(rig.killSwitch()::tripped);
+
+        assertEquals(1, portfolio.brokenCycleCount(), "a real (non-zero) loss must call applyBrokenCyclePnl");
+        assertEquals(0.0, counterCount(rig.registry(), "cfarb.cycles.no_fill"),
+                "a real loss must never be counted as a no-fill");
+        assertTrue(rig.killSwitch().tripped(),
+                "a real loss (partial fill, unwind recovers less than was spent) must call recordFailure "
+                        + "and trip immediately at max-consecutive-failures=1");
+
+        rig.executor().stop();
+        rig.journal().stop();
     }
 
     private static void waitUntil(java.util.function.BooleanSupplier condition) throws InterruptedException {

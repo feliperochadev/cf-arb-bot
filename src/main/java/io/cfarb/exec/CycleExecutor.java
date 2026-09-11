@@ -311,8 +311,14 @@ public final class CycleExecutor {
         if (r.unrecoverable()) {
             killSwitch.recordUnrecoverableInventory(reason + " (leg " + failedLeg + ", " + triangle.name() + "): "
                     + r.detail());
-        } else {
+        } else if (loss != 0) {
             killSwitch.recordFailure(reason + " (leg " + failedLeg + ", " + triangle.name() + ")");
+        } else {
+            // PRE-LIVE-PLAN.md P1-4(a): no real inventory moved (e.g. a leg-0 zero-fill) -- a free
+            // missed trade, not a failure. At measured break rates, counting this as an ordinary
+            // failure was a 49% chance of a halt on day one at zero financial cost.
+            metrics.recordCycleNoFill();
+            killSwitch.recordNoFill(reason + " (leg " + failedLeg + ", " + triangle.name() + ")");
         }
         killSwitch.checkEquityFloor();
         journal.write(JournalEvents.brokenCycle(triangle.name(), failedLeg, reason, loss, equityAfter));

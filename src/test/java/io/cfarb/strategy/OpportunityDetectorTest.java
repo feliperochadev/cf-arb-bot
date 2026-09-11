@@ -99,6 +99,7 @@ class OpportunityDetectorTest {
             public int maxConsecutiveFailures() { return 3; }
             public double maxNotionalPerWindowUsd() { return 1_000_000.0; }
             public long notionalWindowMs() { return 60_000; }
+            public int maxConsecutiveNoFill() { return 25; }
         };
     }
 
@@ -443,6 +444,7 @@ class OpportunityDetectorTest {
             public int maxConsecutiveFailures() { return 3; }
             public double maxNotionalPerWindowUsd() { return 1_000_000.0; }
             public long notionalWindowMs() { return 60_000; }
+            public int maxConsecutiveNoFill() { return 25; }
         };
         RiskGates gates = new RiskGates(risk, strategy(), exec(), triangles.triangleCount(), ks, true);
         BotMetrics metrics = new BotMetrics(new SimpleMeterRegistry());
@@ -534,6 +536,7 @@ class OpportunityDetectorTest {
             public int maxConsecutiveFailures() { return 3; }
             public double maxNotionalPerWindowUsd() { return 1_000_000.0; }
             public long notionalWindowMs() { return 60_000; }
+            public int maxConsecutiveNoFill() { return 25; }
         };
     }
 

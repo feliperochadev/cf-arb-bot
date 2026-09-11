@@ -79,4 +79,72 @@ class KillSwitchTest {
 
         assertTrue(!killSwitch.tripped(), "only 2 consecutive failures since the last success -- must not trip yet");
     }
+
+    // --- PRE-LIVE-PLAN.md P1-4(a): the second, looser no-fill counter -----------------------
+
+    @Test
+    void twentyFourConsecutiveNoFillsDoNotTripButTheTwentyFifthDoes() {
+        Portfolio portfolio = new Portfolio(FixedPoint.fromDouble(100.0));
+        KillSwitch killSwitch = new KillSwitch(portfolio, FixedPoint.fromDouble(50.0), 3, 25);
+
+        for (int i = 0; i < 24; i++) {
+            killSwitch.recordNoFill("no-fill-" + i);
+        }
+        assertTrue(!killSwitch.tripped(), "24 consecutive no-fills must not trip (max-consecutive-no-fill=25)");
+
+        killSwitch.recordNoFill("no-fill-24");
+        assertTrue(killSwitch.tripped(), "the 25th consecutive no-fill must trip");
+        assertTrue(killSwitch.tripReason().contains("consecutive-no-fill"));
+    }
+
+    @Test
+    void threeRealFailuresStillTripAtTheirOwnLooserThreshold() {
+        Portfolio portfolio = new Portfolio(FixedPoint.fromDouble(100.0));
+        KillSwitch killSwitch = new KillSwitch(portfolio, FixedPoint.fromDouble(50.0), 3, 25);
+
+        killSwitch.recordFailure("f1");
+        killSwitch.recordFailure("f2");
+        assertTrue(!killSwitch.tripped());
+        killSwitch.recordFailure("f3");
+        assertTrue(killSwitch.tripped(), "3 real failures must still trip at max-consecutive-failures, unaffected by "
+                + "the separate no-fill counter");
+    }
+
+    @Test
+    void aRealFailureResetsTheNoFillCounterTooSoItCannotStayArmedBehindIt() {
+        Portfolio portfolio = new Portfolio(FixedPoint.fromDouble(100.0));
+        KillSwitch killSwitch = new KillSwitch(portfolio, FixedPoint.fromDouble(50.0), 100, 3);
+
+        killSwitch.recordNoFill("nf1");
+        killSwitch.recordNoFill("nf2"); // 2 of 3 toward the no-fill trip
+        killSwitch.recordFailure("real-failure"); // must reset the no-fill counter too
+        killSwitch.recordNoFill("nf3");
+        killSwitch.recordNoFill("nf4"); // only 2 since the failure -- must not trip
+
+        assertTrue(!killSwitch.tripped(), "recordFailure must reset the no-fill counter, not just its own");
+    }
+
+    @Test
+    void recordSuccessResetsBothCounters() {
+        Portfolio portfolio = new Portfolio(FixedPoint.fromDouble(100.0));
+        KillSwitch killSwitch = new KillSwitch(portfolio, FixedPoint.fromDouble(50.0), 3, 3);
+
+        killSwitch.recordFailure("f1");
+        killSwitch.recordNoFill("nf1");
+        killSwitch.recordSuccess();
+        killSwitch.recordFailure("f2");
+        killSwitch.recordFailure("f3");
+        killSwitch.recordNoFill("nf2");
+
+        assertTrue(!killSwitch.tripped(), "recordSuccess must reset both counters, not just consecutiveFailures");
+    }
+
+    @Test
+    void nonPositiveMaxConsecutiveNoFillRefusesToBoot() {
+        Portfolio portfolio = new Portfolio(FixedPoint.fromDouble(100.0));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> new KillSwitch(portfolio, FixedPoint.fromDouble(50.0), 3, 0));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> new KillSwitch(portfolio, FixedPoint.fromDouble(50.0), 3, -1));
+    }
 }

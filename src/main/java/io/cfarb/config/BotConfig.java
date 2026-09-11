@@ -149,6 +149,13 @@ public interface BotConfig {
          * non-positive value FAILS THE BOOT (S6). */
         @WithDefault("60000")
         long notionalWindowMs();
+
+        /** PRE-LIVE-PLAN.md P1-4(a): {@code risk.KillSwitch}'s second, looser consecutive-failure
+         * counter for a broken cycle that moved NO real inventory (loss == 0, e.g. a leg-0
+         * zero-fill) — a free missed trade, not a failure. A non-positive value FAILS THE BOOT (S6),
+         * same as every other risk limit. */
+        @WithDefault("25")
+        int maxConsecutiveNoFill();
     }
 
     interface ExecConfig {

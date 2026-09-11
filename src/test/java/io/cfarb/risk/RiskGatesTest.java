@@ -29,6 +29,7 @@ class RiskGatesTest {
             public int maxConsecutiveFailures() { return 3; }
             public double maxNotionalPerWindowUsd() { return maxNotionalPerWindow; }
             public long notionalWindowMs() { return notionalWindowMs; }
+            public int maxConsecutiveNoFill() { return 25; }
         };
     }
 

@@ -131,7 +131,7 @@ public class BotService {
         long seedFixed = FixedPoint.fromDouble(seedUsd);
         this.portfolio = new Portfolio(seedFixed);
         this.killSwitch = new KillSwitch(portfolio, FixedPoint.fromDouble(equityFloorUsd),
-                config.risk().maxConsecutiveFailures());
+                config.risk().maxConsecutiveFailures(), config.risk().maxConsecutiveNoFill());
         this.riskGates = new RiskGates(config.risk(), config.strategy(), config.exec(),
                 triangles.triangleCount(), killSwitch, dryRun);
         this.clockSkewToleranceNanos = riskGates.clockSkewToleranceNanos();

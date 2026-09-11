@@ -30,6 +30,9 @@ public class BotMetrics {
     private io.micrometer.core.instrument.Counter opportunitiesRejectedUnfillable;
     private io.micrometer.core.instrument.Counter cyclesCompleted;
     private io.micrometer.core.instrument.Counter cyclesBroken;
+    // PRE-LIVE-PLAN.md P1-4(a): separates the two handleBrokenCycle outcomes on the dashboard --
+    // this is the subset of cyclesBroken that moved no real inventory (loss == 0).
+    private io.micrometer.core.instrument.Counter cyclesNoFill;
     private io.micrometer.core.instrument.Counter orderQueueDrops;
     private io.micrometer.core.instrument.Counter journalDrops;
     private io.micrometer.core.instrument.Counter journalSuppressed;
@@ -94,6 +97,7 @@ public class BotMetrics {
         opportunitiesRejectedUnfillable = registry.counter("cfarb.opportunities.rejected_unfillable");
         cyclesCompleted = registry.counter("cfarb.cycles.completed");
         cyclesBroken = registry.counter("cfarb.cycles.broken");
+        cyclesNoFill = registry.counter("cfarb.cycles.no_fill");
         orderQueueDrops = registry.counter("cfarb.order_queue.drops");
         journalDrops = registry.counter("cfarb.journal.drops");
         // Third-pass review finding: a REJECT candidate the detector deliberately did not journal
@@ -115,6 +119,7 @@ public class BotMetrics {
     public void recordOpportunityRejectedUnfillable() { opportunitiesRejectedUnfillable.increment(); }
     public void recordCycleCompleted() { cyclesCompleted.increment(); }
     public void recordCycleBroken() { cyclesBroken.increment(); }
+    public void recordCycleNoFill() { cyclesNoFill.increment(); }
     public void recordOrderQueueDrop() { orderQueueDrops.increment(); }
     public void recordJournalDrop() { journalDrops.increment(); }
     public void recordJournalSuppressed() { journalSuppressed.increment(); }
