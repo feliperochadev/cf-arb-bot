@@ -44,11 +44,25 @@ public final class EdgeCalculator {
 
     private final Sizer.Result legResult = new Sizer.Result();
 
+    // PRE-LIVE-PLAN.md P0-1: nullable, dry-run-only -- see ConsumptionLedger's own javadoc. Threaded
+    // into walkPass2 ONLY (never the gross first pass, which is size-independent and reads only
+    // top-of-book). null by default (live mode, or dry-run with the feature disabled); set once by
+    // BotService via setConsumptionLedger, never touched by the 9 existing `new EdgeCalculator()`
+    // call sites this constructor's shape deliberately preserves.
+    private ConsumptionLedger consumptionLedger;
+
     // DYNAMIC-SIZING-TASK.md Phase 2: preallocated scratch for evaluateBestSize's ladder-boundary
     // search -- one instance per EdgeCalculator (one per OpportunityDetector), never per evaluation
     // (rule R1). candidateScratch is sized to Sizer.candidateInputs' own 8-slot bound.
     private final long[] candidateScratch = new long[8];
     private final Result sizingScratch = new Result();
+
+    /** PRE-LIVE-PLAN.md P0-1: install the consumption ledger this instance's {@code walkPass2}
+     * threads into {@link Sizer#fillLeg}. Called once by {@code BotService} (dry-run only); every
+     * other caller/test leaves this {@code null}, reproducing pre-P0-1 behaviour exactly. */
+    public void setConsumptionLedger(ConsumptionLedger ledger) {
+        this.consumptionLedger = ledger;
+    }
 
     /** Reusable output of one full-triangle evaluation. */
     public static final class Result {
@@ -98,6 +112,15 @@ public final class EdgeCalculator {
          * every leg -- the write stamp is what distinguishes "nobody touched this level" from "it
          * was consumed and replenished". Only populated in the fillable second pass. Index 0..2. */
         public final long[] legWriteSeq = new long[3];
+        /** PRE-LIVE-PLAN.md P0-1: per-leg copy of {@link Sizer.Result}'s per-level consumption
+         * breakdown -- flat {@code [leg*Sizer.MAX_TRACKED_LEVELS + level]}, valid indices
+         * {@code 0..legLevelsTouched[leg]-1}. Only populated when a fillable candidate was walked
+         * WITH a non-null ledger; {@code OpportunityDetector} reads this (for the WINNING candidate
+         * only) to commit claims into the ledger on an actual fire. Never read on the live path. */
+        public final int[] legLevelsTouched = new int[3];
+        public final int[] legLevelIndex = new int[3 * Sizer.MAX_TRACKED_LEVELS];
+        public final long[] legLevelQtyConsumed = new long[3 * Sizer.MAX_TRACKED_LEVELS];
+        public final long[] legLevelWriteSeq = new long[3 * Sizer.MAX_TRACKED_LEVELS];
         /** DYNAMIC-SIZING-TASK.md Phase 2: how many ladder-boundary candidate sizes
          * {@link #evaluateBestSize} actually walked through pass 2 -- {@code 0} if the evaluation
          * bailed early, or if this {@code Result} was produced by the plain fixed-size
@@ -132,6 +155,7 @@ public final class EdgeCalculator {
         java.util.Arrays.fill(out.legTopPriceFixed, 0L);
         java.util.Arrays.fill(out.legTouchQtyFixed, 0L);
         java.util.Arrays.fill(out.legWriteSeq, 0L);
+        java.util.Arrays.fill(out.legLevelsTouched, 0);
     }
 
     /**
@@ -144,6 +168,13 @@ public final class EdgeCalculator {
      * — i.e. never bails early. Behaviour is byte-for-byte unchanged from before
      * DYNAMIC-SIZING-TASK.md Phase 1: this is the entry point {@code EdgeCalculatorTest}'s Python
      * cross-check calls, and it must keep agreeing with {@code cfarb.stage2_cycles.evaluate_cycle}.
+     *
+     * <p><b>PRE-LIVE-PLAN.md P0-1 / non-negotiable #7:</b> this entry point (and the 5-arg one below)
+     * ALWAYS walks with a {@code null} consumption ledger, unconditionally — even on an instance
+     * that has one installed via {@link #setConsumptionLedger} for {@link #evaluateBestSize}'s use.
+     * No production caller ever does that (only {@code evaluateBestSize} is wired to a ledger), but
+     * the guarantee is unconditional on purpose: "byte-for-byte unchanged" must not depend on caller
+     * discipline.
      */
     public void evaluate(Triangle triangle, BookRegistry books, long startAmount, Result out) {
         evaluate(triangle, books, startAmount, out, Double.NEGATIVE_INFINITY);
@@ -174,7 +205,11 @@ public final class EdgeCalculator {
             out.bailedEarly = true;
             return; // fillable stays false, netBps stays NaN -- see bailedEarly's javadoc
         }
-        walkPass2(triangle, books, startAmount, out);
+        // PRE-LIVE-PLAN.md P0-1 / non-negotiable #7: this entry point (and the 4-arg one above) is
+        // NEVER wired to a consumption ledger by any caller -- consumptionLedger stays whatever this
+        // instance's field is (null for every EdgeCalculatorTest / cross-check use), so nowNanos
+        // (0L) is never actually read by Sizer. Byte-for-byte unchanged from before P0-1.
+        walkPass2(triangle, books, startAmount, out, null, 0L);
     }
 
     /**
@@ -201,7 +236,7 @@ public final class EdgeCalculator {
      * </ul>
      */
     public void evaluateBestSize(Triangle triangle, BookRegistry books, long maxStartAmount, Result out,
-                                 double bailBelowGrossBps) {
+                                 double bailBelowGrossBps, long nowNanos) {
         resetResult(out);
         if (!computeGrossFirstPass(triangle, books, out)) {
             return;
@@ -223,7 +258,7 @@ public final class EdgeCalculator {
         long bestProfit = 0L;
         for (int i = 0; i < k; i++) {
             long candidate = candidateScratch[i];
-            boolean filled = walkPass2(triangle, books, candidate, sizingScratch);
+            boolean filled = walkPass2(triangle, books, candidate, sizingScratch, consumptionLedger, nowNanos);
             if (i == k - 1) {
                 // Sizer.candidateInputs guarantees maxStartAmount is always the LAST candidate --
                 // this is exactly what the old fixed-size evaluate(..., maxStartAmount, ...) would
@@ -278,7 +313,8 @@ public final class EdgeCalculator {
      * and the per-leg input/worst-price/base-qty/write-seq arrays into {@code out} (which may be the
      * real output {@code Result} for {@link #evaluate}, or the shared {@link #sizingScratch} for one
      * candidate of {@link #evaluateBestSize}'s search). Returns whether every leg filled. */
-    private boolean walkPass2(Triangle triangle, BookRegistry books, long startAmount, Result out) {
+    private boolean walkPass2(Triangle triangle, BookRegistry books, long startAmount, Result out,
+                               ConsumptionLedger ledger, long nowNanos) {
         out.fillable = false;
         out.finalAmount = 0;
         out.netBps = Double.NaN;
@@ -286,6 +322,7 @@ public final class EdgeCalculator {
         java.util.Arrays.fill(out.legWorstPriceFixed, 0L);
         java.util.Arrays.fill(out.legBaseQtyFixed, 0L);
         java.util.Arrays.fill(out.legWriteSeq, 0L);
+        java.util.Arrays.fill(out.legLevelsTouched, 0);
 
         int[] symbolIndex = triangle.symbolIndex();
         Side[] sides = triangle.side();
@@ -295,13 +332,24 @@ public final class EdgeCalculator {
         for (int leg = 0; leg < 3; leg++) {
             L2Book book = books.book(symbolIndex[leg]);
             out.legInputAmount[leg] = amount;
-            Sizer.fillLeg(book, sides[leg], filters[leg], amount, legResult);
+            Sizer.fillLeg(book, sides[leg], filters[leg], amount, legResult,
+                    ledger, symbolIndex[leg], nowNanos);
             if (!legResult.filled) {
                 return false; // this leg is unfillable at this size — e.g. below SOLBTC's 1-SOL minimum
             }
             out.legWorstPriceFixed[leg] = legResult.worstPriceFixed;
             out.legBaseQtyFixed[leg] = legResult.baseQtyFixed;
             out.legWriteSeq[leg] = legResult.maxWriteSeq;
+            if (ledger != null) {
+                // PRE-LIVE-PLAN.md P0-1: copy this leg's per-level breakdown into the leg-indexed
+                // slice of `out` -- only ever read back by OpportunityDetector on an actual fire.
+                int base = leg * Sizer.MAX_TRACKED_LEVELS;
+                int touched = legResult.levelsTouched;
+                out.legLevelsTouched[leg] = touched;
+                System.arraycopy(legResult.levelIndex, 0, out.legLevelIndex, base, touched);
+                System.arraycopy(legResult.levelQtyConsumed, 0, out.legLevelQtyConsumed, base, touched);
+                System.arraycopy(legResult.levelWriteSeq, 0, out.legLevelWriteSeq, base, touched);
+            }
             amount = legResult.outputAmount;
         }
 
@@ -322,5 +370,11 @@ public final class EdgeCalculator {
         System.arraycopy(src.legWorstPriceFixed, 0, dst.legWorstPriceFixed, 0, 3);
         System.arraycopy(src.legBaseQtyFixed, 0, dst.legBaseQtyFixed, 0, 3);
         System.arraycopy(src.legWriteSeq, 0, dst.legWriteSeq, 0, 3);
+        // PRE-LIVE-PLAN.md P0-1: carry the winning candidate's per-level consumption breakdown too --
+        // only meaningful when a ledger was in play (both arrays are all-zero/untouched otherwise).
+        System.arraycopy(src.legLevelsTouched, 0, dst.legLevelsTouched, 0, 3);
+        System.arraycopy(src.legLevelIndex, 0, dst.legLevelIndex, 0, 3 * Sizer.MAX_TRACKED_LEVELS);
+        System.arraycopy(src.legLevelQtyConsumed, 0, dst.legLevelQtyConsumed, 0, 3 * Sizer.MAX_TRACKED_LEVELS);
+        System.arraycopy(src.legLevelWriteSeq, 0, dst.legLevelWriteSeq, 0, 3 * Sizer.MAX_TRACKED_LEVELS);
     }
 }

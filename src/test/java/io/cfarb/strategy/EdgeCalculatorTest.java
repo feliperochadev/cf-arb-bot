@@ -244,7 +244,7 @@ class EdgeCalculatorTest {
         EdgeCalculator.Result out = new EdgeCalculator.Result();
         long maxStart = FixedPoint.fromDouble(4000.0);
 
-        calc.evaluateBestSize(tri, books, maxStart, out, Double.NEGATIVE_INFINITY);
+        calc.evaluateBestSize(tri, books, maxStart, out, Double.NEGATIVE_INFINITY, 0L);
 
         assertTrue(out.fillable);
         assertTrue(out.sizeCandidates >= 2, "leg 0's second level must produce a second candidate");
@@ -288,7 +288,7 @@ class EdgeCalculatorTest {
 
         EdgeCalculator calc = new EdgeCalculator();
         EdgeCalculator.Result out = new EdgeCalculator.Result();
-        calc.evaluateBestSize(tri, books, FixedPoint.fromDouble(4000.0), out, Double.NEGATIVE_INFINITY);
+        calc.evaluateBestSize(tri, books, FixedPoint.fromDouble(4000.0), out, Double.NEGATIVE_INFINITY, 0L);
 
         assertTrue(out.fillable, "the $693 candidate must still be picked even though $4000 fails leg 2's depth");
         assertEquals(693.0, FixedPoint.toDouble(out.legInputAmount[0]), 0.5);
@@ -310,7 +310,7 @@ class EdgeCalculatorTest {
 
         EdgeCalculator calc = new EdgeCalculator();
         EdgeCalculator.Result out = new EdgeCalculator.Result();
-        calc.evaluateBestSize(tri, books, FixedPoint.fromDouble(4000.0), out, Double.NEGATIVE_INFINITY);
+        calc.evaluateBestSize(tri, books, FixedPoint.fromDouble(4000.0), out, Double.NEGATIVE_INFINITY, 0L);
 
         assertFalse(out.fillable);
         assertTrue(Double.isNaN(out.netBps));
@@ -324,7 +324,7 @@ class EdgeCalculatorTest {
         EdgeCalculator.Result out = new EdgeCalculator.Result();
 
         // The real gross here is ~101.01bps (top-of-book) -- 200.0 is comfortably above it.
-        calc.evaluateBestSize(tri, books, FixedPoint.fromDouble(4000.0), out, 200.0);
+        calc.evaluateBestSize(tri, books, FixedPoint.fromDouble(4000.0), out, 200.0, 0L);
 
         assertTrue(out.bailedEarly);
         assertFalse(out.fillable);
@@ -333,5 +333,59 @@ class EdgeCalculatorTest {
         for (long worstPx : out.legWorstPriceFixed) {
             assertEquals(0L, worstPx, "no ladder walk means no worst price was ever touched");
         }
+    }
+
+    // --- PRE-LIVE-PLAN.md P0-1: the 4-arg evaluate() gate ---------------------------------------
+
+    @Test
+    void theFourArgEvaluateWithANullLedgerProducesAnIdenticalResultToBeforeP01() {
+        // The exact gate PRE-LIVE-PLAN.md C6 names: a fresh EdgeCalculator (consumptionLedger stays
+        // null, the default -- setConsumptionLedger is never called by this test) must reproduce the
+        // Python-cross-checked continuous-book scenario field-by-field, proving P0-1 is additive.
+        List<String> symbols = List.of("ETHUSDT", "XRPETH", "XRPUSDT");
+        BookRegistry books = new BookRegistry(symbols, 1, 0);
+        seedBook(books.book(0), 2449.00, 10.0, 2450.00, 10.0);
+        seedBook(books.book(1), 0.00056, 100_000.0, 0.00057, 100_000.0);
+        seedBook(books.book(2), 1.40, 1_000_000.0, 1.41, 1_000_000.0);
+
+        SymbolFilter ethusdt = filter("ETHUSDT", "ETH", "USDT", 1L, 8, 0L, 0L, 2, 5.0);
+        SymbolFilter xrpeth = filter("XRPETH", "XRP", "ETH", 1L, 8, 0L, 0L, 7, 5.0);
+        SymbolFilter xrpusdt = filter("XRPUSDT", "XRP", "USDT", 1L, 8, 0L, 0L, 4, 0.0);
+        Triangle tri = triangle("test-eth-xrp", new int[]{0, 1, 2},
+                new Side[]{Side.ASK, Side.ASK, Side.BID},
+                new SymbolFilter[]{ethusdt, xrpeth, xrpusdt});
+
+        EdgeCalculator calc = new EdgeCalculator();
+        EdgeCalculator.Result out = new EdgeCalculator.Result();
+        long start = FixedPoint.fromDouble(1000.0);
+        calc.evaluate(tri, books, start, out);
+
+        assertTrue(out.fillable);
+        assertEquals(15.0401002506, out.netBps, 0.01);
+        assertEquals(15.0401002506, out.grossBps, 0.01);
+        for (int leg = 0; leg < 3; leg++) {
+            assertEquals(0, out.legLevelsTouched[leg], "no ledger -- the per-level breakdown must never populate");
+        }
+
+        // Setting a ledger on a DIFFERENT instance must not somehow leak into this one, and calling
+        // evaluate() AGAIN on this same (still ledger-less) instance must reproduce the identical
+        // Result -- P0-1 must not introduce any hidden state that makes repeated evaluation diverge.
+        EdgeCalculator calcWithLedger = new EdgeCalculator();
+        calcWithLedger.setConsumptionLedger(new ConsumptionLedger(4, 5_000));
+        EdgeCalculator.Result outFromOtherInstance = new EdgeCalculator.Result();
+        calcWithLedger.evaluate(tri, books, start, outFromOtherInstance);
+        assertEquals(out.netBps, outFromOtherInstance.netBps, 1e-9,
+                "the 4-arg evaluate() never wires a ledger in, even on an instance that has one installed "
+                        + "for evaluateBestSize -- see its own javadoc");
+
+        EdgeCalculator.Result second = new EdgeCalculator.Result();
+        calc.evaluate(tri, books, start, second);
+        assertEquals(out.fillable, second.fillable);
+        assertEquals(out.finalAmount, second.finalAmount);
+        assertEquals(out.netBps, second.netBps, 1e-12);
+        assertArrayEquals(out.legInputAmount, second.legInputAmount);
+        assertArrayEquals(out.legWorstPriceFixed, second.legWorstPriceFixed);
+        assertArrayEquals(out.legBaseQtyFixed, second.legBaseQtyFixed);
+        assertArrayEquals(out.legWriteSeq, second.legWriteSeq);
     }
 }

@@ -54,6 +54,8 @@ public interface BotConfig {
 
     DetectorConfig detector();
 
+    ConsumptionLedgerConfig consumptionLedger();
+
     interface VenueConfig {
         @WithDefault("wss://wbs-api.mexc.com/ws")
         String wsUrl();
@@ -355,5 +357,28 @@ public interface BotConfig {
         /** See {@link #staleLegFrozenMs()}. */
         @WithDefault("200")
         long staleLegActiveMs();
+    }
+
+    /**
+     * PRE-LIVE-PLAN.md P0-1 ("Fix B") / cf-arb-bot-plan.md §5.3.2: dry-run-only. {@code
+     * strategy.ConsumptionLedger} makes a paper fill actually consume the ladder depth it modelled,
+     * so a repeated evaluation of the same tick doesn't re-read the same unconsumed book state (the
+     * {@code usdt-sol-btc-rev} burst "bought" 19.32 SOL three times out of a level holding 40.27).
+     * Named {@code cf-bot.consumption-ledger.*}, not {@code cf-bot.dry-run.*} — {@code cf-bot.dry-run}
+     * is already a top-level boolean leaf, and SmallRye Config cannot nest properties under one.
+     */
+    interface ConsumptionLedgerConfig {
+        /** {@code true} (default) enables the ledger in dry-run; {@code false} restores the
+         * pre-P0-1 behaviour (every evaluation re-reads the full displayed depth) for an A/B
+         * comparison against a fresh capture. Never consulted in live mode — {@code BotService}
+         * constructs the ledger only when {@code cf-bot.dry-run=true}, regardless of this value. */
+        @WithDefault("true")
+        boolean enabled();
+
+        /** Backstop TTL for a claimed level nobody ever rewrites again — see {@code
+         * ConsumptionLedger}'s javadoc. A non-positive value FAILS THE BOOT (S6) whenever the ledger
+         * is actually constructed (dry-run AND {@link #enabled()}). */
+        @WithDefault("5000")
+        long ttlMs();
     }
 }

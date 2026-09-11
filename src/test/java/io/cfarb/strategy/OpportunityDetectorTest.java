@@ -696,6 +696,86 @@ class OpportunityDetectorTest {
         assertEquals(1, drain(queue), "the fire after a failed offer must go through -- signature was not stored");
     }
 
+    // --- PRE-LIVE-PLAN.md P0-1: evaluating (never firing) must never consume the book -----------
+
+    @Test
+    void aRejectedCandidateRecordsNothingIntoTheConsumptionLedger() throws Exception {
+        SpscArrayQueue<OrderIntent> queue = new SpscArrayQueue<>(16);
+        Rig rig = firingRig(queue);
+        ConsumptionLedger ledger = new ConsumptionLedger(FIRING_SYMBOLS.size(), 5_000);
+        rig.detector().setConsumptionLedger(ledger);
+        int xrpusdt = rig.books().indexOf("XRPUSDT");
+        long t0 = 10_000_000_000L;
+
+        // A deliberately UNPROFITABLE book (selling XRP for less than it cost to acquire via USDC) --
+        // the full ladder walk still runs (firingRig's reject-sample-ms=0 forces a full, non-bailed
+        // evaluation every tick), computing real per-level consumption internally, but the candidate
+        // must never fire.
+        seedBook(rig.books().book(0), 0.9999, 5_000_000, 1.0000, 5_000_000, t0);   // USDCUSDT
+        seedBook(rig.books().book(1), 1.2999, 5_000_000, 1.3000, 5_000_000, t0);   // XRPUSDC
+        seedBook(rig.books().book(2), 1.2990, 5_000_000, 1.3000, 5_000_000, t0);   // XRPUSDT -- a loss
+        rig.detector().onBookUpdated(xrpusdt, t0);
+
+        assertEquals(0, drain(queue), "sanity: this candidate must not fire");
+        long writeSeq = rig.books().book(0).askWriteSeqAt(0);
+        assertEquals(0L, ledger.consumed(0, Side.ASK, 0, writeSeq, t0),
+                "a rejected (never-fired) candidate must never record consumption, even though the ladder "
+                        + "walk itself ran in full");
+    }
+
+    @Test
+    void aFailedOfferRecordsNothingIntoTheConsumptionLedger() throws Exception {
+        SpscArrayQueue<OrderIntent> queue = new SpscArrayQueue<>(2);
+        Rig rig = firingRig(queue);
+        ConsumptionLedger ledger = new ConsumptionLedger(FIRING_SYMBOLS.size(), 5_000);
+        rig.detector().setConsumptionLedger(ledger);
+        int xrpusdt = rig.books().indexOf("XRPUSDT");
+        long t0 = 10_000_000_000L;
+        seedProfitable(rig.books(), t0); // a genuinely fillable, above-threshold candidate
+
+        OrderIntent filler = new OrderIntent(0L, 0, 0L, 0.0, new long[3], new long[3]);
+        while (queue.offer(filler)) {
+            // fill the queue so the detector's offer() fails
+        }
+
+        rig.detector().onBookUpdated(xrpusdt, t0); // would have fired, but offer() fails -- claim rolled back
+
+        long writeSeq = rig.books().book(0).askWriteSeqAt(0);
+        assertEquals(0L, ledger.consumed(0, Side.ASK, 0, writeSeq, t0),
+                "a candidate that could not even be enqueued must never record consumption -- "
+                        + "the same condition DUPLICATE-FIRE-TASK.md's signature store already uses");
+        rig.journal().stop();
+    }
+
+    @Test
+    void aSuccessfulFireRecordsConsumptionSoTheSameSizeCannotBeReadTwiceFromTheSameLevel() throws Exception {
+        // Closes the loop this whole feature exists for: the usdt-sol-btc-rev burst "bought" the
+        // same size three times out of a single level. Shallow (not 5,000,000-deep) books so a
+        // ~$1000 fire consumes a real, testable fraction of what is displayed.
+        SpscArrayQueue<OrderIntent> queue = new SpscArrayQueue<>(16);
+        Rig rig = firingRig(queue);
+        ConsumptionLedger ledger = new ConsumptionLedger(FIRING_SYMBOLS.size(), 5_000);
+        rig.detector().setConsumptionLedger(ledger);
+        int xrpusdt = rig.books().indexOf("XRPUSDT");
+        long t0 = 10_000_000_000L;
+        seedBook(rig.books().book(0), 0.9999, 5_000, 1.0000, 5_000, t0);   // USDCUSDT -- shallow
+        seedBook(rig.books().book(1), 1.2999, 5_000, 1.3000, 5_000, t0);   // XRPUSDC -- shallow
+        seedBook(rig.books().book(2), 1.3100, 5_000, 1.3200, 5_000, t0);   // XRPUSDT -- shallow
+
+        rig.detector().onBookUpdated(xrpusdt, t0);
+        assertEquals(1, drain(queue), "sanity: the first candidate must fire");
+
+        long askQtyAtLevel0 = rig.books().book(0).askQtyAt(0);
+        long writeSeq = rig.books().book(0).askWriteSeqAt(0);
+        long consumed = ledger.consumed(0, Side.ASK, 0, writeSeq, t0 + NS);
+        assertTrue(consumed > 0, "the fire must have recorded a real, nonzero claim against USDCUSDT's ask");
+        assertTrue(consumed < askQtyAtLevel0, "sanity: this fixture's fire must not have claimed the WHOLE "
+                + "displayed level -- SizerTest's own tests already prove the reduced-availability effect "
+                + "on a subsequent walk directly; this test's job is only the end-to-end wiring: a real "
+                + "fire through OpportunityDetector produces a real, correctly-sized ledger entry.");
+        rig.journal().stop();
+    }
+
     // --- PRE-LIVE-PLAN.md P0-2(b): duplicate suppression survives one churning leg -------------
     // Note: seedProfitable's books are deliberately 5,000,000 deep against a ~$1000 trade, so NO
     // leg is ever "material" (baseQty/touchQty << the 0.10 default) -- that is why every existing

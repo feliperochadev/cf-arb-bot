@@ -179,4 +179,135 @@ class SizerTest {
         assertEquals(1, n);
         assertEquals(500.0, FixedPoint.toDouble(out[0]), 0.01);
     }
+
+    // --- PRE-LIVE-PLAN.md P0-1: ConsumptionLedger integration ---------------------------------
+
+    private static void applyAsksAt(L2Book book, double[] prices, double[] qtys, long nowNanos) {
+        MexcDepthDecoder.DepthFrame f = new MexcDepthDecoder.DepthFrame();
+        f.fromVersion = -1;
+        f.toVersion = -1;
+        f.sendTimeMs = 0;
+        f.bidCount = 1;
+        f.bidPx[0] = FixedPoint.fromDouble(prices[0] - 1.0);
+        f.bidQty[0] = FixedPoint.fromDouble(1_000.0);
+        f.askCount = prices.length;
+        for (int i = 0; i < prices.length; i++) {
+            f.askPx[i] = FixedPoint.fromDouble(prices[i]);
+            f.askQty[i] = FixedPoint.fromDouble(qtys[i]);
+        }
+        book.apply(f, nowNanos);
+    }
+
+    /** Mirrors what {@code OpportunityDetector.recordConsumption} does after a successful fire --
+     * commits a {@link Sizer.Result}'s per-level breakdown into the ledger. */
+    private static void commit(ConsumptionLedger ledger, int symbolIndex, Side side, Sizer.Result out, long nowNanos) {
+        for (int i = 0; i < out.levelsTouched; i++) {
+            ledger.record(symbolIndex, side, out.levelIndex[i], out.levelWriteSeq[i], out.levelQtyConsumed[i], nowNanos);
+        }
+    }
+
+    @Test
+    void aLegThatFillsAtSizeNOnceCannotFillAtNAgainFromTheSameUnchangedLadder() {
+        L2Book b = book(1, 0);
+        long t0 = 10_000_000_000L;
+        applyAsksAt(b, new double[]{100.0}, new double[]{1.0}, t0); // 1.0 BTC @ 100 -> $100 total depth
+        SymbolFilter filter = filter(1e-6, 6, 1e-6, 1.0, 2, 5.0);
+        long budget = FixedPoint.fromDouble(70.0); // more than half the level's depth
+        ConsumptionLedger ledger = new ConsumptionLedger(4, 5_000);
+        int symbolIndex = 3;
+
+        Sizer.Result first = new Sizer.Result();
+        Sizer.fillLeg(b, Side.ASK, filter, budget, first, ledger, symbolIndex, t0);
+        assertTrue(first.filled, "the first $70 fill must succeed against $100 of depth");
+        commit(ledger, symbolIndex, Side.ASK, first, t0);
+
+        // Same book (nothing rewrote the level), same budget, a moment later -- only $30 of real
+        // depth remains after the ledger's claim, not enough to fill $70 in full.
+        Sizer.Result second = new Sizer.Result();
+        Sizer.fillLeg(b, Side.ASK, filter, budget, second, ledger, symbolIndex, t0 + 1_000_000L);
+        assertTrue(!second.filled, "the SAME $70 must not fill again from the same, now largely-claimed, level");
+    }
+
+    @Test
+    void theSameLegFillsAgainOnceTheLevelsWriteSeqAdvances() {
+        L2Book b = book(1, 0);
+        long t0 = 10_000_000_000L;
+        applyAsksAt(b, new double[]{100.0}, new double[]{1.0}, t0);
+        SymbolFilter filter = filter(1e-6, 6, 1e-6, 1.0, 2, 5.0);
+        long budget = FixedPoint.fromDouble(70.0);
+        ConsumptionLedger ledger = new ConsumptionLedger(4, 5_000);
+        int symbolIndex = 3;
+
+        Sizer.Result first = new Sizer.Result();
+        Sizer.fillLeg(b, Side.ASK, filter, budget, first, ledger, symbolIndex, t0);
+        assertTrue(first.filled);
+        commit(ledger, symbolIndex, Side.ASK, first, t0);
+
+        Sizer.Result blocked = new Sizer.Result();
+        Sizer.fillLeg(b, Side.ASK, filter, budget, blocked, ledger, symbolIndex, t0 + 1_000_000L);
+        assertTrue(!blocked.filled, "sanity: still blocked before the level is rewritten");
+
+        // The venue replenishes the SAME price level (an in-place qty update bumps its writeSeq) --
+        // genuinely new liquidity, so the old claim must no longer apply.
+        long t1 = t0 + 2_000_000L;
+        applyAsksAt(b, new double[]{100.0}, new double[]{1.0}, t1);
+
+        Sizer.Result third = new Sizer.Result();
+        Sizer.fillLeg(b, Side.ASK, filter, budget, third, ledger, symbolIndex, t1);
+        assertTrue(third.filled, "a rewritten level must fill again, the old claim no longer applies");
+    }
+
+    @Test
+    void aNullLedgerReproducesUnclaimedBehaviourExactly() {
+        // The live-mode path: passing ledger=null must behave identically to the pre-P0-1 5-arg form.
+        L2Book b = book(1, 0);
+        long t0 = 10_000_000_000L;
+        applyAsksAt(b, new double[]{100.0}, new double[]{1.0}, t0);
+        SymbolFilter filter = filter(1e-6, 6, 1e-6, 1.0, 2, 5.0);
+        long budget = FixedPoint.fromDouble(70.0);
+
+        Sizer.Result viaFiveArg = new Sizer.Result();
+        Sizer.fillLeg(b, Side.ASK, filter, budget, viaFiveArg);
+
+        Sizer.Result viaNullLedger = new Sizer.Result();
+        Sizer.fillLeg(b, Side.ASK, filter, budget, viaNullLedger, null, -1, 0L);
+
+        assertTrue(viaFiveArg.filled && viaNullLedger.filled);
+        assertEquals(viaFiveArg.baseQtyFixed, viaNullLedger.baseQtyFixed);
+        assertEquals(viaFiveArg.worstPriceFixed, viaNullLedger.worstPriceFixed);
+        assertEquals(viaFiveArg.quoteFixed, viaNullLedger.quoteFixed);
+        assertEquals(viaFiveArg.maxWriteSeq, viaNullLedger.maxWriteSeq);
+        assertEquals(0, viaNullLedger.levelsTouched, "a null ledger must never populate the per-level breakdown");
+
+        // Firing the SAME budget again must behave identically too -- a null ledger never blocks.
+        Sizer.Result again = new Sizer.Result();
+        Sizer.fillLeg(b, Side.ASK, filter, budget, again, null, -1, 0L);
+        assertTrue(again.filled, "no ledger -- the same size must fill every time, unaffected by any prior fire");
+        assertEquals(viaFiveArg.baseQtyFixed, again.baseQtyFixed);
+    }
+
+    @Test
+    void multiLevelConsumptionBreakdownIsClippedToTheFinalCappedFillNeverOverReported() {
+        // Mirrors multiLevelWalkCapsQuantitySoTheWorstPriceNotionalNeverExceedsBudget's shape: level
+        // 0 is cheap and shallow, level 1 deep but pricier -- the worst-price cap shrinks baseFilled
+        // below what the raw per-level walk would suggest. The recorded breakdown's sum must match
+        // the FINAL (capped) baseQtyFixed exactly, never more.
+        L2Book b = book(1, 0);
+        long t0 = 10_000_000_000L;
+        applyAsksAt(b, new double[]{50.0, 102.0}, new double[]{0.0005, 10.0}, t0);
+        SymbolFilter filter = filter(1e-6, 6, 1e-6, 1.0, 2, 5.0);
+        long budget = FixedPoint.fromDouble(100.0);
+        ConsumptionLedger ledger = new ConsumptionLedger(4, 5_000);
+
+        Sizer.Result out = new Sizer.Result();
+        Sizer.fillLeg(b, Side.ASK, filter, budget, out, ledger, 5, t0);
+
+        assertTrue(out.filled);
+        long sumRecorded = 0;
+        for (int i = 0; i < out.levelsTouched; i++) {
+            sumRecorded += out.levelQtyConsumed[i];
+        }
+        assertEquals(out.baseQtyFixed, sumRecorded,
+                "the recorded per-level breakdown must sum to exactly the final (capped) fill, never more");
+    }
 }
