@@ -30,16 +30,38 @@ public final class KillSwitch {
     private final AtomicBoolean tripped = new AtomicBoolean(false);
     private final AtomicReference<String> tripReason = new AtomicReference<>();
     private final AtomicInteger consecutiveFailures = new AtomicInteger(0);
+    // PRE-LIVE-PLAN.md P1-4(a): a second, LOOSER counter for cycles that broke with NO real
+    // inventory moved (a free missed trade, e.g. a leg-0 zero-fill) -- see recordNoFill's javadoc.
+    private final AtomicInteger consecutiveNoFill = new AtomicInteger(0);
     private volatile Consumer<String> tripListener;
 
     private final Portfolio portfolio;
     private final long equityFloorFixed;
     private final int maxConsecutiveFailures;
+    private final int maxConsecutiveNoFill;
+
+    /** Matches {@code BotConfig.RiskConfig#maxConsecutiveNoFill}'s own default -- used only by the
+     * 3-arg convenience constructor below, for the many existing call sites that predate P1-4(a)
+     * and don't care about this counter. */
+    private static final int DEFAULT_MAX_CONSECUTIVE_NO_FILL = 25;
 
     public KillSwitch(Portfolio portfolio, long equityFloorFixed, int maxConsecutiveFailures) {
+        this(portfolio, equityFloorFixed, maxConsecutiveFailures, DEFAULT_MAX_CONSECUTIVE_NO_FILL);
+    }
+
+    public KillSwitch(Portfolio portfolio, long equityFloorFixed, int maxConsecutiveFailures,
+                       int maxConsecutiveNoFill) {
         this.portfolio = portfolio;
         this.equityFloorFixed = equityFloorFixed;
         this.maxConsecutiveFailures = maxConsecutiveFailures;
+        // PRE-LIVE-PLAN.md P1-4(a): S6 -- a misconfigured limit is loud and fatal, same as every
+        // other risk limit in this codebase (see risk.RiskGates#failStartup).
+        if (maxConsecutiveNoFill <= 0) {
+            String msg = "cf-bot.risk.max-consecutive-no-fill must be > 0, got " + maxConsecutiveNoFill;
+            LOG.error(msg);
+            throw new IllegalStateException(msg);
+        }
+        this.maxConsecutiveNoFill = maxConsecutiveNoFill;
     }
 
     /** Register the one action to run exactly once, on the CAS-winning trip transition
@@ -71,17 +93,36 @@ public final class KillSwitch {
         }
     }
 
-    /** Call on a successful order/cycle to reset the consecutive-failure counter. */
+    /** Call on a successful order/cycle to reset BOTH consecutive-failure counters. */
     public void recordSuccess() {
         consecutiveFailures.set(0);
+        consecutiveNoFill.set(0);
     }
 
-    /** Call on any order rejection, timeout, or broken cycle. Trips after maxConsecutiveFailures
-     * in a row — the same signal S7 names ("repeated order errors"). */
+    /** Call on any order rejection, timeout, or broken cycle where real inventory actually moved
+     * (a non-zero loss). Trips after maxConsecutiveFailures in a row — the same signal S7 names
+     * ("repeated order errors"). A real failure is strictly worse news than a no-fill (see
+     * {@link #recordNoFill}), so it resets that looser counter too — it must not stay armed behind
+     * a genuine failure streak. */
     public void recordFailure(String reason) {
+        consecutiveNoFill.set(0);
         int n = consecutiveFailures.incrementAndGet();
         if (n >= maxConsecutiveFailures) {
             trip("consecutive-failures(" + n + "): " + reason);
+        }
+    }
+
+    /** PRE-LIVE-PLAN.md P1-4(a): call on a broken cycle where NO real inventory moved (loss == 0 —
+     * e.g. a leg-0 zero-fill: the order never filled, so there is nothing to recover and nothing
+     * lost). {@code handleBrokenCycle} previously called {@link #recordFailure} unconditionally,
+     * including for this case — at the measured break rate that was a 49% chance of a halt on day
+     * one, at ZERO financial cost. This is a separate, LOOSER counter tripping at
+     * {@code max-consecutive-no-fill} (default 25) — a genuinely dead venue (every cycle zero-fills)
+     * still trips something, but one occasional harmless non-fill among real activity does not. */
+    public void recordNoFill(String reason) {
+        int n = consecutiveNoFill.incrementAndGet();
+        if (n >= maxConsecutiveNoFill) {
+            trip("consecutive-no-fill(" + n + "): " + reason);
         }
     }
 

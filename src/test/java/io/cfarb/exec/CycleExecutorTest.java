@@ -71,6 +71,9 @@ class CycleExecutorTest {
             public int maxCyclesPerMinute() { return 30; }
             public long cycleCooldownMs() { return 0; }
             public int maxConsecutiveFailures() { return 3; }
+            public double maxNotionalPerWindowUsd() { return 1_000_000.0; }
+            public long notionalWindowMs() { return 60_000; }
+            public int maxConsecutiveNoFill() { return 25; }
         };
     }
 
@@ -89,6 +92,7 @@ class CycleExecutorTest {
             public long legTimeoutMs() { return 1500; }
             public long unwindCrossBps() { return 40; }
             public long maxIntentAgeMs() { return 150; }
+            public double legCrossBps() { return 0.0; }
         };
     }
 
@@ -171,7 +175,7 @@ class CycleExecutorTest {
         scriptGenerousFill(api, "XRPBTC", FixedPoint.fromDouble(0.000017), "o1");
         scriptGenerousFill(api, "XRPUSDT", FixedPoint.fromDouble(1.40), "o2");
 
-        riskGates.claim(0, System.nanoTime());
+        riskGates.claim(0, FixedPoint.fromDouble(100.0), System.nanoTime());
         assertTrue(queue.offer(intent()));
         waitUntil(() -> riskGates.openCycleCount() == 0);
 
@@ -201,7 +205,7 @@ class CycleExecutorTest {
         // the unwind reversal (SELL back on BTCUSDT) fills fully
         api.scriptQuery("BTCUSDT", partial, FixedPoint.fromDouble(0.0007 * 77850.0 * 0.999), "FILLED", "rev0");
 
-        riskGates.claim(0, System.nanoTime());
+        riskGates.claim(0, FixedPoint.fromDouble(100.0), System.nanoTime());
         assertTrue(queue.offer(intent()));
         waitUntil(() -> riskGates.openCycleCount() == 0);
 
@@ -219,7 +223,7 @@ class CycleExecutorTest {
         api.scriptQuery("XRPBTC", 0, 0, "CANCELED", "o1");
         api.scriptQuery("BTCUSDT", FixedPoint.fromDouble(0.001284), FixedPoint.fromDouble(99.9), "FILLED", "rev0");
 
-        riskGates.claim(0, System.nanoTime());
+        riskGates.claim(0, FixedPoint.fromDouble(100.0), System.nanoTime());
         assertTrue(queue.offer(intent()));
         waitUntil(() -> riskGates.openCycleCount() == 0);
 
@@ -242,7 +246,7 @@ class CycleExecutorTest {
         scriptGenerousFill(api, "XRPBTC", FixedPoint.fromDouble(0.000017), "o1");
         scriptGenerousFill(api, "XRPUSDT", FixedPoint.fromDouble(1.40), "o2");
 
-        riskGates.claim(0, System.nanoTime());
+        riskGates.claim(0, FixedPoint.fromDouble(100.0), System.nanoTime());
         assertTrue(queue.offer(intent()));
         waitUntil(() -> riskGates.openCycleCount() == 0);
 
@@ -250,6 +254,188 @@ class CycleExecutorTest {
         // a second cycle must be claimable immediately -- would fail if the count had gone negative
         // and canFire's >= comparison were somehow defeated, or positive and never released
         assertTrue(riskGates.canFire(0, FixedPoint.fromDouble(50.0), System.nanoTime()));
+    }
+
+    // --- PRE-LIVE-PLAN.md P1-4(a): a zero-fill break takes the no-fill path, a partial-fill break
+    //     takes the failure path -------------------------------------------------------------
+    // Both new tests build their OWN executor around a KillSwitch with maxConsecutiveFailures=1 (a
+    // SINGLE wrongly-classified recordFailure() call would trip immediately) and the default
+    // maxConsecutiveNoFill=25 -- so "did not trip" proves recordNoFill() was called, and "did trip"
+    // proves recordFailure() was.
+
+    private record ExecRig(FakeMexcOrderApi api, CycleExecutor executor, SpscArrayQueue<OrderIntent> queue,
+                            EventJournal journal, KillSwitch killSwitch, SimpleMeterRegistry registry) {
+    }
+
+    private ExecRig buildRig(int maxConsecutiveFailures) {
+        FakeMexcOrderApi rigApi = new FakeMexcOrderApi();
+        KillSwitch rigKillSwitch = new KillSwitch(portfolio, FixedPoint.fromDouble(10.0), maxConsecutiveFailures);
+        RiskGates rigRiskGates = new RiskGates(riskConfig(), strategyConfig(), execConfig(), 1, rigKillSwitch, true);
+        SimpleMeterRegistry rigRegistry = new SimpleMeterRegistry();
+        BotMetrics rigMetrics = new BotMetrics(rigRegistry);
+        EventJournal rigJournal = new EventJournal(tempDir.resolve("journal-" + System.nanoTime()), rigMetrics, false);
+        rigJournal.start();
+        SpscArrayQueue<OrderIntent> rigQueue = new SpscArrayQueue<>(8);
+
+        Triangle tri = triangle();
+        Map<String, BotConfig.TriangleConfig> triangleConfigs = Map.of("usdt-btc-xrp-fwd",
+                new BotConfig.TriangleConfig() {
+                    public boolean enabled() { return true; }
+                    public List<String> legs() { return List.of("BTCUSDT:ASK", "XRPBTC:ASK", "XRPUSDT:BID"); }
+                    public java.util.OptionalDouble maxNotionalUsd() { return java.util.OptionalDouble.empty(); }
+                });
+        io.cfarb.book.BookRegistry books = new io.cfarb.book.BookRegistry(
+                List.of("BTCUSDT", "XRPBTC", "XRPUSDT"), 1, 0);
+        Map<String, SymbolFilter> filters = Map.of("BTCUSDT", BTCUSDT, "XRPBTC", XRPBTC, "XRPUSDT", XRPUSDT);
+        TriangleRegistry rigTriangles = new TriangleRegistry(triangleConfigs, "USDT", books, filters);
+
+        Unwinder unwinder = new Unwinder(rigApi, "IOC", 1500, books, 40);
+        CycleExecutor rigExecutor = new CycleExecutor(rigQueue, rigTriangles, rigRiskGates, rigKillSwitch, portfolio,
+                rigMetrics, rigJournal, false, rigApi, unwinder, "IOC", 1500, 150);
+        rigExecutor.start();
+        rigRiskGates.claim(0, FixedPoint.fromDouble(100.0), System.nanoTime());
+        return new ExecRig(rigApi, rigExecutor, rigQueue, rigJournal, rigKillSwitch, rigRegistry);
+    }
+
+    private static double counterCount(SimpleMeterRegistry registry, String name) {
+        io.micrometer.core.instrument.Counter c = registry.find(name).counter();
+        return c == null ? 0.0 : c.count();
+    }
+
+    @Test
+    void leg0ZeroFillTakesTheNoFillPathAndDoesNotTripAtAStrictFailureThreshold() throws InterruptedException {
+        // Nothing is ever spent (leg 0 itself zero-fills) -- Unwinder.unwind finds nothing to
+        // reverse (heldLegIndex stays -1) and returns recoveredAnchorFixed=0, so loss == 0 - 0 == 0.
+        // handleBrokenCycle never calls Portfolio#applyBrokenCyclePnl for a zero loss, so
+        // brokenCycleCount() itself stays 0 -- cfarb.cycles.no_fill is the precise signal here.
+        ExecRig rig = buildRig(1);
+        rig.api().scriptQuery("BTCUSDT", 0, 0, "CANCELED", "o0");
+
+        assertTrue(rig.queue().offer(intent()));
+        waitUntil(() -> counterCount(rig.registry(), "cfarb.cycles.no_fill") >= 1.0);
+
+        assertEquals(0, portfolio.brokenCycleCount(), "a zero-loss break never calls applyBrokenCyclePnl");
+        assertEquals(1.0, counterCount(rig.registry(), "cfarb.cycles.broken"), "metrics.recordCycleBroken() still fires");
+        assertTrue(!rig.killSwitch().tripped(),
+                "a zero-loss (leg-0 zero-fill) break must call recordNoFill, not recordFailure -- "
+                        + "a real recordFailure would have tripped immediately at max-consecutive-failures=1");
+
+        rig.executor().stop();
+        rig.journal().stop();
+    }
+
+    @Test
+    void partialFillTakesTheFailurePathAndTripsAtAStrictFailureThreshold() throws InterruptedException {
+        // Same scenario as partialFillOnLeg0AbortsAndUnwindsRatherThanContinuing, but with
+        // max-consecutive-failures=1 to prove which counter handleBrokenCycle actually drove: the
+        // unwind reversal recovers slightly LESS than was spent (0.999 factor), a real non-zero loss.
+        ExecRig rig = buildRig(1);
+        long partial = FixedPoint.fromDouble(0.0007);
+        long partialQuote = FixedPoint.fromDouble(0.0007 * 77850.0);
+        rig.api().scriptQuerySequence("BTCUSDT",
+                FakeMexcOrderApi.response(partial, partialQuote, "PARTIALLY_FILLED", "o0"),
+                FakeMexcOrderApi.response(partial, partialQuote, "CANCELED", "o0"));
+        rig.api().scriptQuery("BTCUSDT", partial, FixedPoint.fromDouble(0.0007 * 77850.0 * 0.999), "FILLED", "rev0");
+
+        assertTrue(rig.queue().offer(intent()));
+        waitUntil(rig.killSwitch()::tripped);
+
+        assertEquals(1, portfolio.brokenCycleCount(), "a real (non-zero) loss must call applyBrokenCyclePnl");
+        assertEquals(0.0, counterCount(rig.registry(), "cfarb.cycles.no_fill"),
+                "a real loss must never be counted as a no-fill");
+        assertTrue(rig.killSwitch().tripped(),
+                "a real loss (partial fill, unwind recovers less than was spent) must call recordFailure "
+                        + "and trip immediately at max-consecutive-failures=1");
+
+        rig.executor().stop();
+        rig.journal().stop();
+    }
+
+    // --- PRE-LIVE-PLAN.md P1-5: IOC cross buffer -----------------------------------------------
+
+    private CycleExecutor executorWithCrossBps(double legCrossBps) {
+        // dryRun=true so the (!dryRun && unwinder==null) validation is never reached -- this method
+        // only exercises applyLegCrossBuffer directly, never a real execution path.
+        return new CycleExecutor(queue, triangles, riskGates, killSwitch, portfolio, metrics, journal,
+                true, api, null, "IOC", 1500, 150, legCrossBps);
+    }
+
+    @Test
+    void anAskLegCrossesUpByExactlyTheConfiguredBps() {
+        CycleExecutor exec = executorWithCrossBps(10.0);
+        long worstPrice = FixedPoint.fromDouble(100.0);
+
+        long crossed = exec.applyLegCrossBuffer(worstPrice, Side.ASK, BTCUSDT);
+
+        assertEquals(100.10, FixedPoint.toDouble(crossed), 1e-6, "100 crossed up by 10bps = 100.10");
+        assertTrue(crossed > worstPrice, "an ASK leg must cross UP");
+    }
+
+    @Test
+    void aBidLegCrossesDownByExactlyTheConfiguredBps() {
+        CycleExecutor exec = executorWithCrossBps(10.0);
+        long worstPrice = FixedPoint.fromDouble(100.0);
+
+        long crossed = exec.applyLegCrossBuffer(worstPrice, Side.BID, BTCUSDT);
+
+        assertEquals(99.90, FixedPoint.toDouble(crossed), 1e-6, "100 crossed down by 10bps = 99.90");
+        assertTrue(crossed < worstPrice, "a BID leg must cross DOWN");
+    }
+
+    @Test
+    void theCrossedResultIsTickRepresentable() {
+        // A generous band (0.05/0.05, BTCUSDT's own default here) so the clamp never binds --
+        // isolates tick-representability from the separate "clamp wins" property below.
+        CycleExecutor exec = executorWithCrossBps(7.0);
+        long worstPrice = FixedPoint.fromDouble(123.456789); // deliberately sub-tick precision
+
+        for (Side side : new Side[]{Side.ASK, Side.BID}) {
+            long crossed = exec.applyLegCrossBuffer(worstPrice, side, BTCUSDT);
+            String rendered = FixedPoint.toPlainString(crossed, BTCUSDT.priceDecimals());
+            long reparsed = FixedPoint.parse(rendered);
+            assertEquals(crossed, reparsed, side + ": the crossed price must already be exactly "
+                    + "representable at priceDecimals -- a later render/truncate must not change it");
+        }
+    }
+
+    @Test
+    void aBandClampOverridesTheBuffer() {
+        // A large buffer (40bps) against a tight 0.1% band -- the clamp must bind and win.
+        SymbolFilter tightBand = filter("BTCUSDT", "BTC", "USDT", 1e-6, 6, 1e-6, 1.0, 2, 5.0);
+        tightBand = new SymbolFilter(tightBand.symbol(), tightBand.baseAsset(), tightBand.quoteAsset(),
+                tightBand.qtyStep(), tightBand.qtyDecimals(), tightBand.minQty(), tightBand.minNotional(),
+                tightBand.priceDecimals(), tightBand.takerBps(), tightBand.takerFeeMultiplierFixed(),
+                tightBand.orderTypes(), 0.001, 0.001); // 0.1% band, far tighter than the 40bps buffer
+        CycleExecutor exec = executorWithCrossBps(40.0);
+        long worstPrice = FixedPoint.fromDouble(100.0);
+
+        long askCrossed = exec.applyLegCrossBuffer(worstPrice, Side.ASK, tightBand);
+        double askCap = 100.0 * 1.001; // bidMultiplierUp = 0.1%
+        assertEquals(askCap, FixedPoint.toDouble(askCrossed), 0.01,
+                "the 0.1% band cap must win over the 40bps buffer's own (larger) target");
+
+        long bidCrossed = exec.applyLegCrossBuffer(worstPrice, Side.BID, tightBand);
+        double bidFloor = 100.0 * 0.999; // askMultiplierDown = 0.1%
+        assertEquals(bidFloor, FixedPoint.toDouble(bidCrossed), 0.01,
+                "the 0.1% band floor must win over the 40bps buffer's own (larger) target");
+    }
+
+    @Test
+    void zeroCrossBpsReproducesTodaysPriceByteForByte() {
+        CycleExecutor exec = executorWithCrossBps(0.0);
+        long worstPrice = FixedPoint.fromDouble(77_850.123456);
+
+        assertEquals(worstPrice, exec.applyLegCrossBuffer(worstPrice, Side.ASK, BTCUSDT));
+        assertEquals(worstPrice, exec.applyLegCrossBuffer(worstPrice, Side.BID, BTCUSDT));
+    }
+
+    @Test
+    void negativeOrTooLargeLegCrossBpsRefusesToBoot() {
+        // 0.0 itself is the valid, inert default -- only outside [0, 50] fails.
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> executorWithCrossBps(-1.0));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> executorWithCrossBps(50.001));
     }
 
     private static void waitUntil(java.util.function.BooleanSupplier condition) throws InterruptedException {

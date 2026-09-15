@@ -163,7 +163,10 @@ public final class MexcRestClient implements MexcOrderApi {
 
     private CompletableFuture<String> signedGet(String path, String queryString, long timeoutMs) {
         long timestamp = System.currentTimeMillis();
-        String totalParams = queryString + "&recvWindow=" + recvWindowMs + "&timestamp=" + timestamp;
+        // queryString is empty for account() below (no extra params beyond recvWindow/timestamp) --
+        // avoid a leading "&" in that case rather than relying on the venue tolerating one.
+        String base = queryString.isEmpty() ? "" : queryString + "&";
+        String totalParams = base + "recvWindow=" + recvWindowMs + "&timestamp=" + timestamp;
         String signature = signer.sign(totalParams);
         String fullQuery = totalParams + "&signature=" + signature;
 
@@ -197,6 +200,13 @@ public final class MexcRestClient implements MexcOrderApi {
      */
     public CompletableFuture<String> cancelOrder(String symbol, String clientOrderId, long timeoutMs) {
         return signedDelete("/api/v3/order", "symbol=" + symbol + "&origClientOrderId=" + clientOrderId, timeoutMs);
+    }
+
+    /** {@code GET /api/v3/account} -- PRE-LIVE-PLAN.md P1-4(b): the one boot-time call {@code
+     * state.BalanceReconciler} makes, live mode only, before the feed connects. Returns the raw
+     * JSON body (an object with a {@code balances} array of {@code {asset,free,locked}}). */
+    public CompletableFuture<String> account(long timeoutMs) {
+        return signedGet("/api/v3/account", "", timeoutMs);
     }
 
     private CompletableFuture<String> signedDelete(String path, String queryString, long timeoutMs) {

@@ -52,6 +52,10 @@ public interface BotConfig {
 
     FeesConfig fees();
 
+    DetectorConfig detector();
+
+    ConsumptionLedgerConfig consumptionLedger();
+
     interface VenueConfig {
         @WithDefault("wss://wbs-api.mexc.com/ws")
         String wsUrl();
@@ -107,6 +111,22 @@ public interface BotConfig {
 
         @WithDefault("true")
         boolean compound();
+
+        /** PRE-LIVE-PLAN.md P1-4(b): fetch real account balances on boot and seed {@code
+         * state.Portfolio} from the anchor balance instead of {@link #seedUsd()} -- {@code
+         * state.Portfolio} is otherwise a single in-memory number with no idea what a restart's
+         * account actually holds. LIVE MODE ONLY; ignored (and never contacts the venue) in
+         * dry-run, where {@link #seedUsd()} is always the seed. */
+        @WithDefault("true")
+        boolean reconcileOnBoot();
+
+        /** A non-anchor asset balance above this (in that asset's OWN units for a recognized
+         * ~1:1-USD stablecoin peer of the anchor; ANY nonzero balance for every other asset, since
+         * no live price exists yet at boot to convert it — see {@code state.BalanceReconciler}'s
+         * javadoc) FAILS THE BOOT (S5) as stranded inventory needing operator review, rather than
+         * something the bot silently trades around. */
+        @WithDefault("1.0")
+        double nonAnchorDustUsd();
     }
 
     interface RiskConfig {
@@ -134,6 +154,26 @@ public interface BotConfig {
 
         @WithDefault("3")
         int maxConsecutiveFailures();
+
+        /** PRE-LIVE-PLAN.md P0-2(a): notional BUDGET across a rolling window, distinct from {@link
+         * #maxNotionalUsd()} (bounds one order) and {@link #maxCyclesPerMinute()} (bounds a COUNT,
+         * not a dollar sum). Neither existing gate binds a rapid sequence of full-sized fires — the
+         * 2026-09-11 burst put 43 fires x $2,010 = $86,430 of notional through in 19s against $2,500
+         * of equity. A non-positive value FAILS THE BOOT (S6), same as every other risk limit. */
+        @WithDefault("5000")
+        double maxNotionalPerWindowUsd();
+
+        /** Width of the rolling window {@link #maxNotionalPerWindowUsd()} is measured over. A
+         * non-positive value FAILS THE BOOT (S6). */
+        @WithDefault("60000")
+        long notionalWindowMs();
+
+        /** PRE-LIVE-PLAN.md P1-4(a): {@code risk.KillSwitch}'s second, looser consecutive-failure
+         * counter for a broken cycle that moved NO real inventory (loss == 0, e.g. a leg-0
+         * zero-fill) — a free missed trade, not a failure. A non-positive value FAILS THE BOOT (S6),
+         * same as every other risk limit. */
+        @WithDefault("25")
+        int maxConsecutiveNoFill();
     }
 
     interface ExecConfig {
@@ -184,6 +224,17 @@ public interface BotConfig {
          * acting on one that is already older than that all but guarantees leg failures. */
         @WithDefault("150")
         long maxIntentAgeMs();
+
+        /** PRE-LIVE-PLAN.md P1-5: a marketable limit fills at the BOOK's price up to your limit, so
+         * crossing costs nothing when the book has not moved since detection (measured expected cost
+         * ~0.11 bps against a 4.833 bps mean edge, converting 72% of adverse moves into fills).
+         * {@code exec.CycleExecutor} crosses each leg's modelled price by this many bps -- ASK legs
+         * up, BID legs down -- clamped inside the symbol's {@code PERCENT_PRICE_BY_SIDE} band.
+         * {@code 0.0} (default) is inert and reproduces today's submitted price byte-for-byte.
+         * {@code EdgeCalculator} is never touched: this is purely an execution-time adjustment. A
+         * value outside {@code [0, 50]} FAILS THE BOOT (S6). */
+        @WithDefault("0.0")
+        double legCrossBps();
     }
 
     interface JournalConfig {
@@ -222,6 +273,16 @@ public interface BotConfig {
          * pre-JOURNAL-TUNING behavior, only sane for a short diagnostic capture. */
         @WithDefault("500")
         long maxCrossedMs();
+
+        /** PRE-LIVE-PLAN.md P0-2(c): a book that just {@code reset()} (crossed-latch self-heal, a
+         * version-chain gap, or reconnect) is {@code isTrusted()} again within roughly 55ms on a
+         * ~900msg/s symbol (see {@code L2Book#lastResetNanos}'s javadoc) — a ladder rebuilt from a
+         * handful of deltas, not a real book. {@code OpportunityDetector} refuses any triangle with
+         * a leg reset more recently than this, regardless of {@code isTrusted()}. {@code 0} DISABLES
+         * the quarantine entirely and logs a startup WARN — only sane for a short diagnostic
+         * capture; a negative value FAILS THE BOOT (S6). */
+        @WithDefault("2000")
+        long postResetQuarantineMs();
     }
 
     /**
@@ -271,5 +332,64 @@ public interface BotConfig {
          * appended. Chatty, but never on the tick path. */
         @WithDefault("false")
         boolean echoEvents();
+    }
+
+    /**
+     * PRE-LIVE-PLAN.md P0-2(b): tuning for {@code OpportunityDetector}'s per-triangle duplicate-fire
+     * suppression (DUPLICATE-FIRE-TASK.md "Fix A"). Fix A suppresses only when all three legs' fire
+     * signatures are unchanged, but a resetting-often leg (BTCUSDT resets ~79/h) keeps ONE leg's
+     * write stamp advancing continuously — "one churning leg unlocks re-fires against two frozen
+     * ones" — so the all-three rule almost never actually fires
+     * (cfarb_detector_duplicate_fire_total: 10 suppressions across 11h, on one triangle).
+     */
+    interface DetectorConfig {
+        /** A leg counts toward duplicate suppression only when its base quantity is at least this
+         * fraction of its touch quantity — stops a deep, effectively-constant leg (USDCUSDT's top)
+         * from vetoing suppression on its own. Outside {@code (0, 1]} FAILS THE BOOT (S6). */
+        @WithDefault("0.10")
+        double duplicateMaterialFraction();
+
+        /** A candidate identical to the last fire on every MATERIAL leg is suppressed only while the
+         * last fire is within this many ms — an old fire's signature does not veto a fresh one
+         * forever. */
+        @WithDefault("30000")
+        long duplicateWindowMs();
+
+        /** PRE-LIVE-PLAN.md P0-2(d): stale-leg guard. If one leg's top ({@code L2Book
+         * #lastTopChangeNanos}) has not changed in at least this many ms while another leg's top
+         * changed within {@link #staleLegActiveMs()}, the edge is refused as lag, not a real
+         * opportunity — the 12:30:16 signature (BTCUSDC's bid sitting 161.58 above BTCUSDT's ask
+         * while every other sample that window ran -0.69 to -6.61 bps). Either this or {@link
+         * #staleLegActiveMs()} {@code <= 0} DISABLES the guard entirely (startup WARN, not a boot
+         * failure — this is a tuning knob, not a safety limit). */
+        @WithDefault("1000")
+        long staleLegFrozenMs();
+
+        /** See {@link #staleLegFrozenMs()}. */
+        @WithDefault("200")
+        long staleLegActiveMs();
+    }
+
+    /**
+     * PRE-LIVE-PLAN.md P0-1 ("Fix B") / cf-arb-bot-plan.md §5.3.2: dry-run-only. {@code
+     * strategy.ConsumptionLedger} makes a paper fill actually consume the ladder depth it modelled,
+     * so a repeated evaluation of the same tick doesn't re-read the same unconsumed book state (the
+     * {@code usdt-sol-btc-rev} burst "bought" 19.32 SOL three times out of a level holding 40.27).
+     * Named {@code cf-bot.consumption-ledger.*}, not {@code cf-bot.dry-run.*} — {@code cf-bot.dry-run}
+     * is already a top-level boolean leaf, and SmallRye Config cannot nest properties under one.
+     */
+    interface ConsumptionLedgerConfig {
+        /** {@code true} (default) enables the ledger in dry-run; {@code false} restores the
+         * pre-P0-1 behaviour (every evaluation re-reads the full displayed depth) for an A/B
+         * comparison against a fresh capture. Never consulted in live mode — {@code BotService}
+         * constructs the ledger only when {@code cf-bot.dry-run=true}, regardless of this value. */
+        @WithDefault("true")
+        boolean enabled();
+
+        /** Backstop TTL for a claimed level nobody ever rewrites again — see {@code
+         * ConsumptionLedger}'s javadoc. A non-positive value FAILS THE BOOT (S6) whenever the ledger
+         * is actually constructed (dry-run AND {@link #enabled()}). */
+        @WithDefault("5000")
+        long ttlMs();
     }
 }

@@ -1,6 +1,7 @@
 package io.cfarb.book;
 
 import io.cfarb.feed.MexcDepthDecoder;
+import io.cfarb.model.Side;
 
 /**
  * One symbol's reconstructed L2 book, ported from {@code cf-arb-poc/cfarb/book.py}'s semantics
@@ -94,6 +95,29 @@ public final class L2Book {
      * on the hot path. volatile for the same cross-thread-read reason as {@link #crossedSinceNanos}. */
     private volatile long crossedResetCount;
 
+    /** PRE-LIVE-PLAN.md P0-2(c): nanoTime this book was last {@link #reset}, by ANY path -- the
+     * crossed-latch self-heal, a version-chain gap, or an external {@code BookRegistry#resetAll}
+     * (reconnect). {@code maybePromote}'s {@code updateCount >= warmupUpdates || elapsed >=
+     * warmupNanos} OR-promotion means a book back on a ~900msg/s symbol is {@code isTrusted()}
+     * again in roughly 55ms, carrying a ladder rebuilt from a handful of deltas -- nowhere near a
+     * full book (LIVE-REALISATION-ANALYSIS.md: 12% of BTCUSDT resets fired on a book holding fewer
+     * than 50 updates). {@code OpportunityDetector} quarantines a triangle whose leg reset too
+     * recently, regardless of {@code isTrusted()}. volatile for the same cross-thread-read reason as
+     * {@link #crossedSinceNanos}; the detector reads it on this book's own thread, never a race. */
+    private volatile long lastResetNanos = Long.MIN_VALUE / 2;
+
+    /** PRE-LIVE-PLAN.md P0-2(d): nanoTime index 0 (the top) last actually changed price or
+     * quantity, per side -- set in {@link #applyLevel} only on a real change at the top, never on
+     * an unrelated deeper-level update. {@code OpportunityDetector}'s stale-leg guard reads both
+     * sides' ages to refuse a candidate where one leg is frozen while another is actively moving --
+     * exactly the 12:30:16 BTCUSDC-bid-161.58-above-BTCUSDT-ask signature the guard targets.
+     * volatile for the same cross-thread-read reason as {@link #crossedSinceNanos}; NOT reset by
+     * {@link #reset}, deliberately -- a just-reset book is already covered by the separate
+     * post-reset quarantine ({@link #lastResetNanos}), and the guard only runs on legs quarantine
+     * has already cleared. */
+    private volatile long lastBidTopChangeNanos = Long.MIN_VALUE / 2;
+    private volatile long lastAskTopChangeNanos = Long.MIN_VALUE / 2;
+
     // cf-arb-bot-review-plan.md (second pass) Tier A4: published top-of-book, read by the executor
     // thread ONLY for pricing an emergency unwind reversal (exec.Unwinder) -- never for a trading
     // DECISION, which stays exclusively on this book-owning Netty event-loop thread via the normal
@@ -117,7 +141,16 @@ public final class L2Book {
         this.maxCrossedNanos = maxCrossedMs > 0 ? maxCrossedMs * 1_000_000L : 0L;
     }
 
+    /** Rare, off-tick-path callers (e.g. {@code BookRegistry#resetAll} on reconnect) that don't
+     * already have {@code nowNanos} in scope. */
     public void reset() {
+        reset(System.nanoTime());
+    }
+
+    /** PRE-LIVE-PLAN.md P0-2(c): callers on the tick path (the crossed-latch self-heal and the
+     * version-chain-gap reset inside {@link #apply}) must pass the SAME {@code nowNanos} they
+     * already have, never a fresh {@code System.nanoTime()} call (rule R1). */
+    public void reset(long nowNanos) {
         bidCount = 0;
         askCount = 0;
         updateCount = 0;
@@ -127,6 +160,7 @@ public final class L2Book {
         topBidFixed = Long.MIN_VALUE;
         topAskFixed = Long.MIN_VALUE;
         crossedSinceNanos = -1;
+        lastResetNanos = nowNanos;
         // DUPLICATE-FIRE-TASK.md: writeSeq is deliberately NOT reset -- see its field javadoc. Levels
         // rebuilt after a reset must carry strictly higher stamps than any signature the detector
         // still holds so a re-warmed book always re-fires.
@@ -146,18 +180,18 @@ public final class L2Book {
         // so isTrusted() re-gates every triangle touching this symbol until it re-warms (rule S5).
         if (maxCrossedNanos > 0 && crossedSinceNanos >= 0
                 && nowNanos - crossedSinceNanos >= maxCrossedNanos) {
-            reset();
+            reset(nowNanos);
             crossedResetCount++;
         }
         boolean gap = lastToVersion >= 0 && f.fromVersion >= 0 && f.fromVersion > lastToVersion + 1;
         if (gap) {
-            reset();
+            reset(nowNanos);
         }
         for (int i = 0; i < f.bidCount; i++) {
-            applyLevel(true, f.bidPx[i], f.bidQty[i]);
+            applyLevel(true, f.bidPx[i], f.bidQty[i], nowNanos);
         }
         for (int i = 0; i < f.askCount; i++) {
-            applyLevel(false, f.askPx[i], f.askQty[i]);
+            applyLevel(false, f.askPx[i], f.askQty[i], nowNanos);
         }
         if (f.toVersion >= 0) {
             lastToVersion = f.toVersion;
@@ -188,7 +222,7 @@ public final class L2Book {
         return !gap;
     }
 
-    private void applyLevel(boolean isBid, long px, long qty) {
+    private void applyLevel(boolean isBid, long px, long qty, long nowNanos) {
         long[] pxArr = isBid ? bidPx : askPx;
         long[] qtyArr = isBid ? bidQty : askQty;
         long[] seqArr = isBid ? bidWriteSeq : askWriteSeq;
@@ -199,20 +233,28 @@ public final class L2Book {
 
         if (qty == 0) {
             if (found) {
+                boolean wasTop = idx == 0;
                 System.arraycopy(pxArr, idx + 1, pxArr, idx, count - idx - 1);
                 System.arraycopy(qtyArr, idx + 1, qtyArr, idx, count - idx - 1);
                 // DUPLICATE-FIRE-TASK.md: mirror the shift-left so surviving levels keep their stamps.
                 System.arraycopy(seqArr, idx + 1, seqArr, idx, count - idx - 1);
                 if (isBid) bidCount--; else askCount--;
+                if (wasTop) {
+                    markTopChanged(isBid, nowNanos);
+                }
             }
             return;
         }
         if (found) {
+            boolean topQtyChanged = idx == 0 && qtyArr[idx] != qty;
             qtyArr[idx] = qty;
             // DUPLICATE-FIRE-TASK.md: the load-bearing case -- a level rewritten in place (consumed
             // and replenished, or resized) gets a fresh stamp, which is what tells the detector the
             // liquidity is no longer the liquidity it last fired at.
             seqArr[idx] = ++writeSeq;
+            if (topQtyChanged) {
+                markTopChanged(isBid, nowNanos);
+            }
             return;
         }
         // insert a new level at idx, shifting the tail right
@@ -232,6 +274,21 @@ public final class L2Book {
         } else {
             askCount++;
             pruneIfNeeded(false);
+        }
+        if (idx == 0) {
+            // PRE-LIVE-PLAN.md P0-2(d): a brand-new best level (the book was empty, or this price
+            // beats the previous top) is by definition a top-price change.
+            markTopChanged(isBid, nowNanos);
+        }
+    }
+
+    /** PRE-LIVE-PLAN.md P0-2(d): stamps the per-side top-change nanoTime. Called only from {@link
+     * #applyLevel} when index 0's price or quantity actually changed. */
+    private void markTopChanged(boolean isBid, long nowNanos) {
+        if (isBid) {
+            lastBidTopChangeNanos = nowNanos;
+        } else {
+            lastAskTopChangeNanos = nowNanos;
         }
     }
 
@@ -356,6 +413,18 @@ public final class L2Book {
      * performed. The feed watchdog diffs this per symbol to journal a {@code book_reset} event. */
     public long crossedResetCount() {
         return crossedResetCount;
+    }
+
+    /** PRE-LIVE-PLAN.md P0-2(c): nanoTime this book was last {@link #reset} by any path, or a
+     * sentinel far in the past if it has never reset. See the field javadoc for why. */
+    public long lastResetNanos() {
+        return lastResetNanos;
+    }
+
+    /** PRE-LIVE-PLAN.md P0-2(d): nanoTime the given side's top (index 0) last actually changed
+     * price or quantity, or a sentinel far in the past if it never has. */
+    public long lastTopChangeNanos(Side side) {
+        return side == Side.BID ? lastBidTopChangeNanos : lastAskTopChangeNanos;
     }
 
     /** Published top-of-book, for {@code exec.Unwinder}'s emergency reversal pricing ONLY (Tier

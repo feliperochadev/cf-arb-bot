@@ -26,4 +26,8 @@ public interface MexcOrderApi {
 
     /** See {@link MexcRestClient#sign} -- dry-run's "sign and discard" path (Tier 1 step 1.9). */
     String sign(String queryString);
+
+    /** See {@link MexcRestClient#account} -- PRE-LIVE-PLAN.md P1-4(b): {@code state.BalanceReconciler}'s
+     * one boot-time call, live mode only. */
+    CompletableFuture<String> account(long timeoutMs);
 }

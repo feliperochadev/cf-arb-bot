@@ -20,7 +20,9 @@ import io.cfarb.model.SymbolFilter;
 import io.cfarb.observability.ActivityReport;
 import io.cfarb.risk.KillSwitch;
 import io.cfarb.risk.RiskGates;
+import io.cfarb.state.BalanceReconciler;
 import io.cfarb.state.Portfolio;
+import io.cfarb.strategy.ConsumptionLedger;
 import io.cfarb.strategy.OpportunityDetector;
 import io.cfarb.util.FixedPoint;
 import io.quarkus.runtime.ShutdownEvent;
@@ -68,6 +70,11 @@ public class BotService {
      * last resort -- "reconnection failing repeatedly," not "the connection was briefly quiet." */
     private static final int FEED_DEAD_TRIP_THRESHOLD = 3;
     private static final long LATENCY_SNAPSHOT_PERIOD_MS = 60_000;
+    /** PRE-LIVE-PLAN.md P1-4(b): the one blocking boot-time call {@code state.BalanceReconciler}
+     * makes -- generous relative to {@code cf-bot.exec.leg-timeout-ms} (a hot-path budget) since
+     * this runs once, before the feed connects, and a slow-but-eventually-successful response is
+     * still strictly better here than aborting the boot on a false timeout. */
+    private static final long BALANCE_RECONCILE_TIMEOUT_MS = 10_000;
     /** Dry-run never opens a socket or sends a request, but MexcSigner requires a non-empty secret
      * to construct -- cf-arb-bot-review-plan.md Tier 1 step 1.9. This is not a real credential and
      * is never used to sign anything that leaves the process. */
@@ -117,6 +124,23 @@ public class BotService {
             validateOrderType(filters);
         }
 
+        // cf-arb-bot-review-plan.md Tier 1 step 1.9: MexcRestClient (and therefore the signer) is
+        // now constructed in BOTH modes, so dry-run can build and sign every request through the
+        // real code path and discard it (realistic latency histogram) without ever opening a
+        // socket for it. Only live mode reads real credentials from the environment. Moved ahead of
+        // Portfolio construction (PRE-LIVE-PLAN.md P1-4(b)) so live mode can reconcile real balances
+        // and seed Portfolio from them before anything else touches it.
+        String apiKey;
+        MexcSigner signer;
+        if (dryRun) {
+            apiKey = "dry-run";
+            signer = new MexcSigner(DRY_RUN_DUMMY_SECRET);
+        } else {
+            apiKey = requireEnv("MEXC_API_KEY");
+            signer = new MexcSigner(requireEnv("MEXC_API_SECRET"));
+        }
+        this.restClient = new MexcRestClient(vertx, config.venue().restUrl(), apiKey, signer, config.exec().recvWindowMs());
+
         // cf-arb-bot-review-plan.md Tier 2 step 2.5: fail closed on a non-positive capital
         // configuration instead of silently trading on a nonsensical value.
         double seedUsd = config.capital().seedUsd();
@@ -129,9 +153,12 @@ public class BotService {
         }
 
         long seedFixed = FixedPoint.fromDouble(seedUsd);
+        if (!dryRun && config.capital().reconcileOnBoot()) {
+            seedFixed = reconcileBalancesOrFailBoot();
+        }
         this.portfolio = new Portfolio(seedFixed);
         this.killSwitch = new KillSwitch(portfolio, FixedPoint.fromDouble(equityFloorUsd),
-                config.risk().maxConsecutiveFailures());
+                config.risk().maxConsecutiveFailures(), config.risk().maxConsecutiveNoFill());
         this.riskGates = new RiskGates(config.risk(), config.strategy(), config.exec(),
                 triangles.triangleCount(), killSwitch, dryRun);
         this.clockSkewToleranceNanos = riskGates.clockSkewToleranceNanos();
@@ -152,24 +179,25 @@ public class BotService {
         killSwitch.checkEquityFloor();
 
         SpscArrayQueue<OrderIntent> orderQueue = new SpscArrayQueue<>(256);
+        long postResetQuarantineMs = resolvePostResetQuarantineMs();
+        long[] staleLeg = resolveStaleLegConfig();
         OpportunityDetector detector = new OpportunityDetector(books, triangles, riskGates, portfolio,
                 metrics, journal, orderQueue, config.strategy().minNetBps(), config.strategy().slippageBufferBps(),
-                config.capital().compound(), config.journal().rejectSampleMs());
-
-        // cf-arb-bot-review-plan.md Tier 1 step 1.9: MexcRestClient (and therefore the signer) is
-        // now constructed in BOTH modes, so dry-run can build and sign every request through the
-        // real code path and discard it (realistic latency histogram) without ever opening a
-        // socket for it. Only live mode reads real credentials from the environment.
-        String apiKey;
-        MexcSigner signer;
-        if (dryRun) {
-            apiKey = "dry-run";
-            signer = new MexcSigner(DRY_RUN_DUMMY_SECRET);
-        } else {
-            apiKey = requireEnv("MEXC_API_KEY");
-            signer = new MexcSigner(requireEnv("MEXC_API_SECRET"));
+                config.capital().compound(), config.journal().rejectSampleMs(), postResetQuarantineMs,
+                config.detector().duplicateMaterialFraction(), config.detector().duplicateWindowMs(),
+                staleLeg[0], staleLeg[1]);
+        // PRE-LIVE-PLAN.md P0-1: dry-run only -- live mode never simulates (ConsumptionLedger stays
+        // null end to end, reproducing pre-P0-1 behaviour exactly). cf-bot.consumption-ledger.enabled
+        // lets an operator opt back out for an A/B comparison without a code change.
+        if (dryRun && config.consumptionLedger().enabled()) {
+            // ConsumptionLedger's own constructor validates ttlMs > 0 and fails the boot (S6) --
+            // see its javadoc.
+            ConsumptionLedger consumptionLedger =
+                    new ConsumptionLedger(books.symbolCount(), config.consumptionLedger().ttlMs());
+            detector.setConsumptionLedger(consumptionLedger);
+            LOG.infof("dry-run consumption ledger enabled: ttlMs=%d (cf-bot.consumption-ledger.*)",
+                    config.consumptionLedger().ttlMs());
         }
-        this.restClient = new MexcRestClient(vertx, config.venue().restUrl(), apiKey, signer, config.exec().recvWindowMs());
 
         Unwinder unwinder = null;
         if (!dryRun) {
@@ -185,7 +213,7 @@ public class BotService {
 
         this.executor = new CycleExecutor(orderQueue, triangles, riskGates, killSwitch, portfolio,
                 metrics, journal, dryRun, restClient, unwinder, config.exec().orderType(),
-                config.exec().legTimeoutMs(), config.exec().maxIntentAgeMs());
+                config.exec().legTimeoutMs(), config.exec().maxIntentAgeMs(), config.exec().legCrossBps());
         executor.start();
 
         List<String> subscribeMessages = MexcProtocol.subscribeMessages(config.venue().depthChannel(), config.symbols());
@@ -583,6 +611,79 @@ public class BotService {
         }
         LOG.infof("L2 book crossed-latch self-heal: reset after %dms crossed (cf-bot.book.max-crossed-ms)", ms);
         return ms;
+    }
+
+    /** PRE-LIVE-PLAN.md P0-2(c): {@code cf-bot.book.post-reset-quarantine-ms}. {@code 0} is an
+     * explicit opt-out (loud WARN, same shape as {@link #resolveMaxCrossedMs}); a negative value is
+     * a misconfiguration and FAILS THE BOOT (S6) rather than silently behaving like 0. */
+    private long resolvePostResetQuarantineMs() {
+        long ms = config.book().postResetQuarantineMs();
+        if (ms < 0) {
+            throw new IllegalStateException(
+                    "cf-bot.book.post-reset-quarantine-ms must be >= 0, got " + ms);
+        }
+        if (ms == 0) {
+            LOG.warnf("*** cf-bot.book.post-reset-quarantine-ms=0 -- the post-reset quarantine is "
+                    + "DISABLED. A book that just reset can be isTrusted() again within ~55ms on a "
+                    + "busy symbol, carrying a ladder rebuilt from a handful of deltas "
+                    + "(LIVE-REALISATION-ANALYSIS.md: 12% of BTCUSDT resets fired on a book holding "
+                    + "fewer than 50 updates).");
+            return 0;
+        }
+        LOG.infof("post-reset quarantine: refuse a triangle with a leg reset within %dms "
+                + "(cf-bot.book.post-reset-quarantine-ms)", ms);
+        return ms;
+    }
+
+    /** PRE-LIVE-PLAN.md P1-4(b): fetches real account balances (live mode, {@code
+     * cf-bot.capital.reconcile-on-boot=true} only) and returns the anchor asset's real balance,
+     * fixed-point, to seed {@link #portfolio} from instead of {@code cf-bot.capital.seed-usd}.
+     * FAILS THE BOOT (S5) if any non-anchor asset in the account holds more than a dust allowance —
+     * see {@code state.BalanceReconciler}'s javadoc for exactly what "dust" means here — or if the
+     * reconciliation call itself fails for any reason (network, auth, malformed response): starting
+     * live trading blind, with no idea what the account actually holds, is worse than not starting. */
+    private long reconcileBalancesOrFailBoot() {
+        BalanceReconciler reconciler = new BalanceReconciler(restClient, config.capital().anchorAsset(),
+                config.capital().nonAnchorDustUsd());
+        BalanceReconciler.Result result;
+        try {
+            result = reconciler.reconcile(BALANCE_RECONCILE_TIMEOUT_MS);
+        } catch (Exception e) {
+            throw new IllegalStateException("cf-bot.capital.reconcile-on-boot=true but balance reconciliation "
+                    + "failed -- refusing to start live trading blind (security rule S5)", e);
+        }
+        if (!result.clean()) {
+            StringBuilder sb = new StringBuilder("stranded non-anchor inventory found on boot, operator review "
+                    + "required before live trading (security rule S5): ");
+            for (BalanceReconciler.StrandedAsset s : result.stranded()) {
+                sb.append(s.asset()).append('=').append(s.balance()).append(' ');
+            }
+            throw new IllegalStateException(sb.toString().strip());
+        }
+        LOG.infof("balance reconciliation: seeded Portfolio from the real %s balance = %.8f "
+                        + "(cf-bot.capital.seed-usd=%.2f ignored)",
+                config.capital().anchorAsset(), FixedPoint.toDouble(result.anchorBalanceFixed()),
+                config.capital().seedUsd());
+        return result.anchorBalanceFixed();
+    }
+
+    /** PRE-LIVE-PLAN.md P0-2(d): {@code cf-bot.detector.stale-leg-frozen-ms} /
+     * {@code cf-bot.detector.stale-leg-active-ms}. Either non-positive DISABLES the whole guard --
+     * a tuning knob, not a safety limit, so this WARNs rather than failing the boot (contrast
+     * {@link #resolvePostResetQuarantineMs} and every S6 risk-config check). Returns
+     * {@code [frozenMs, activeMs]}, both 0 when disabled. */
+    private long[] resolveStaleLegConfig() {
+        long frozenMs = config.detector().staleLegFrozenMs();
+        long activeMs = config.detector().staleLegActiveMs();
+        if (frozenMs <= 0 || activeMs <= 0) {
+            LOG.warnf("*** cf-bot.detector.stale-leg-frozen-ms=%d / stale-leg-active-ms=%d -- the "
+                    + "stale-leg guard is DISABLED. A candidate whose edge comes from one frozen leg "
+                    + "against another genuinely moving one will not be refused.", frozenMs, activeMs);
+            return new long[] {0L, 0L};
+        }
+        LOG.infof("stale-leg guard: refuse a candidate with a leg frozen >= %dms while another "
+                + "changed within %dms", frozenMs, activeMs);
+        return new long[] {frozenMs, activeMs};
     }
 
     // Accessors for BotApiResource/ReadinessCheck (read-only).

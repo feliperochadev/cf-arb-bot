@@ -30,6 +30,9 @@ public class BotMetrics {
     private io.micrometer.core.instrument.Counter opportunitiesRejectedUnfillable;
     private io.micrometer.core.instrument.Counter cyclesCompleted;
     private io.micrometer.core.instrument.Counter cyclesBroken;
+    // PRE-LIVE-PLAN.md P1-4(a): separates the two handleBrokenCycle outcomes on the dashboard --
+    // this is the subset of cyclesBroken that moved no real inventory (loss == 0).
+    private io.micrometer.core.instrument.Counter cyclesNoFill;
     private io.micrometer.core.instrument.Counter orderQueueDrops;
     private io.micrometer.core.instrument.Counter journalDrops;
     private io.micrometer.core.instrument.Counter journalSuppressed;
@@ -42,11 +45,22 @@ public class BotMetrics {
     // (unit tests that construct BotMetrics directly): the record* methods no-op in that case.
     private Counter[] detectorStaleSkipByTriangle;
     private Counter[] detectorStaleSkipLegBySymbol;
+    // PRE-LIVE-PLAN.md P0-2(c): per-symbol count of triangles refused because a leg reset too
+    // recently (post-reset quarantine) -- distinct from detectorStaleSkipLegBySymbol so an operator
+    // can tell "quarantined" from "genuinely stale/untrusted/crossed".
+    private Counter[] postResetSkipBySymbol;
     // DUPLICATE-FIRE-TASK.md ("Fix A"): per-triangle count of fires suppressed because the book
     // levels the order would consume are unchanged (same worst price, base qty, and write stamp) at
     // the last fire. Same flat-array pattern as the T3 counters -- lock-free array increment on the
     // detector hot path, null until initRuntimeCounters() wires it.
     private Counter[] duplicateFireByTriangle;
+    // PRE-LIVE-PLAN.md P0-2(a): per-triangle count of fires blocked by the rolling-window notional
+    // budget (RiskGates#windowBudgetWouldBlock) -- same flat-array pattern as the other per-triangle
+    // counters here.
+    private Counter[] windowBudgetBlockByTriangle;
+    // PRE-LIVE-PLAN.md P0-2(d): per-triangle count of candidates refused because one leg was frozen
+    // while another was actively moving (the stale-leg guard).
+    private Counter[] staleLegByTriangle;
     // JOURNAL-TUNING-TASK.md T1b: crossed-book episode counter, pre-resolved by symbol index.
     private Counter[] bookCrossedBySymbol;
     // JOURNAL-TUNING-TASK.md T1c: crossed-latch self-heal resets, keyed by "symbol|reason". Lazily
@@ -83,6 +97,7 @@ public class BotMetrics {
         opportunitiesRejectedUnfillable = registry.counter("cfarb.opportunities.rejected_unfillable");
         cyclesCompleted = registry.counter("cfarb.cycles.completed");
         cyclesBroken = registry.counter("cfarb.cycles.broken");
+        cyclesNoFill = registry.counter("cfarb.cycles.no_fill");
         orderQueueDrops = registry.counter("cfarb.order_queue.drops");
         journalDrops = registry.counter("cfarb.journal.drops");
         // Third-pass review finding: a REJECT candidate the detector deliberately did not journal
@@ -104,6 +119,7 @@ public class BotMetrics {
     public void recordOpportunityRejectedUnfillable() { opportunitiesRejectedUnfillable.increment(); }
     public void recordCycleCompleted() { cyclesCompleted.increment(); }
     public void recordCycleBroken() { cyclesBroken.increment(); }
+    public void recordCycleNoFill() { cyclesNoFill.increment(); }
     public void recordOrderQueueDrop() { orderQueueDrops.increment(); }
     public void recordJournalDrop() { journalDrops.increment(); }
     public void recordJournalSuppressed() { journalSuppressed.increment(); }
@@ -120,18 +136,27 @@ public class BotMetrics {
         this.symbolNamesForCounters = List.copyOf(symbolNames);
         detectorStaleSkipByTriangle = new Counter[triangleNames.size()];
         duplicateFireByTriangle = new Counter[triangleNames.size()];
+        windowBudgetBlockByTriangle = new Counter[triangleNames.size()];
+        staleLegByTriangle = new Counter[triangleNames.size()];
         for (int i = 0; i < triangleNames.size(); i++) {
             detectorStaleSkipByTriangle[i] = registry.counter("cfarb.detector.stale_skip",
                     "triangle", triangleNames.get(i));
             duplicateFireByTriangle[i] = registry.counter("cfarb.detector.duplicate_fire",
                     "triangle", triangleNames.get(i));
+            windowBudgetBlockByTriangle[i] = registry.counter("cfarb.risk.window_budget_block",
+                    "triangle", triangleNames.get(i));
+            staleLegByTriangle[i] = registry.counter("cfarb.detector.stale_leg",
+                    "triangle", triangleNames.get(i));
         }
         detectorStaleSkipLegBySymbol = new Counter[symbolNames.size()];
         bookCrossedBySymbol = new Counter[symbolNames.size()];
+        postResetSkipBySymbol = new Counter[symbolNames.size()];
         for (int i = 0; i < symbolNames.size(); i++) {
             detectorStaleSkipLegBySymbol[i] = registry.counter("cfarb.detector.stale_skip_leg",
                     "symbol", symbolNames.get(i));
             bookCrossedBySymbol[i] = registry.counter("cfarb.book.crossed", "symbol", symbolNames.get(i));
+            postResetSkipBySymbol[i] = registry.counter("cfarb.detector.post_reset_skip",
+                    "symbol", symbolNames.get(i));
         }
     }
 
@@ -146,10 +171,27 @@ public class BotMetrics {
         if (detectorStaleSkipLegBySymbol != null) detectorStaleSkipLegBySymbol[symbolIndex].increment();
     }
 
+    /** PRE-LIVE-PLAN.md P0-2(c): a triangle was refused because {@code symbolIndex}'s leg reset more
+     * recently than {@code cf-bot.book.post-reset-quarantine-ms}. */
+    public void recordPostResetSkip(int symbolIndex) {
+        if (postResetSkipBySymbol != null) postResetSkipBySymbol[symbolIndex].increment();
+    }
+
     /** DUPLICATE-FIRE-TASK.md ("Fix A"): a fire was suppressed because the triangle's fire signature
      * (per-leg worst price + base qty + book write stamp) is unchanged since the last fire. */
     public void recordDuplicateFireSuppressed(int triangleIndex) {
         if (duplicateFireByTriangle != null) duplicateFireByTriangle[triangleIndex].increment();
+    }
+
+    /** PRE-LIVE-PLAN.md P0-2(a): a fire was blocked by the rolling-window notional budget. */
+    public void recordWindowBudgetBlock(int triangleIndex) {
+        if (windowBudgetBlockByTriangle != null) windowBudgetBlockByTriangle[triangleIndex].increment();
+    }
+
+    /** PRE-LIVE-PLAN.md P0-2(d): a candidate was refused because one leg was frozen while another
+     * was actively moving (the stale-leg guard). */
+    public void recordStaleLeg(int triangleIndex) {
+        if (staleLegByTriangle != null) staleLegByTriangle[triangleIndex].increment();
     }
 
     /** JOURNAL-TUNING-TASK.md T1b: a book first went crossed (one increment per crossed episode,

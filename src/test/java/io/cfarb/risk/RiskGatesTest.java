@@ -13,6 +13,13 @@ import org.junit.jupiter.api.Test;
 class RiskGatesTest {
 
     private static BotConfig.RiskConfig risk(double maxNotional, int maxOpen, int maxPerMin, long cooldownMs) {
+        // Window budget generous enough to never bind existing tests that know nothing about it --
+        // see the 6-arg overload below for tests that exercise P0-2(a) itself.
+        return risk(maxNotional, maxOpen, maxPerMin, cooldownMs, 1_000_000.0, 60_000);
+    }
+
+    private static BotConfig.RiskConfig risk(double maxNotional, int maxOpen, int maxPerMin, long cooldownMs,
+                                               double maxNotionalPerWindow, long notionalWindowMs) {
         return new BotConfig.RiskConfig() {
             public double equityFloorUsd() { return 50.0; }
             public double maxNotionalUsd() { return maxNotional; }
@@ -20,6 +27,9 @@ class RiskGatesTest {
             public int maxCyclesPerMinute() { return maxPerMin; }
             public long cycleCooldownMs() { return cooldownMs; }
             public int maxConsecutiveFailures() { return 3; }
+            public double maxNotionalPerWindowUsd() { return maxNotionalPerWindow; }
+            public long notionalWindowMs() { return notionalWindowMs; }
+            public int maxConsecutiveNoFill() { return 25; }
         };
     }
 
@@ -38,6 +48,7 @@ class RiskGatesTest {
             public long legTimeoutMs() { return 1500; }
             public long unwindCrossBps() { return 40; }
             public long maxIntentAgeMs() { return 150; }
+            public double legCrossBps() { return 0.0; }
         };
     }
 
@@ -80,7 +91,7 @@ class RiskGatesTest {
         long amt = FixedPoint.fromDouble(50.0);
         long t0 = 10_000_000_000L;
         assertTrue(gates.canFire(0, amt, t0));
-        gates.claim(0, t0);
+        gates.claim(0, amt, t0);
         assertFalse(gates.canFire(0, amt, t0 + 100_000_000L)); // 100ms later, cooldown is 250ms
         assertTrue(gates.canFire(0, amt, t0 + 300_000_000L));  // 300ms later, past cooldown
         // a DIFFERENT triangle is unaffected by triangle 0's cooldown
@@ -93,7 +104,7 @@ class RiskGatesTest {
         RiskGates gates = new RiskGates(risk(200.0, 1, 30, 0), strategy(), exec(), 1, ks, true);
         long amt = FixedPoint.fromDouble(50.0);
         assertTrue(gates.canFire(0, amt, 1L));
-        gates.claim(0, 1L);
+        gates.claim(0, amt, 1L);
         assertFalse(gates.canFire(0, amt, 2L), "max-open-cycles=1, one is already open");
         gates.onCycleFinished();
         assertTrue(gates.canFire(0, amt, 3L), "the slot should free up once the cycle finishes");
@@ -105,10 +116,10 @@ class RiskGatesTest {
         RiskGates gates = new RiskGates(risk(200.0, 100, 2, 0), strategy(), exec(), 1, ks, true);
         long amt = FixedPoint.fromDouble(10.0);
         assertTrue(gates.canFire(0, amt, 0L));
-        gates.claim(0, 0L);
+        gates.claim(0, amt, 0L);
         gates.onCycleFinished();
         assertTrue(gates.canFire(0, amt, 1L));
-        gates.claim(0, 1L);
+        gates.claim(0, amt, 1L);
         gates.onCycleFinished();
         // third cycle within the same 60s window should be blocked (cap=2/min)
         assertFalse(gates.canFire(0, amt, 2L));
@@ -172,5 +183,68 @@ class RiskGatesTest {
         ks.checkEquityFloor();
         assertTrue(ks.tripped());
         assertFalse(gates.canFire(0, FixedPoint.fromDouble(10.0), 2L));
+    }
+
+    // --- PRE-LIVE-PLAN.md P0-2(a): per-triangle notional budget per rolling window --------------
+
+    @Test
+    void windowBudgetBlocksTheNPlusOnethFireInsideTheWindow() {
+        KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(10_000.0)), FixedPoint.fromDouble(50.0), 3);
+        // max-notional-usd=1000 (per-order cap) is generous; the $2500 window budget is the binding
+        // constraint here -- two $1000 fires fit ($2000 <= $2500), a third does not ($3000 > $2500).
+        RiskGates gates = new RiskGates(risk(1_000.0, 100, 100, 0, 2_500.0, 60_000), strategy(), exec(), 1, ks, true);
+        long amt = FixedPoint.fromDouble(1_000.0);
+        long t0 = 10_000_000_000L;
+
+        assertTrue(gates.canFire(0, amt, t0));
+        gates.claim(0, amt, t0);
+        gates.onCycleFinished();
+        assertTrue(gates.canFire(0, amt, t0 + 1_000L), "$2000 spent so far, still under the $2500 budget");
+        gates.claim(0, amt, t0 + 1_000L);
+        gates.onCycleFinished();
+        assertFalse(gates.canFire(0, amt, t0 + 2_000L), "a third $1000 fire would total $3000, over the $2500 budget");
+    }
+
+    @Test
+    void windowBudgetRollsAfterTheConfiguredWindow() {
+        KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(10_000.0)), FixedPoint.fromDouble(50.0), 3);
+        RiskGates gates = new RiskGates(risk(1_000.0, 100, 100, 0, 1_500.0, 60_000), strategy(), exec(), 1, ks, true);
+        long amt = FixedPoint.fromDouble(1_000.0);
+        long t0 = 10_000_000_000L;
+
+        assertTrue(gates.canFire(0, amt, t0));
+        gates.claim(0, amt, t0);
+        gates.onCycleFinished();
+        assertFalse(gates.canFire(0, amt, t0 + 1_000L), "$2000 would exceed the $1500 window budget");
+        // 60s later the window has rolled -- the budget is fresh again.
+        long t1 = t0 + 60_000_000_000L;
+        assertTrue(gates.canFire(0, amt, t1), "the window rolled, so the budget is fresh again");
+    }
+
+    @Test
+    void nonPositiveWindowBudgetConfigRefusesToBoot() {
+        KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(100.0)), FixedPoint.fromDouble(50.0), 3);
+        assertThrows(IllegalStateException.class, () -> new RiskGates(
+                risk(200.0, 1, 30, 250, 0.0, 60_000), strategy(), exec(), 1, ks, true));
+        assertThrows(IllegalStateException.class, () -> new RiskGates(
+                risk(200.0, 1, 30, 250, -5.0, 60_000), strategy(), exec(), 1, ks, true));
+        assertThrows(IllegalStateException.class, () -> new RiskGates(
+                risk(200.0, 1, 30, 250, 5_000.0, 0L), strategy(), exec(), 1, ks, true));
+        assertThrows(IllegalStateException.class, () -> new RiskGates(
+                risk(200.0, 1, 30, 250, 5_000.0, -1L), strategy(), exec(), 1, ks, true));
+    }
+
+    @Test
+    void windowBudgetWouldBlockAttributesTheBlockForTelemetry() {
+        KillSwitch ks = new KillSwitch(new Portfolio(FixedPoint.fromDouble(10_000.0)), FixedPoint.fromDouble(50.0), 3);
+        RiskGates gates = new RiskGates(risk(1_000.0, 100, 100, 0, 1_500.0, 60_000), strategy(), exec(), 1, ks, true);
+        long amt = FixedPoint.fromDouble(1_000.0);
+        long t0 = 10_000_000_000L;
+        gates.claim(0, amt, t0);
+        gates.onCycleFinished();
+
+        assertFalse(gates.canFire(0, amt, t0 + 1_000L));
+        assertTrue(gates.windowBudgetWouldBlock(0, amt, t0 + 1_000L),
+                "the window budget is specifically what refuses this candidate");
     }
 }
