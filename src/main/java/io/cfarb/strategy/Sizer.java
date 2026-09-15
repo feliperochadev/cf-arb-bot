@@ -19,6 +19,13 @@ import io.cfarb.util.FixedPoint;
  */
 public final class Sizer {
 
+    /** PRE-LIVE-PLAN.md P0-1: the deepest per-leg ladder walk {@link Result} (and
+     * {@link ConsumptionLedger}) track individually — deeper walks are vanishingly rare and simply
+     * go unmodelled by the consumption ledger (conservative: it under-reports consumption, never
+     * over-reports it). Public because {@link ConsumptionLedger} sizes its own backing arrays
+     * against it. */
+    public static final int MAX_TRACKED_LEVELS = 16;
+
     private Sizer() {
     }
 
@@ -48,6 +55,17 @@ public final class Sizer {
          * {@link #worstPriceFixed} / {@link #baseQtyFixed} to decide "is the liquidity I am about to
          * trade the liquidity I just traded". */
         public long maxWriteSeq;
+        /** PRE-LIVE-PLAN.md P0-1: per-level detail of THIS walk, index 0..{@link #levelsTouched}-1,
+         * best-to-worst consumption order (NOT necessarily consecutive ladder positions -- a level a
+         * {@link ConsumptionLedger} reports as already fully claimed is skipped without an entry).
+         * Populated only when a non-null ledger was passed to {@link #fillLeg} (cheap either way --
+         * already iterating -- but pointless when there is nothing to ever record into); read by
+         * {@code OpportunityDetector} to commit the WINNING candidate's claims into the ledger on a
+         * fire. Never read by anything on the live path. */
+        public int levelsTouched;
+        public final int[] levelIndex = new int[MAX_TRACKED_LEVELS];
+        public final long[] levelQtyConsumed = new long[MAX_TRACKED_LEVELS];
+        public final long[] levelWriteSeq = new long[MAX_TRACKED_LEVELS];
     }
 
     /**
@@ -64,44 +82,75 @@ public final class Sizer {
      * can't fully support is strictly safer than discovering that mid-cycle via {@code Unwinder}.
      */
     public static void fillLeg(L2Book book, Side side, SymbolFilter filter, long inputAmount, Result out) {
+        fillLeg(book, side, filter, inputAmount, out, null, -1, 0L);
+    }
+
+    /** PRE-LIVE-PLAN.md P0-1: {@code ledger}/{@code symbolIndex}/{@code nowNanos} are only ever
+     * consulted when {@code ledger != null} (dry-run with the consumption ledger enabled) --
+     * {@code symbolIndex}/{@code nowNanos} are otherwise unused and may be any value (the 5-arg
+     * overload above passes placeholders). {@code symbolIndex} identifies this leg's book inside the
+     * ledger's flat arrays; {@code nowNanos} is frame-receipt time (security rule S14), never a fresh
+     * {@code System.nanoTime()} call here. */
+    public static void fillLeg(L2Book book, Side side, SymbolFilter filter, long inputAmount, Result out,
+                                ConsumptionLedger ledger, int symbolIndex, long nowNanos) {
         out.filled = false;
         out.outputAmount = 0;
         out.worstPriceFixed = 0;
         out.baseQtyFixed = 0;
         out.quoteFixed = 0;
         out.maxWriteSeq = 0;
+        out.levelsTouched = 0;
         if (inputAmount <= 0) {
             return;
         }
         if (side == Side.ASK) {
-            fillAsk(book, filter, inputAmount, out);
+            fillAsk(book, filter, inputAmount, out, ledger, symbolIndex, nowNanos);
         } else {
-            fillBid(book, filter, inputAmount, out);
+            fillBid(book, filter, inputAmount, out, ledger, symbolIndex, nowNanos);
         }
     }
 
     /** Buying base with quote: inputAmount is QUOTE budget; walk asks ascending (best-first). */
-    private static void fillAsk(L2Book book, SymbolFilter filter, long quoteBudget, Result out) {
+    private static void fillAsk(L2Book book, SymbolFilter filter, long quoteBudget, Result out,
+                                 ConsumptionLedger ledger, int symbolIndex, long nowNanos) {
         long baseFilled = 0;
         long quoteSpent = 0;
         long worstPrice = 0;
         long maxWriteSeq = 0;
+        int levelsTouched = 0;
         int n = book.askLevelCount();
         for (int i = 0; i < n && quoteSpent < quoteBudget; i++) {
             long price = book.askPxAt(i);
+            long levelWriteSeq = book.askWriteSeqAt(i);
             long qty = book.askQtyAt(i);
+            if (ledger != null) {
+                long alreadyClaimed = ledger.consumed(symbolIndex, Side.ASK, i, levelWriteSeq, nowNanos);
+                qty = Math.max(0, qty - alreadyClaimed);
+                if (qty == 0) {
+                    continue; // this level is already fully claimed by an earlier fire -- try the next
+                }
+            }
             long levelNotional = FixedPoint.mulDiv(price, qty, FixedPoint.SCALE);
             long remainingBudget = quoteBudget - quoteSpent;
+            long takenBase;
             if (levelNotional <= remainingBudget) {
+                takenBase = qty;
                 baseFilled += qty;
                 quoteSpent += levelNotional;
             } else {
-                baseFilled += FixedPoint.mulDiv(remainingBudget, FixedPoint.SCALE, price);
+                takenBase = FixedPoint.mulDiv(remainingBudget, FixedPoint.SCALE, price);
+                baseFilled += takenBase;
                 quoteSpent = quoteBudget;
             }
             worstPrice = price;
             // DUPLICATE-FIRE-TASK.md: one long compare-and-store per level already being visited.
-            maxWriteSeq = Math.max(maxWriteSeq, book.askWriteSeqAt(i));
+            maxWriteSeq = Math.max(maxWriteSeq, levelWriteSeq);
+            if (ledger != null && levelsTouched < MAX_TRACKED_LEVELS) {
+                out.levelIndex[levelsTouched] = i;
+                out.levelQtyConsumed[levelsTouched] = takenBase;
+                out.levelWriteSeq[levelsTouched] = levelWriteSeq;
+                levelsTouched++;
+            }
         }
         if (quoteSpent < quoteBudget) {
             return; // the displayed ladder can't fully absorb the intended size — reject, don't partial-fill
@@ -138,6 +187,37 @@ public final class Sizer {
         out.maxWriteSeq = maxWriteSeq;
         out.outputAmount = FixedPoint.mulDiv(baseFilled, filter.takerFeeMultiplierFixed(), FixedPoint.SCALE);
         out.filled = true;
+        if (ledger != null) {
+            // PRE-LIVE-PLAN.md P0-1: the worst-price cap and quantize-down above can each shrink
+            // baseFilled below the raw per-level walk recorded -- clip the recorded breakdown so its
+            // sum never exceeds the FINAL baseFilled actually being ordered. Never over-reports (see
+            // ConsumptionLedger's class javadoc): a level's claim is trimmed, or dropped entirely if
+            // the final size never really reached it.
+            levelsTouched = clipLevelBreakdownToFinalFill(out, levelsTouched, baseFilled);
+        }
+        out.levelsTouched = levelsTouched;
+    }
+
+    /** Shared by {@link #fillAsk}/{@link #fillBid}: walks the recorded per-level breakdown
+     * best-to-worst and clips the cumulative sum to {@code finalBaseFilled}, dropping any levels
+     * beyond the point the FINAL (capped/quantized) fill actually reached. Returns the new, possibly
+     * smaller, {@code levelsTouched} count. */
+    private static int clipLevelBreakdownToFinalFill(Result out, int levelsTouched, long finalBaseFilled) {
+        long cumulative = 0;
+        int keep = 0;
+        for (int i = 0; i < levelsTouched; i++) {
+            long remaining = finalBaseFilled - cumulative;
+            if (remaining <= 0) {
+                break;
+            }
+            long take = Math.min(out.levelQtyConsumed[i], remaining);
+            out.levelIndex[keep] = out.levelIndex[i];
+            out.levelWriteSeq[keep] = out.levelWriteSeq[i];
+            out.levelQtyConsumed[keep] = take;
+            cumulative += take;
+            keep++;
+        }
+        return keep;
     }
 
     /**
@@ -190,7 +270,8 @@ public final class Sizer {
     }
 
     /** Selling base for quote: inputAmount is BASE held; walk bids descending (best-first). */
-    private static void fillBid(L2Book book, SymbolFilter filter, long baseHeld, Result out) {
+    private static void fillBid(L2Book book, SymbolFilter filter, long baseHeld, Result out,
+                                 ConsumptionLedger ledger, int symbolIndex, long nowNanos) {
         long qtyToSell = FixedPoint.quantizeDown(baseHeld, filter.qtyStep());
         if (qtyToSell < filter.minQty()) {
             return;
@@ -199,17 +280,32 @@ public final class Sizer {
         long quoteReceived = 0;
         long worstPrice = 0;
         long maxWriteSeq = 0;
+        int levelsTouched = 0;
         int n = book.bidLevelCount();
         for (int i = 0; i < n && sold < qtyToSell; i++) {
             long price = book.bidPxAt(i);
+            long levelWriteSeq = book.bidWriteSeqAt(i);
             long qty = book.bidQtyAt(i);
+            if (ledger != null) {
+                long alreadyClaimed = ledger.consumed(symbolIndex, Side.BID, i, levelWriteSeq, nowNanos);
+                qty = Math.max(0, qty - alreadyClaimed);
+                if (qty == 0) {
+                    continue; // this level is already fully claimed by an earlier fire -- try the next
+                }
+            }
             long remaining = qtyToSell - sold;
             long take = Math.min(qty, remaining);
             sold += take;
             quoteReceived += FixedPoint.mulDiv(price, take, FixedPoint.SCALE);
             worstPrice = price;
             // DUPLICATE-FIRE-TASK.md: track the highest write stamp across every consumed bid level.
-            maxWriteSeq = Math.max(maxWriteSeq, book.bidWriteSeqAt(i));
+            maxWriteSeq = Math.max(maxWriteSeq, levelWriteSeq);
+            if (ledger != null && levelsTouched < MAX_TRACKED_LEVELS) {
+                out.levelIndex[levelsTouched] = i;
+                out.levelQtyConsumed[levelsTouched] = take;
+                out.levelWriteSeq[levelsTouched] = levelWriteSeq;
+                levelsTouched++;
+            }
         }
         if (sold < qtyToSell || quoteReceived < filter.minNotional()) {
             return; // insufficient displayed depth to fill the intended (quantized) size
@@ -219,6 +315,10 @@ public final class Sizer {
         out.quoteFixed = quoteReceived;
         out.maxWriteSeq = maxWriteSeq;
         out.outputAmount = FixedPoint.mulDiv(quoteReceived, filter.takerFeeMultiplierFixed(), FixedPoint.SCALE);
+        // No worst-price-cap or quantize-after-the-fact step on this side (unlike fillAsk) -- `sold`
+        // is accumulated as a straight quantity capped directly by qtyToSell, so the recorded
+        // per-level breakdown already sums to EXACTLY out.baseQtyFixed; no clipping needed.
+        out.levelsTouched = levelsTouched;
         out.filled = true;
     }
 }

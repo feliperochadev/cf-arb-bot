@@ -92,6 +92,7 @@ class CycleExecutorTest {
             public long legTimeoutMs() { return 1500; }
             public long unwindCrossBps() { return 40; }
             public long maxIntentAgeMs() { return 150; }
+            public double legCrossBps() { return 0.0; }
         };
     }
 
@@ -348,6 +349,93 @@ class CycleExecutorTest {
 
         rig.executor().stop();
         rig.journal().stop();
+    }
+
+    // --- PRE-LIVE-PLAN.md P1-5: IOC cross buffer -----------------------------------------------
+
+    private CycleExecutor executorWithCrossBps(double legCrossBps) {
+        // dryRun=true so the (!dryRun && unwinder==null) validation is never reached -- this method
+        // only exercises applyLegCrossBuffer directly, never a real execution path.
+        return new CycleExecutor(queue, triangles, riskGates, killSwitch, portfolio, metrics, journal,
+                true, api, null, "IOC", 1500, 150, legCrossBps);
+    }
+
+    @Test
+    void anAskLegCrossesUpByExactlyTheConfiguredBps() {
+        CycleExecutor exec = executorWithCrossBps(10.0);
+        long worstPrice = FixedPoint.fromDouble(100.0);
+
+        long crossed = exec.applyLegCrossBuffer(worstPrice, Side.ASK, BTCUSDT);
+
+        assertEquals(100.10, FixedPoint.toDouble(crossed), 1e-6, "100 crossed up by 10bps = 100.10");
+        assertTrue(crossed > worstPrice, "an ASK leg must cross UP");
+    }
+
+    @Test
+    void aBidLegCrossesDownByExactlyTheConfiguredBps() {
+        CycleExecutor exec = executorWithCrossBps(10.0);
+        long worstPrice = FixedPoint.fromDouble(100.0);
+
+        long crossed = exec.applyLegCrossBuffer(worstPrice, Side.BID, BTCUSDT);
+
+        assertEquals(99.90, FixedPoint.toDouble(crossed), 1e-6, "100 crossed down by 10bps = 99.90");
+        assertTrue(crossed < worstPrice, "a BID leg must cross DOWN");
+    }
+
+    @Test
+    void theCrossedResultIsTickRepresentable() {
+        // A generous band (0.05/0.05, BTCUSDT's own default here) so the clamp never binds --
+        // isolates tick-representability from the separate "clamp wins" property below.
+        CycleExecutor exec = executorWithCrossBps(7.0);
+        long worstPrice = FixedPoint.fromDouble(123.456789); // deliberately sub-tick precision
+
+        for (Side side : new Side[]{Side.ASK, Side.BID}) {
+            long crossed = exec.applyLegCrossBuffer(worstPrice, side, BTCUSDT);
+            String rendered = FixedPoint.toPlainString(crossed, BTCUSDT.priceDecimals());
+            long reparsed = FixedPoint.parse(rendered);
+            assertEquals(crossed, reparsed, side + ": the crossed price must already be exactly "
+                    + "representable at priceDecimals -- a later render/truncate must not change it");
+        }
+    }
+
+    @Test
+    void aBandClampOverridesTheBuffer() {
+        // A large buffer (40bps) against a tight 0.1% band -- the clamp must bind and win.
+        SymbolFilter tightBand = filter("BTCUSDT", "BTC", "USDT", 1e-6, 6, 1e-6, 1.0, 2, 5.0);
+        tightBand = new SymbolFilter(tightBand.symbol(), tightBand.baseAsset(), tightBand.quoteAsset(),
+                tightBand.qtyStep(), tightBand.qtyDecimals(), tightBand.minQty(), tightBand.minNotional(),
+                tightBand.priceDecimals(), tightBand.takerBps(), tightBand.takerFeeMultiplierFixed(),
+                tightBand.orderTypes(), 0.001, 0.001); // 0.1% band, far tighter than the 40bps buffer
+        CycleExecutor exec = executorWithCrossBps(40.0);
+        long worstPrice = FixedPoint.fromDouble(100.0);
+
+        long askCrossed = exec.applyLegCrossBuffer(worstPrice, Side.ASK, tightBand);
+        double askCap = 100.0 * 1.001; // bidMultiplierUp = 0.1%
+        assertEquals(askCap, FixedPoint.toDouble(askCrossed), 0.01,
+                "the 0.1% band cap must win over the 40bps buffer's own (larger) target");
+
+        long bidCrossed = exec.applyLegCrossBuffer(worstPrice, Side.BID, tightBand);
+        double bidFloor = 100.0 * 0.999; // askMultiplierDown = 0.1%
+        assertEquals(bidFloor, FixedPoint.toDouble(bidCrossed), 0.01,
+                "the 0.1% band floor must win over the 40bps buffer's own (larger) target");
+    }
+
+    @Test
+    void zeroCrossBpsReproducesTodaysPriceByteForByte() {
+        CycleExecutor exec = executorWithCrossBps(0.0);
+        long worstPrice = FixedPoint.fromDouble(77_850.123456);
+
+        assertEquals(worstPrice, exec.applyLegCrossBuffer(worstPrice, Side.ASK, BTCUSDT));
+        assertEquals(worstPrice, exec.applyLegCrossBuffer(worstPrice, Side.BID, BTCUSDT));
+    }
+
+    @Test
+    void negativeOrTooLargeLegCrossBpsRefusesToBoot() {
+        // 0.0 itself is the valid, inert default -- only outside [0, 50] fails.
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> executorWithCrossBps(-1.0));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> executorWithCrossBps(50.001));
     }
 
     private static void waitUntil(java.util.function.BooleanSupplier condition) throws InterruptedException {

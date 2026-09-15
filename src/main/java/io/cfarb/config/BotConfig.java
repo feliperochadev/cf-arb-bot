@@ -54,6 +54,8 @@ public interface BotConfig {
 
     DetectorConfig detector();
 
+    ConsumptionLedgerConfig consumptionLedger();
+
     interface VenueConfig {
         @WithDefault("wss://wbs-api.mexc.com/ws")
         String wsUrl();
@@ -222,6 +224,17 @@ public interface BotConfig {
          * acting on one that is already older than that all but guarantees leg failures. */
         @WithDefault("150")
         long maxIntentAgeMs();
+
+        /** PRE-LIVE-PLAN.md P1-5: a marketable limit fills at the BOOK's price up to your limit, so
+         * crossing costs nothing when the book has not moved since detection (measured expected cost
+         * ~0.11 bps against a 4.833 bps mean edge, converting 72% of adverse moves into fills).
+         * {@code exec.CycleExecutor} crosses each leg's modelled price by this many bps -- ASK legs
+         * up, BID legs down -- clamped inside the symbol's {@code PERCENT_PRICE_BY_SIDE} band.
+         * {@code 0.0} (default) is inert and reproduces today's submitted price byte-for-byte.
+         * {@code EdgeCalculator} is never touched: this is purely an execution-time adjustment. A
+         * value outside {@code [0, 50]} FAILS THE BOOT (S6). */
+        @WithDefault("0.0")
+        double legCrossBps();
     }
 
     interface JournalConfig {
@@ -355,5 +368,28 @@ public interface BotConfig {
         /** See {@link #staleLegFrozenMs()}. */
         @WithDefault("200")
         long staleLegActiveMs();
+    }
+
+    /**
+     * PRE-LIVE-PLAN.md P0-1 ("Fix B") / cf-arb-bot-plan.md §5.3.2: dry-run-only. {@code
+     * strategy.ConsumptionLedger} makes a paper fill actually consume the ladder depth it modelled,
+     * so a repeated evaluation of the same tick doesn't re-read the same unconsumed book state (the
+     * {@code usdt-sol-btc-rev} burst "bought" 19.32 SOL three times out of a level holding 40.27).
+     * Named {@code cf-bot.consumption-ledger.*}, not {@code cf-bot.dry-run.*} — {@code cf-bot.dry-run}
+     * is already a top-level boolean leaf, and SmallRye Config cannot nest properties under one.
+     */
+    interface ConsumptionLedgerConfig {
+        /** {@code true} (default) enables the ledger in dry-run; {@code false} restores the
+         * pre-P0-1 behaviour (every evaluation re-reads the full displayed depth) for an A/B
+         * comparison against a fresh capture. Never consulted in live mode — {@code BotService}
+         * constructs the ledger only when {@code cf-bot.dry-run=true}, regardless of this value. */
+        @WithDefault("true")
+        boolean enabled();
+
+        /** Backstop TTL for a claimed level nobody ever rewrites again — see {@code
+         * ConsumptionLedger}'s javadoc. A non-positive value FAILS THE BOOT (S6) whenever the ledger
+         * is actually constructed (dry-run AND {@link #enabled()}). */
+        @WithDefault("5000")
+        long ttlMs();
     }
 }

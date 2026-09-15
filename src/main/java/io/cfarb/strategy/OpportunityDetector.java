@@ -119,6 +119,13 @@ public final class OpportunityDetector {
     private final long[] lastFiredBaseQty;
     private final long[] lastFiredWriteSeq;
     private final boolean[] hasFiredSignature;
+
+    // PRE-LIVE-PLAN.md P0-1: nullable, dry-run-only -- see ConsumptionLedger's javadoc. Wired via
+    // setConsumptionLedger (not the constructor -- see that method's javadoc for why) so none of
+    // this class's many existing constructor call sites needed to change. Kept alongside
+    // edgeCalculator's own copy so evaluate() can call record() at dispatch time without needing
+    // EdgeCalculator to expose its private field back out.
+    private ConsumptionLedger consumptionLedger;
     // PRE-LIVE-PLAN.md P0-2(b): extends the signature above so a triangle can also be suppressed
     // when only SOME legs are unchanged -- see anyMaterialLegUnchanged's javadoc. Same flat
     // [triangleIndex*3 + leg] layout; lastFiredNanos backs the (separate, only-for-the-new-rule)
@@ -232,6 +239,17 @@ public final class OpportunityDetector {
         java.util.Arrays.fill(lastFiredNanos, Long.MIN_VALUE / 2);
     }
 
+    /** PRE-LIVE-PLAN.md P0-1: install the consumption ledger, wiring it into this instance's own
+     * {@link EdgeCalculator} too. A setter, not a constructor parameter — {@code BotService}
+     * constructs the ledger only when {@code dryRun}, and this class already has enough constructor
+     * overloads carrying real risk-bearing config; this one carries no config of its own to validate
+     * (all of that lives in {@code ConsumptionLedger}'s own constructor). Called at most once, by
+     * {@code BotService}, before the feed connects. */
+    public void setConsumptionLedger(ConsumptionLedger ledger) {
+        this.consumptionLedger = ledger;
+        this.edgeCalculator.setConsumptionLedger(ledger);
+    }
+
     /** Called after {@code symbolIndex}'s book has just been updated. {@code nowNanos} must be
      * {@code System.nanoTime()} at frame receipt (security rule S14). */
     public void onBookUpdated(int symbolIndex, long nowNanos) {
@@ -296,7 +314,7 @@ public final class OpportunityDetector {
         // Phase 2: search the ladder-boundary candidate sizes up to candidateNotional (the cap) and
         // keep the one maximising absolute profit, not bps -- candidateNotional above remains only
         // the pre-check ceiling handed to riskGates.canFire.
-        edgeCalculator.evaluateBestSize(tri, books, candidateNotional, edgeResult, bail);
+        edgeCalculator.evaluateBestSize(tri, books, candidateNotional, edgeResult, bail, nowNanos);
         if (wantDiagnostic) {
             lastFullEvalNanos[triangleIndex] = nowNanos;
         }
@@ -372,6 +390,11 @@ public final class OpportunityDetector {
         // DUPLICATE-FIRE-TASK.md: store the signature ONLY now that the intent is actually enqueued
         // -- the queue-full branch above rolled the claim back and must stay re-fireable.
         storeFireSignature(triangleIndex, nowNanos);
+        // PRE-LIVE-PLAN.md P0-1: record consumption ONLY now, same condition as the signature above
+        // -- a rolled-back claim must not poison the book either.
+        if (consumptionLedger != null) {
+            recordConsumption(tri, nowNanos);
+        }
         journal.write(JournalEvents.opportunity(tri.name(), edgeResult.netBps, edgeResult.grossBps,
                 chosenNotional, true, null, 0,
                 edgeResult.legTopPriceFixed, edgeResult.legTouchQtyFixed,
@@ -439,6 +462,23 @@ public final class OpportunityDetector {
         }
         lastFiredNanos[triangleIndex] = nowNanos;
         hasFiredSignature[triangleIndex] = true;
+    }
+
+    /** PRE-LIVE-PLAN.md P0-1: commits {@link #edgeResult}'s per-leg consumption breakdown (the
+     * WINNING candidate {@code evaluateBestSize} chose) into {@link #consumptionLedger}. Caller must
+     * have already checked {@code consumptionLedger != null} and be past the successful
+     * {@code orderQueue.offer()} -- see the call site's comment. */
+    private void recordConsumption(Triangle tri, long nowNanos) {
+        int[] symbolIndex = tri.symbolIndex();
+        Side[] sides = tri.side();
+        for (int leg = 0; leg < 3; leg++) {
+            int base = leg * Sizer.MAX_TRACKED_LEVELS;
+            int touched = edgeResult.legLevelsTouched[leg];
+            for (int t = 0; t < touched; t++) {
+                consumptionLedger.record(symbolIndex[leg], sides[leg], edgeResult.legLevelIndex[base + t],
+                        edgeResult.legLevelWriteSeq[base + t], edgeResult.legLevelQtyConsumed[base + t], nowNanos);
+            }
+        }
     }
 
     /**

@@ -123,14 +123,34 @@ public final class JournalEvents {
 
     public static String cycle(String triangleName, long notionalFixed, double detectedNetBps,
                                 long realizedPnlFixed, long equityAfterFixed, long durationNanos) {
-        return "{\"type\":\"cycle\",\"ts_us\":" + EpochMicros.now()
-                + ",\"triangle\":\"" + esc(triangleName) + "\""
-                + ",\"notional_usd\":" + io.cfarb.util.FixedPoint.toDouble(notionalFixed)
-                + ",\"detected_net_bps\":" + jsonNumber(detectedNetBps)
-                + ",\"realized_pnl_usd\":" + io.cfarb.util.FixedPoint.toDouble(realizedPnlFixed)
-                + ",\"equity_after_usd\":" + io.cfarb.util.FixedPoint.toDouble(equityAfterFixed)
-                + ",\"duration_ms\":" + (durationNanos / 1_000_000.0)
-                + "}";
+        return cycle(triangleName, notionalFixed, detectedNetBps, realizedPnlFixed, equityAfterFixed,
+                durationNanos, null, null);
+    }
+
+    /**
+     * PRE-LIVE-PLAN.md P1-5: adds {@code leg_worst_px} (the MODELLED price {@code EdgeCalculator}
+     * detected, {@code OrderIntent#legWorstPriceFixed()}) alongside the new {@code leg_requested_px}
+     * (what {@code CycleExecutor} actually submitted after {@code cf-bot.exec.leg-cross-bps}'s
+     * buffer) — carrying both on the SAME line makes the per-leg gap measurable directly, without
+     * correlating back to a separate {@code opportunity} line by timestamp/triangle. Omitted (both
+     * null) for the dry-run path, which never applies a buffer.
+     */
+    public static String cycle(String triangleName, long notionalFixed, double detectedNetBps,
+                                long realizedPnlFixed, long equityAfterFixed, long durationNanos,
+                                long[] legWorstPxFixed, long[] legRequestedPxFixed) {
+        StringBuilder sb = new StringBuilder(224);
+        sb.append("{\"type\":\"cycle\",\"ts_us\":").append(EpochMicros.now())
+                .append(",\"triangle\":\"").append(esc(triangleName)).append('"')
+                .append(",\"notional_usd\":").append(io.cfarb.util.FixedPoint.toDouble(notionalFixed))
+                .append(",\"detected_net_bps\":").append(jsonNumber(detectedNetBps))
+                .append(",\"realized_pnl_usd\":").append(io.cfarb.util.FixedPoint.toDouble(realizedPnlFixed))
+                .append(",\"equity_after_usd\":").append(io.cfarb.util.FixedPoint.toDouble(equityAfterFixed))
+                .append(",\"duration_ms\":").append(durationNanos / 1_000_000.0);
+        if (legWorstPxFixed != null && legRequestedPxFixed != null) {
+            sb.append(",\"leg_worst_px\":").append(jsonArr3(legWorstPxFixed));
+            sb.append(",\"leg_requested_px\":").append(jsonArr3(legRequestedPxFixed));
+        }
+        return sb.append('}').toString();
     }
 
     public static String brokenCycle(String triangleName, int failedLeg, String reason, long lossFixed, long equityAfterFixed) {

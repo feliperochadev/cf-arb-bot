@@ -125,4 +125,33 @@ class JournalEventsTest {
         assertEquals(reason, node.get("reason").asText());
         assertEquals("risk_trip", node.get("type").asText());
     }
+
+    // --- PRE-LIVE-PLAN.md P1-5: cycle() gains leg_worst_px / leg_requested_px --------------------
+
+    @Test
+    void sixArgCycleOmitsLegPriceArraysEntirely() {
+        String line = JournalEvents.cycle("usdt-btc-xrp-fwd", FixedPoint.fromDouble(1_000.0), 5.0,
+                FixedPoint.fromDouble(2.5), FixedPoint.fromDouble(2_502.5), 12_000_000L);
+
+        JsonNode node = assertDoesNotThrow(() -> MAPPER.readTree(line));
+        assertEquals("cycle", node.get("type").asText());
+        assertEquals(false, node.has("leg_worst_px"), "the dry-run path never applies a buffer -- must be omitted");
+        assertEquals(false, node.has("leg_requested_px"));
+    }
+
+    @Test
+    void eightArgCycleCarriesBothModelledAndRequestedPricesPerLeg() {
+        long[] worst = {FixedPoint.fromDouble(77850.0), FixedPoint.fromDouble(0.000017), FixedPoint.fromDouble(1.40)};
+        long[] requested = {FixedPoint.fromDouble(77857.79), FixedPoint.fromDouble(0.0000170017),
+                FixedPoint.fromDouble(1.3999)};
+        String line = JournalEvents.cycle("usdt-btc-xrp-fwd", FixedPoint.fromDouble(1_000.0), 5.0,
+                FixedPoint.fromDouble(2.5), FixedPoint.fromDouble(2_502.5), 12_000_000L, worst, requested);
+
+        JsonNode node = assertDoesNotThrow(() -> MAPPER.readTree(line));
+        assertEquals(3, node.get("leg_worst_px").size());
+        assertEquals(3, node.get("leg_requested_px").size());
+        assertEquals(77850.0, node.get("leg_worst_px").get(0).asDouble(), 0.01);
+        assertEquals(77857.79, node.get("leg_requested_px").get(0).asDouble(), 0.01,
+                "the gap between modelled and requested price must be measurable directly off this one line");
+    }
 }

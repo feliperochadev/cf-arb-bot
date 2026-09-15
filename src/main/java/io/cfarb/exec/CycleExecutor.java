@@ -54,6 +54,7 @@ public final class CycleExecutor {
     private final OrderReconciler reconciler; // null when dryRun
     private final long legTimeoutMs;
     private final long maxIntentAgeNanos;    // REVIEW.md MED-10
+    private final double legCrossBps;        // PRE-LIVE-PLAN.md P1-5
 
     private volatile boolean running;
     private Thread thread;
@@ -63,6 +64,15 @@ public final class CycleExecutor {
                           BotMetrics metrics, EventJournal journal, boolean dryRun,
                           MexcOrderApi rest, Unwinder unwinder, String orderType, long legTimeoutMs,
                           long maxIntentAgeMs) {
+        this(queue, triangles, riskGates, killSwitch, portfolio, metrics, journal, dryRun, rest,
+                unwinder, orderType, legTimeoutMs, maxIntentAgeMs, 0.0);
+    }
+
+    public CycleExecutor(SpscArrayQueue<OrderIntent> queue, TriangleRegistry triangles,
+                          RiskGates riskGates, KillSwitch killSwitch, Portfolio portfolio,
+                          BotMetrics metrics, EventJournal journal, boolean dryRun,
+                          MexcOrderApi rest, Unwinder unwinder, String orderType, long legTimeoutMs,
+                          long maxIntentAgeMs, double legCrossBps) {
         this.queue = queue;
         this.triangles = triangles;
         this.riskGates = riskGates;
@@ -75,6 +85,12 @@ public final class CycleExecutor {
         this.unwinder = unwinder;
         this.legTimeoutMs = legTimeoutMs;
         this.maxIntentAgeNanos = maxIntentAgeMs * 1_000_000L;
+        // PRE-LIVE-PLAN.md P1-5: S6 -- inert by default (0.0 reproduces today's submitted price
+        // byte-for-byte); outside [0, 50] is a misconfiguration and FAILS THE BOOT.
+        if (legCrossBps < 0 || legCrossBps > 50) {
+            throw new IllegalStateException("cf-bot.exec.leg-cross-bps must be in [0, 50], got " + legCrossBps);
+        }
+        this.legCrossBps = legCrossBps;
         if (!dryRun && (rest == null || unwinder == null)) {
             throw new IllegalStateException("live execution requires a MexcRestClient and Unwinder");
         }
@@ -200,12 +216,16 @@ public final class CycleExecutor {
         SymbolFilter[] filters = triangle.filter();
         String cycleId = "c" + intent.detectedAtNanos() + "-" + intent.triangleIndex();
         CycleState state = new CycleState(cycleId);
+        // PRE-LIVE-PLAN.md P1-5: the actually-submitted (post-buffer) price per leg, for the
+        // leg_requested_px journal field alongside intent's own (modelled) leg_worst_px.
+        long[] legRequestedPxFixed = new long[3];
 
         long carryAmount = 0; // legs 1-2 only: the previous leg's ACTUAL net proceeds
         for (int leg = 0; leg < 3; leg++) {
             SymbolFilter filter = filters[leg];
             Side side = sides[leg];
-            long priceFixed = intent.legWorstPriceFixed()[leg];
+            long priceFixed = applyLegCrossBuffer(intent.legWorstPriceFixed()[leg], side, filter);
+            legRequestedPxFixed[leg] = priceFixed;
             CycleState.Leg legState = state.legs[leg];
 
             // Third-pass review finding: record what this leg was HANDED, before it is submitted, so
@@ -293,7 +313,40 @@ public final class CycleExecutor {
         killSwitch.checkEquityFloor();
         metrics.recordCycleCompleted();
         journal.write(JournalEvents.cycle(triangle.name(), intent.candidateNotionalFixed(),
-                intent.detectedNetBps(), pnl, equityAfter, System.nanoTime() - intent.detectedAtNanos()));
+                intent.detectedNetBps(), pnl, equityAfter, System.nanoTime() - intent.detectedAtNanos(),
+                intent.legWorstPriceFixed(), legRequestedPxFixed));
+    }
+
+    /** PRE-LIVE-PLAN.md P1-5: a marketable limit fills at the BOOK's price up to your limit, so
+     * crossing costs nothing when the book hasn't moved since detection -- ASK legs price UP, BID
+     * legs price DOWN, by {@code worstPrice * legCrossBps / 10_000}. Inert (returns
+     * {@code worstPriceFixed} unchanged) when {@code legCrossBps <= 0}, the default -- {@code
+     * EdgeCalculator} is never touched; this is purely an execution-time adjustment applied AFTER
+     * the modelled price is already fixed. Rounds AWAY from the touch to a representable tick BEFORE
+     * returning -- not deferred to the later on-wire render ({@code FixedPoint#toPlainString} never
+     * rounds, only truncates) -- so the buffer amount is exact the instant this method returns,
+     * independent of how the price is later rendered: an ASK leg rounds UP (mirrors {@code
+     * Unwinder#clampToPriceBand}'s own L2 finding for a price floor), a BID leg rounds DOWN.
+     * Clamped inside the symbol's {@code PERCENT_PRICE_BY_SIDE} band via {@link
+     * Unwinder#clampToPriceBand} -- the clamp wins over the buffer.
+     *
+     * <p>Package-private (not {@code private}) so {@code CycleExecutorTest} can exercise it directly,
+     * the same testability pattern {@link Unwinder#clampToPriceBand} already uses. */
+    long applyLegCrossBuffer(long worstPriceFixed, Side side, SymbolFilter filter) {
+        if (legCrossBps <= 0) {
+            return worstPriceFixed;
+        }
+        long crossed;
+        if (side == Side.ASK) {
+            crossed = FixedPoint.mulDiv(worstPriceFixed,
+                    FixedPoint.fromDouble(1.0 + legCrossBps / 10_000.0), FixedPoint.SCALE);
+            crossed = Unwinder.roundUpToDecimals(crossed, filter.priceDecimals());
+        } else {
+            crossed = FixedPoint.mulDiv(worstPriceFixed,
+                    FixedPoint.fromDouble(1.0 - legCrossBps / 10_000.0), FixedPoint.SCALE);
+            crossed = Unwinder.truncateToDecimals(crossed, filter.priceDecimals());
+        }
+        return Unwinder.clampToPriceBand(crossed, side, filter, worstPriceFixed);
     }
 
     private void handleBrokenCycle(Triangle triangle, CycleState state, int failedLeg, String reason) {

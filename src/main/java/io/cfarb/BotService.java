@@ -22,6 +22,7 @@ import io.cfarb.risk.KillSwitch;
 import io.cfarb.risk.RiskGates;
 import io.cfarb.state.BalanceReconciler;
 import io.cfarb.state.Portfolio;
+import io.cfarb.strategy.ConsumptionLedger;
 import io.cfarb.strategy.OpportunityDetector;
 import io.cfarb.util.FixedPoint;
 import io.quarkus.runtime.ShutdownEvent;
@@ -185,6 +186,18 @@ public class BotService {
                 config.capital().compound(), config.journal().rejectSampleMs(), postResetQuarantineMs,
                 config.detector().duplicateMaterialFraction(), config.detector().duplicateWindowMs(),
                 staleLeg[0], staleLeg[1]);
+        // PRE-LIVE-PLAN.md P0-1: dry-run only -- live mode never simulates (ConsumptionLedger stays
+        // null end to end, reproducing pre-P0-1 behaviour exactly). cf-bot.consumption-ledger.enabled
+        // lets an operator opt back out for an A/B comparison without a code change.
+        if (dryRun && config.consumptionLedger().enabled()) {
+            // ConsumptionLedger's own constructor validates ttlMs > 0 and fails the boot (S6) --
+            // see its javadoc.
+            ConsumptionLedger consumptionLedger =
+                    new ConsumptionLedger(books.symbolCount(), config.consumptionLedger().ttlMs());
+            detector.setConsumptionLedger(consumptionLedger);
+            LOG.infof("dry-run consumption ledger enabled: ttlMs=%d (cf-bot.consumption-ledger.*)",
+                    config.consumptionLedger().ttlMs());
+        }
 
         Unwinder unwinder = null;
         if (!dryRun) {
@@ -200,7 +213,7 @@ public class BotService {
 
         this.executor = new CycleExecutor(orderQueue, triangles, riskGates, killSwitch, portfolio,
                 metrics, journal, dryRun, restClient, unwinder, config.exec().orderType(),
-                config.exec().legTimeoutMs(), config.exec().maxIntentAgeMs());
+                config.exec().legTimeoutMs(), config.exec().maxIntentAgeMs(), config.exec().legCrossBps());
         executor.start();
 
         List<String> subscribeMessages = MexcProtocol.subscribeMessages(config.venue().depthChannel(), config.symbols());
